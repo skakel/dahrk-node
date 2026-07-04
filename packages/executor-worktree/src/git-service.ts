@@ -243,6 +243,17 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     };
   };
 
+  /**
+   * Env for a network git op (clone/fetch/push/remote update). Always disables git's interactive
+   * credential prompt so a host that cannot authenticate fails fast with git's real auth error
+   * instead of falling through to a Username prompt that, under pm2/tsx (no TTY), dies with the
+   * confusing `could not read Username ... Device not configured`. When a brokered token is present
+   * its askpass env already carries `GIT_TERMINAL_PROMPT=0`; the tokenless (ambient) path gets it
+   * here, so ambient auth failures are as clear as brokered ones.
+   */
+  const netEnv = (authEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv =>
+    authEnv ?? { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+
   /** Add an `x-access-token` username to an HTTPS URL so the askpass password (the token) is used.
    *  Only the (non-secret) username is embedded - the token never lands in the URL or git config. */
   const withTokenUser = (gitUrl: string): string =>
@@ -268,7 +279,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     if (existsSync(mirror) && gitOk(mirror, ["rev-parse", "--git-dir"])) {
       log.info(`refreshing mirror ${repoId}`);
       try {
-        git(mirror, ["remote", "update", "--prune"], authEnv);
+        git(mirror, ["remote", "update", "--prune"], netEnv(authEnv));
         return { mirror, refreshed: true };
       } catch (e) {
         // A refresh failure (offline, transient) does not abort here: the cached mirror still serves
@@ -281,7 +292,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     mkdirSync(mirrorsDir, { recursive: true });
     const cloneUrl = authEnv ? withTokenUser(gitUrl) : gitUrl;
     log.info(`cloning mirror ${repoId} from ${gitUrl}`);
-    gitBare(["clone", "--mirror", cloneUrl, mirror], authEnv);
+    gitBare(["clone", "--mirror", cloneUrl, mirror], netEnv(authEnv));
     return { mirror, refreshed: true };
   };
 
@@ -331,7 +342,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
           // from a base we cannot confirm is fresh (truthful failure over a phantom-stale run).
           if (!refreshed) {
             log.info(`mirror refresh failed; fetching base ${baseBranch} before branching ${branchName}`);
-            git(mirror, ["fetch", "origin", `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`], auth?.env);
+            git(mirror, ["fetch", "origin", `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`], netEnv(auth?.env));
           }
           log.info(`creating worktree at ${worktreePath} from ${baseBranch} on ${branchName}`);
           git(mirror, ["worktree", "add", "-b", branchName, worktreePath, baseBranch]);
@@ -408,7 +419,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
         let fetched = false;
         if (opts.base) {
           try {
-            git(worktreePath, ["fetch", remote, opts.base], auth?.env);
+            git(worktreePath, ["fetch", remote, opts.base], netEnv(auth?.env));
             fetched = true;
           } catch (e) {
             // Best-effort: an offline/transient fetch failure must not fabricate a conflict. Skip
@@ -441,7 +452,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
             return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "conflict", conflictFiles };
           }
         }
-        git(worktreePath, ["push", remote, `HEAD:refs/heads/${branch}`], auth?.env);
+        git(worktreePath, ["push", remote, `HEAD:refs/heads/${branch}`], netEnv(auth?.env));
         pushed = true;
       } finally {
         auth?.cleanup();

@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkspaceRef } from "@dahrk/contracts";
@@ -417,6 +417,60 @@ test("createWorktree refuses to branch a NEW run from a stale base when the base
     );
   } finally {
     rmSync(src, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
+test("an ambient (tokenless) clone runs git with GIT_TERMINAL_PROMPT=0 so auth failures fail fast", async () => {
+  // HAR-248: the tokenless path must also disable git's interactive credential prompt. When an ambient
+  // node clones a repo the host cannot authenticate over HTTPS, git otherwise falls through to a
+  // Username prompt that, under pm2/tsx (no TTY), dies with the confusing "could not read Username ...
+  // Device not configured" instead of a clear auth failure. Rather than stand up an auth-challenging
+  // server (needs network), we shim `git` on PATH to record the GIT_TERMINAL_PROMPT it was invoked
+  // with on the clone, then delegate to the real git (the fixture is a local path, so no auth is
+  // needed). Before the fix the tokenless clone passed no env and the flag was unset.
+  const realGit = execFileSync("which", ["git"], { encoding: "utf-8" }).trim();
+  const src = makeRepo();
+  const shimDir = mkdtempSync(join(tmpdir(), "dahrk-shim-"));
+  const captureFile = join(shimDir, "clone-terminal-prompt");
+  const shim = join(shimDir, "git");
+  // For `clone`, record the flag (or the literal UNSET) then exec the real git; pass everything else
+  // straight through so the rest of createWorktree behaves exactly as normal.
+  writeFileSync(
+    shim,
+    `#!/bin/sh\nif [ "$1" = "clone" ]; then printf '%s' "\${GIT_TERMINAL_PROMPT-UNSET}" > "${captureFile}"; fi\nexec "${realGit}" "$@"\n`,
+    { mode: 0o755 },
+  );
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+
+  const savedPath = process.env.PATH;
+  const savedPrompt = process.env.GIT_TERMINAL_PROMPT;
+  process.env.PATH = `${shimDir}:${savedPath ?? ""}`;
+  // Ensure the flag is not already set in the ambient env, so a captured "0" can only come from the fix.
+  delete process.env.GIT_TERMINAL_PROMPT;
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-ambient",
+      gitUrl: src,
+      baseBranch: "main",
+      runId: "run-ambient-1",
+    });
+    assert.ok(existsSync(ref.worktreePath), "the ambient worktree still builds through the shim");
+    assert.equal(
+      readFileSync(captureFile, "utf-8"),
+      "0",
+      "the tokenless clone must run git with GIT_TERMINAL_PROMPT=0",
+    );
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    if (savedPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
+    else process.env.GIT_TERMINAL_PROMPT = savedPrompt;
+    rmSync(src, { recursive: true, force: true });
+    rmSync(shimDir, { recursive: true, force: true });
     rmSync(worktreesDir, { recursive: true, force: true });
     rmSync(mirrorsDir, { recursive: true, force: true });
   }
