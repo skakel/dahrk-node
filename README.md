@@ -26,12 +26,31 @@ Requires **Node 22+** and **pnpm 11+**.
 ```bash
 pnpm install
 pnpm build
-DAHRK_HUB_URL=ws://localhost:7071 pnpm --filter @dahrk/edge-node dev --token <enrolment-token>
+DAHRK_HUB_URL=ws://localhost:7071 pnpm --filter @dahrk/edge-node dev start --token <enrolment-token>
 ```
 
 The node auto-detects which agent runtimes are installed (claude / codex / pi), mints and persists a
 stable node id under `~/.dahrk/node.json`, dials out to the hub, and waits for Jobs. It advertises no
 inbound ports; repositories are cloned on demand from each Job's git URL.
+
+## Commands
+
+```bash
+dahrk-node start --token <t> [--name <n>] [--hub-url <u>] [--ephemeral]   # run the node
+dahrk-node doctor [--token <t>] [--hub-url <u>]                           # preflight checks
+dahrk-node help [start|doctor]                                            # usage
+dahrk-node version                                                        # print the client version
+```
+
+`start` is the default, so `dahrk-node --token <t>` (no subcommand) still runs the node.
+
+`dahrk-node doctor` runs a preflight before you commit to `start` and reports a clear pass/fail for:
+the **Node version**, which **agent runtimes** are installed (with versions), **hub reachability**
+(does the WebSocket connect?), and **token validity** (does the hub accept the enrolment token, or is
+it missing / invalid / expired?). It exits non-zero if any check fails.
+
+`--ephemeral` mints a throwaway node id for the run instead of reading/persisting `~/.dahrk/node.json`
+- handy for CI or one-shot nodes that should leave no local state.
 
 ## Configuration
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildEdgeOptions, resolveNodeId, resolveRuntimes } from "../src/main.ts";
@@ -107,4 +107,21 @@ test("resolveNodeId: mints once and persists a stable UUID across calls", () => 
 test("resolveRuntimes: env override wins; mock runner skips probing", async () => {
   assert.deepEqual(await resolveRuntimes({ DAHRK_RUNTIMES: "codex, pi" }), ["codex", "pi"]);
   assert.deepEqual(await resolveRuntimes({ DAHRK_RUNNER: "mock" }), ["claude-code"]);
+});
+
+test("resolveNodeId: --ephemeral mints a throwaway id and never touches disk", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-ephemeral-"));
+  try {
+    const env = { DAHRK_STATE_DIR: dir };
+    const first = resolveNodeId(env, { ephemeral: true });
+    const second = resolveNodeId(env, { ephemeral: true });
+    assert.notEqual(first, second, "ephemeral ids are fresh per boot");
+    assert.equal(existsSync(join(dir, "node.json")), false, "ephemeral writes no node.json");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveNodeId: an explicit DAHRK_NODE_ID still wins under --ephemeral", () => {
+  assert.equal(resolveNodeId({ DAHRK_NODE_ID: "node-fixed" }, { ephemeral: true }), "node-fixed");
 });

@@ -1,7 +1,7 @@
 /**
  * Installable edge node entrypoint (Mac / VPS). The streamlined install is token-only:
  *
- *   dahrk-node --token <enrolment-token>
+ *   dahrk start --token <enrolment-token>
  *
  * Everything else is either auto-detected on the node or pushed from the hub. On boot the node
  * probes which runtimes are installed (claude / codex / pi), reads or mints a stable node id
@@ -9,6 +9,10 @@
  * and the hub replies `welcome` with the node's tenant, display name, and policy (credential mode,
  * heartbeat, retention, allowed repos) - so the operator no longer hand-sets `DAHRK_TENANT_ID` or
  * `DAHRK_RUNTIMES`. No inbound ports; repos are cloned on demand from each Job's gitUrl.
+ *
+ * The CLI is subcommand-based (`start`, `doctor`, `help`, `version`), but `start` is the default so the
+ * pre-subcommand invocation (`dahrk-node --token X`) still works. `dahrk doctor` runs a preflight
+ * (Node version, runtimes, hub reachability, token validity) before you commit to `start`.
  *
  * Everything remains overridable for power users and the managed profile: `--token` / `--name` /
  * `--hub-url` flags win over the matching `DAHRK_*` env vars (the legacy `SKAKEL_*` names are still
@@ -18,11 +22,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { parseArgs } from "node:util";
 import { detectRuntimes, startEdgeNode, type EdgeOptions } from "@dahrk/edge";
 import type { CredentialMode, Runtime } from "@dahrk/contracts";
+import { parseCli, usage, type StartFlags } from "./cli.js";
+import { runDoctor } from "./doctor.js";
 
 const CLIENT_VERSION = process.env.npm_package_version ?? "0.0.0";
 
@@ -67,9 +72,12 @@ function readNodeId(file: string): string | undefined {
 /** Resolve this node's stable id. An explicit `DAHRK_NODE_ID` wins (the managed profile
  *  pins one); otherwise read `~/.dahrk/node.json` (falling back to the legacy `~/.skakel/node.json`
  *  so a pre-rename node keeps its id), minting and persisting a fresh UUID on first boot so the id
- *  survives restarts. A disk failure logs and falls back to an in-memory UUID. */
-export function resolveNodeId(env: NodeJS.ProcessEnv): string {
+ *  survives restarts. A disk failure logs and falls back to an in-memory UUID. `ephemeral` skips all
+ *  disk I/O and mints a throwaway id for this run (CI / one-shot nodes), unless an explicit
+ *  `DAHRK_NODE_ID` still pins one. */
+export function resolveNodeId(env: NodeJS.ProcessEnv, opts: { ephemeral?: boolean } = {}): string {
   if (env.DAHRK_NODE_ID) return env.DAHRK_NODE_ID;
+  if (opts.ephemeral) return randomUUID();
   const dir = stateDir(env);
   const file = join(dir, "node.json");
   const existing = readNodeId(file);
@@ -178,39 +186,67 @@ function applyEnvAliases(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return merged;
 }
 
-/** Overlay the token-only CLI flags onto a copy of the env; a flag wins over the matching env var. */
-function envWithFlags(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const { values } = parseArgs({
-    args: process.argv.slice(2),
-    options: {
-      token: { type: "string" },
-      name: { type: "string" },
-      "hub-url": { type: "string" },
-    },
-    allowPositionals: false,
-  });
+/** Overlay the parsed CLI flags onto a copy of the env; a flag wins over the matching env var. The
+ *  legacy `SKAKEL_*` aliases are folded in first so a flag still beats them. */
+function envWithFlags(env: NodeJS.ProcessEnv, flags: StartFlags): NodeJS.ProcessEnv {
   const merged = applyEnvAliases(env);
-  if (values.token) merged.DAHRK_ENROL_TOKEN = values.token;
-  if (values.name) merged.DAHRK_NODE_NAME = values.name;
-  if (values["hub-url"]) merged.DAHRK_HUB_URL = values["hub-url"];
+  if (flags.token) merged.DAHRK_ENROL_TOKEN = flags.token;
+  if (flags.name) merged.DAHRK_NODE_NAME = flags.name;
+  if (flags.hubUrl) merged.DAHRK_HUB_URL = flags.hubUrl;
   return merged;
 }
 
-async function main(): Promise<void> {
-  const env = envWithFlags(process.env);
-  const nodeId = resolveNodeId(env);
+/** Run the node: resolve identity + runtimes, then dial the hub and serve Jobs (blocks until exit). */
+async function start(flags: StartFlags): Promise<void> {
+  const env = envWithFlags(process.env, flags);
+  const nodeId = resolveNodeId(env, { ephemeral: flags.ephemeral });
   const runtimes = await resolveRuntimes(env);
   if (runtimes.length === 0) {
     console.warn(
       "no agent runtimes detected on this host (claude/codex/pi not on PATH); the node will advertise " +
-        "none and serve no Jobs. Install a runtime or set DAHRK_RUNTIMES to override.",
+        "none and serve no Jobs. Install a runtime or set DAHRK_RUNTIMES to override. Run `dahrk doctor` to check.",
     );
   }
   const resolved: ResolvedBoot = { nodeId, runtimes, clientVersion: CLIENT_VERSION };
   await startEdgeNode(buildEdgeOptions(env, resolved));
 }
 
-// Only dial the hub when run as the process entrypoint; importing the module (e.g. from tests) is
+/** Dispatch the CLI: `start` (default), `doctor`, `help`, `version`. Returns nothing for `start`
+ *  (it blocks on the socket); the others print and let the caller exit. */
+async function main(): Promise<void> {
+  // The invoked program name for usage text. When run from source/dist the entry file is `main.*`,
+  // which is meaningless to an operator, so fall back to the published bin name `dahrk-node`.
+  const invoked = basename(process.argv[1] ?? "");
+  const bin = !invoked || invoked.startsWith("main.") ? "dahrk-node" : invoked;
+  const parsed = parseCli(process.argv.slice(2));
+  switch (parsed.kind) {
+    case "error":
+      console.error(`${parsed.message}\n`);
+      console.error(usage(bin));
+      process.exit(2);
+      break;
+    case "help":
+      console.log(usage(bin, parsed.command));
+      break;
+    case "version":
+      console.log(CLIENT_VERSION);
+      break;
+    case "doctor": {
+      const env = envWithFlags(process.env, parsed.flags);
+      process.exitCode = await runDoctor({
+        hubUrl: env.DAHRK_HUB_URL,
+        token: env.DAHRK_ENROL_TOKEN,
+        clientVersion: CLIENT_VERSION,
+      });
+      break;
+    }
+    case "start":
+      await start(parsed.flags);
+      break;
+  }
+}
+
+// Only run the CLI when invoked as the process entrypoint; importing the module (e.g. from tests) is
 // side-effect-free.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err: unknown) => {

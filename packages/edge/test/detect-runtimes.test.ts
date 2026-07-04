@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectRuntimes } from "../src/detect-runtimes.js";
+import { detectRuntimes, probeRuntimeStatuses } from "../src/detect-runtimes.js";
 
 /** Build a temp bin dir holding a passing fake CLI per name, prepend it to PATH, run fn, then clean up
  *  and restore PATH. */
@@ -50,4 +50,30 @@ test("all three present -> all three, in stable order", async () => {
     const detected = await detectRuntimes(2000);
     assert.deepEqual(detected, ["claude-code", "codex", "pi"]);
   });
+});
+
+test("probeRuntimeStatuses reports installed + version, absent runtimes as not-installed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-status-"));
+  // A fake `claude` that prints a version; `codex`/`pi` stay absent from the throwaway PATH.
+  const p = join(dir, "claude");
+  writeFileSync(p, '#!/bin/sh\necho "claude 9.9.9"\nexit 0\n');
+  chmodSync(p, 0o755);
+  const prevPath = process.env.PATH;
+  process.env.PATH = dir;
+  try {
+    const statuses = await probeRuntimeStatuses(2000);
+    const byRuntime = Object.fromEntries(statuses.map((s) => [s.runtime, s]));
+    assert.deepEqual(byRuntime["claude-code"], {
+      runtime: "claude-code",
+      cmd: "claude",
+      installed: true,
+      version: "claude 9.9.9",
+    });
+    assert.equal(byRuntime["codex"]?.installed, false);
+    assert.equal(byRuntime["pi"]?.installed, false);
+    assert.equal(byRuntime["codex"]?.version, undefined);
+  } finally {
+    process.env.PATH = prevPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
