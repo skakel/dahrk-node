@@ -1,6 +1,6 @@
 # @dahrk/edge-node
 
-The installable Dahrk edge node (binary `dahrk-edge`). Runs on a Mac (primary) or a Linux VPS. Dials
+The installable Dahrk edge node (binary `dahrk-node`). Runs on a Mac (primary) or a Linux VPS. Dials
 out to the hub over WebSocket, advertises its repos and installed runtimes, and runs stages in
 worktrees. No inbound ports.
 

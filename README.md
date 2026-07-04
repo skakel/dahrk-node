@@ -1,13 +1,15 @@
-# Dahrk edge client
+# Dahrk node
 
 **Dahrk** is a Linear-native agent-workflow harness: a hosted **hub** dispatches deterministic,
-multi-stage agent workflows, one per Linear issue, to deliberate **edge nodes** - the client in this
+multi-stage agent workflows, one per Linear issue, to deliberate **nodes** - the runnable in this
 repository. Each stage runs in an isolated git worktree via a pluggable runtime (Claude Code, Codex,
 Pi), and the node streams progress and results back to the hub. The engine that sequences stages is
 pure TypeScript and never lets a model decide control flow; inference happens only *inside* a stage.
 
-This repo is the **open client**. It has no dependency on the hub - it shares only the wire protocol
-and types published as [`@dahrk/contracts`](https://www.npmjs.com/package/@dahrk/contracts).
+A node runs in one of two modes: an **edge node** (unmanaged, self-hosted, dials OUT - no inbound
+ports) or a **managed node** (a Dahrk-hosted container pool). This repo is the **open node**: it has
+no dependency on the hub, sharing only the wire protocol and types published as
+[`@dahrk/contracts`](https://www.npmjs.com/package/@dahrk/contracts).
 
 ## Packages
 
@@ -15,7 +17,7 @@ and types published as [`@dahrk/contracts`](https://www.npmjs.com/package/@dahrk
 |---|---|
 | [`packages/edge`](packages/edge) (`@dahrk/edge`) | The node's brain: the WebSocket client, the stage runner, tool/stage-entry policy, and stage-exit hooks. |
 | [`packages/executor-worktree`](packages/executor-worktree) (`@dahrk/executor-worktree`) | The worktree executor: runner adapters (Claude Agent SDK, Codex SDK, Pi), a vendored GitService for worktree lifecycle, and the trace producer. |
-| [`apps/edge-node`](apps/edge-node) (`@dahrk/edge-node`) | The installable entrypoint (`dahrk-edge`). Dials out to the hub over WebSocket and runs stages in worktrees. No inbound ports. |
+| [`apps/edge-node`](apps/edge-node) (`@dahrk/edge-node`) | The installable entrypoint (`dahrk-node`). Dials out to the hub over WebSocket and runs stages in worktrees. No inbound ports. |
 
 ## Quick start
 

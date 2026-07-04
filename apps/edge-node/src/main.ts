@@ -1,7 +1,7 @@
 /**
  * Installable edge node entrypoint (Mac / VPS). The streamlined install is token-only:
  *
- *   dahrk-edge --token <enrolment-token>
+ *   dahrk-node --token <enrolment-token>
  *
  * Everything else is either auto-detected on the node or pushed from the hub. On boot the node
  * probes which runtimes are installed (claude / codex / pi), reads or mints a stable node id

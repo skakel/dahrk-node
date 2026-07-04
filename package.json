@@ -1,17 +1,17 @@
 {
-  "name": "dahrk-client",
+  "name": "dahrk-node",
   "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
-  "description": "The Dahrk edge client: deliberate edge nodes that run deterministic multi-stage agent workflows per Linear issue, dispatched by the Dahrk hub.",
+  "description": "The Dahrk node: deliberate edge/managed nodes that run deterministic multi-stage agent workflows per Linear issue, dispatched by the Dahrk hub.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/skakel/dahrk.git"
+    "url": "git+https://github.com/skakel/dahrk-node.git"
   },
-  "homepage": "https://github.com/skakel/dahrk#readme",
+  "homepage": "https://github.com/skakel/dahrk-node#readme",
   "bugs": {
-    "url": "https://github.com/skakel/dahrk/issues"
+    "url": "https://github.com/skakel/dahrk-node/issues"
   },
   "engines": {
     "node": ">=22"

@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "description": "Installable Dahrk edge node entrypoint (Mac / VPS). Dials out to the hub over WebSocket and runs stages in worktrees.",
-  "bin": { "dahrk-edge": "dist/main.js" },
+  "bin": { "dahrk-node": "dist/main.js" },
   "exports": { ".": "./src/main.ts" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
