@@ -86,6 +86,13 @@ export function createClaudeRunner(): Runner {
   const baseOptions = (ctx: RunnerContext): Options => ({
     cwd: ctx.workspace.worktreePath,
     abortController,
+    // The deterministic push-stage commit sets the harness author identity itself (see
+    // GitService.commitAndPush); when the Claude runtime commits inside an interactive stage it must
+    // NOT append its own `Co-Authored-By: Claude <noreply@anthropic.com>` trailer. `includeCoAuthoredBy`
+    // is a Claude Code SETTINGS key (not a top-level Options field), so it rides the inline `settings`
+    // object, which sits at the flag layer and overrides any project/local setting. Mirrors the cyrus
+    // reference (EdgeWorker.ts writes the same key into .claude/settings.local.json).
+    settings: { includeCoAuthoredBy: false },
     // Inherit the REPO's .mcp.json / .claude settings (build spec section 9): do NOT set
     // strictMcpConfig. Policy enforcement around tools is M6; M4 allows tools to run and the
     // stage runner intercepts denied actions at the trace level.

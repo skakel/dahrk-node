@@ -120,6 +120,14 @@ test("commitAndPush commits the worktree and pushes the per-issue branch to the 
     assert.equal(r1.pushed, true);
     assert.equal(r1.nothingToCommit, false);
 
+    // The harness stamps its own author/committer identity on the commit, independent of the
+    // fixture repo's local git config (set to "Dahrk <harness@dahrk.test>" above). Default is
+    // Dahrk <noreply@dahrk.net>.
+    assert.equal(
+      git(remote, ["show", "-s", "--format=%an <%ae> | %cn <%ce>", branch]).trim(),
+      "Dahrk <noreply@dahrk.net> | Dahrk <noreply@dahrk.net>",
+    );
+
     // The bare remote now carries the branch with the file (the push landed).
     assert.doesNotThrow(() => git(remote, ["rev-parse", "--verify", branch]));
     assert.match(git(remote, ["show", `${branch}:hello.txt`]), /from session 1/);
@@ -148,6 +156,41 @@ test("commitAndPush commits the worktree and pushes the per-issue branch to the 
     // A push with no changes commits nothing but still reports cleanly.
     const r3 = await svc.commitAndPush(ref2, { message: "noop", branch });
     assert.equal(r3.nothingToCommit, true);
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
+test("commitAndPush honours the configured author/committer identity override", async () => {
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({
+    worktreesDir,
+    mirrorsDir,
+    authorName: "Bot",
+    authorEmail: "bot@example.test",
+  });
+  const branch = "dahrk/issue-TEST-override";
+
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-id",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-id-1",
+      branch,
+    });
+    writeFileSync(join(ref.worktreePath, "hello.txt"), "override\n");
+    const r = await svc.commitAndPush(ref, { message: "override identity", branch });
+    assert.equal(r.pushed, true);
+    // The override reaches BOTH author and committer.
+    assert.equal(
+      git(remote, ["show", "-s", "--format=%an <%ae> | %cn <%ce>", branch]).trim(),
+      "Bot <bot@example.test> | Bot <bot@example.test>",
+    );
   } finally {
     rmSync(remote, { recursive: true, force: true });
     rmSync(worktreesDir, { recursive: true, force: true });

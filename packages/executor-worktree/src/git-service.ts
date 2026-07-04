@@ -133,6 +133,10 @@ export interface GitServiceOptions {
   worktreesDir?: string;
   /** Where per-repo bare mirrors are cached; one subdirectory per repoId. */
   mirrorsDir?: string;
+  /** Author/committer name for harness-made commits. Env: DAHRK_GIT_AUTHOR_NAME. */
+  authorName?: string;
+  /** Author/committer email for harness-made commits. Env: DAHRK_GIT_AUTHOR_EMAIL. */
+  authorEmail?: string;
   logger?: GitLogger;
 }
 
@@ -157,6 +161,8 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     opts.worktreesDir ?? process.env.DAHRK_WORKTREES_DIR ?? process.env.SKAKEL_WORKTREES_DIR ?? join(homedir(), ".dahrk", "worktrees");
   const mirrorsDir =
     opts.mirrorsDir ?? process.env.DAHRK_MIRRORS_DIR ?? process.env.SKAKEL_MIRRORS_DIR ?? join(homedir(), ".dahrk", "mirrors");
+  const authorName = opts.authorName ?? process.env.DAHRK_GIT_AUTHOR_NAME ?? "Dahrk";
+  const authorEmail = opts.authorEmail ?? process.env.DAHRK_GIT_AUTHOR_EMAIL ?? "noreply@dahrk.net";
   const log = opts.logger ?? noopLogger;
 
   const git = (cwd: string, args: string[], env?: NodeJS.ProcessEnv): string =>
@@ -357,9 +363,9 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       if (hasStaged) {
         git(worktreePath, [
           "-c",
-          "user.name=Dahrk",
+          `user.name=${authorName}`,
           "-c",
-          "user.email=dahrk@users.noreply.github.com",
+          `user.email=${authorEmail}`,
           "commit",
           "-m",
           opts.message,
@@ -415,9 +421,9 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
             // A non-fast-forward merge writes a commit, so pass the same committer identity as the commit.
             git(worktreePath, [
               "-c",
-              "user.name=Skakel",
+              `user.name=${authorName}`,
               "-c",
-              "user.email=skakel@users.noreply.github.com",
+              `user.email=${authorEmail}`,
               "merge",
               "--no-edit",
               "FETCH_HEAD",
