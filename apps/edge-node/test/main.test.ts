@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildEdgeOptions, resolveNodeId, resolveRuntimes } from "../src/main.ts";
+import { buildEdgeOptions, resolveNodeId, resolveRuntimes, DEFAULT_HUB_URL } from "../src/main.ts";
 
 const base: NodeJS.ProcessEnv = { DAHRK_HUB_URL: "ws://127.0.0.1:7071" };
 
@@ -41,8 +41,8 @@ test("mixed runtimes keep claude-code, codex and pi", () => {
   assert.deepEqual(opts.runtimes, ["claude-code", "codex", "pi"]);
 });
 
-test("a missing hub url throws", () => {
-  assert.throws(() => buildEdgeOptions({}));
+test("a missing hub url defaults to the hosted hub", () => {
+  assert.equal(buildEdgeOptions({}).hubUrl, DEFAULT_HUB_URL);
 });
 
 // -- token-only surface ---

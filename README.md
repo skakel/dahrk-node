@@ -26,21 +26,38 @@ Requires **Node 22+** and **pnpm 11+**.
 ```bash
 pnpm install
 pnpm build
-DAHRK_HUB_URL=ws://localhost:7071 pnpm --filter @dahrk/edge-node dev --token <enrolment-token>
+pnpm --filter @dahrk/edge-node dev --token <enrolment-token>
 ```
 
 The node auto-detects which agent runtimes are installed (claude / codex / pi), mints and persists a
 stable node id under `~/.dahrk/node.json`, dials out to the hub, and waits for Jobs. It advertises no
 inbound ports; repositories are cloned on demand from each Job's git URL.
 
+### Run it durably (pm2)
+
+For a long-running node, use the bundled pm2 config - self-contained, runs from source, no build step:
+
+```bash
+pnpm install
+export DAHRK_ENROL_TOKEN=<enrolment-token>   # or put it in a gitignored .env loaded via direnv
+pm2 start ecosystem.config.cjs
+pm2 logs dahrk-node                           # watch for the connect / welcome handshake
+```
+
+`pm2 restart dahrk-node` after a `git pull`; `pm2 stop` / `pm2 delete dahrk-node` to stop or remove.
+The hub URL defaults to `wss://hub.dahrk.net`; override it by exporting `DAHRK_HUB_URL`. pm2 does not
+parse `.env` itself, so either export the token in your shell or use direnv to load `.env` before
+starting; never commit the token.
+
 ## Configuration
 
-The token-only install needs just a hub URL and an enrolment token; everything else is auto-detected
-or pushed from the hub on connect. Flags win over the matching env var.
+The token-only install needs just an enrolment token; the hub URL defaults to `wss://hub.dahrk.net`
+and everything else is auto-detected or pushed from the hub on connect. Flags win over the matching
+env var.
 
 | Flag / env | Purpose |
 |---|---|
-| `--hub-url` / `DAHRK_HUB_URL` | Hub WebSocket URL (required). |
+| `--hub-url` / `DAHRK_HUB_URL` | Hub WebSocket URL (optional; defaults to `wss://hub.dahrk.net`). |
 | `--token` / `DAHRK_ENROL_TOKEN` | Enrolment token (required). |
 | `--name` / `DAHRK_NODE_NAME` | Display-name override (else the hub assigns one). |
 | `DAHRK_RUNTIMES` | Comma list to override runtime auto-detection (`claude-code,codex,pi`). |

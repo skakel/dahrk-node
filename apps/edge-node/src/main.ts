@@ -26,6 +26,9 @@ import type { CredentialMode, Runtime } from "@dahrk/contracts";
 
 const CLIENT_VERSION = process.env.npm_package_version ?? "0.0.0";
 
+/** Canonical hosted hub; used when neither DAHRK_HUB_URL nor --hub-url is set. */
+export const DEFAULT_HUB_URL = "wss://hub.dahrk.net";
+
 const list = (v: string | undefined): string[] =>
   (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -106,8 +109,9 @@ export async function resolveRuntimes(env: NodeJS.ProcessEnv): Promise<Runtime[]
  * and the node id / client version are left to the caller.
  */
 export function buildEdgeOptions(env: NodeJS.ProcessEnv, resolved?: ResolvedBoot): EdgeOptions {
-  const hubUrl = env.DAHRK_HUB_URL;
-  if (!hubUrl) throw new Error("set DAHRK_HUB_URL (e.g. ws://localhost:7071) or pass --hub-url");
+  // DAHRK_HUB_URL / --hub-url is now an override; unset falls back to the canonical hosted hub so the
+  // token-only install needs just an enrolment token.
+  const hubUrl = env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL;
   // DAHRK_REPOS is now an OPTIONAL self-hosted allowlist of registry repoIds this node will serve
   // (a binding, not a definition); empty = serve any repo, cloning on demand (demoted from the
   // former list of pre-cloned local paths).
