@@ -6,30 +6,28 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
-### Added
-
-- Client distribution: `dahrk-node` is now a publishable npm package installable three ways
-  (`npm install -g dahrk-node`, `brew install dahrkai/tap/dahrk`, `curl -fsSL https://dahrk.ai/install.sh | sh`).
-  All three provide the `dahrk` command.
-- `dahrk --version` and `dahrk --help`.
-- Tag-driven release CI: a `vX.Y.Z` tag publishes to npm, bumps the Homebrew tap formula, and cuts a
-  GitHub release.
-
-### Changed
-
-- The `apps/edge-node` package is built with `tsup` into a single bundled `dist/main.js` (the two
-  private workspace packages are inlined; published deps stay external) and published as `dahrk-node`.
-  The command it installs is `dahrk`.
-
-### Fixed
-
-- The installed binary now runs when invoked through a symlink (as npm/Homebrew global installs do):
-  the entrypoint guard resolves `argv[1]` through symlinks, so `dahrk --version` no longer exits
-  silently.
-
 ## [0.1.0]
 
-Initial public release of the Dahrk edge client (from-source / pm2).
+First published release of the `dahrk-node` edge client.
+
+### Added
+
+- Installable edge client. Run `dahrk start --token <enrolment-token>` and the process becomes a
+  self-managed node: it dials OUT to the hub over WebSocket (no inbound ports), auto-detects the
+  agent runtimes installed on the host (Claude Code, Codex, Pi), mints and persists a stable node id
+  under `~/.dahrk/node.json`, and runs each workflow stage in an isolated git worktree.
+- Subcommand CLI: `dahrk start` (default), `dahrk doctor`, `dahrk help`, `dahrk version`.
+  `dahrk doctor` preflights the Node version, installed runtimes, hub reachability, and token
+  validity before you commit to `start`. `--ephemeral` mints a throwaway node id for CI / one-shot
+  nodes.
+- Token-only install: the hub URL defaults to the hosted hub, so only an enrolment token is
+  required; `--token` / `--name` / `--hub-url` flags override the matching `DAHRK_*` env vars (the
+  legacy `SKAKEL_*` names are accepted as aliases during the rename).
+- Three install channels, all providing the `dahrk` command: npm (`npm install -g dahrk-node`),
+  Homebrew (`brew install dahrkai/tap/dahrk`), and curl (`curl -fsSL https://dahrk.ai/install.sh | sh`).
+- pm2 config (`ecosystem.config.cjs`) for running a durable node from source.
+- Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
+  formula, and cuts a GitHub release.
 
 [Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/dahrkai/dahrk-node/releases/tag/v0.1.0
