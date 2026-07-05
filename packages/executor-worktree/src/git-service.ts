@@ -72,10 +72,12 @@ export interface CommitPushResult {
   /** How many commits the branch is ahead of its base (`git rev-list --count base..HEAD`); 0 if
    *  the count could not be resolved (e.g. base not present locally). */
   commitsAhead: number;
-  /** Outcome of merging the freshly fetched base into the branch before pushing. `conflict`
-   *  means the merge was aborted and nothing was pushed; absent when integration was skipped (no base
-   *  given, or the base fetch failed) so the legacy push-only path is treated as clean. */
-  integration?: "clean" | "conflict";
+  /** Outcome of merging the freshly fetched base into the branch before pushing. `conflict` means the
+   *  merge started and hit content conflicts (aborted, nothing pushed); `diverged` means the merge
+   *  could not even START - the branch and base share no common history (unrelated/diverged), so it can
+   *  never auto-integrate and nothing was pushed; absent when integration was skipped (no base given, or
+   *  the base fetch failed) so the legacy push-only path is treated as clean. */
+  integration?: "clean" | "conflict" | "diverged";
   /** The conflicted paths when `integration === "conflict"` (`git diff --name-only --diff-filter=U`). */
   conflictFiles?: string[];
 }
@@ -351,6 +353,15 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
         auth?.cleanup();
       }
 
+      // Fail fast on an unborn worktree. If the base did not materialise (empty/unresolvable ref), the
+      // worktree checks out with no commit and HEAD does not resolve - every later `git ... HEAD` throws
+      // `ambiguous argument 'HEAD'`, and the run limps to deliver where the first commit lands on a
+      // history unrelated to the base. Refuse to hand back a broken worktree; a truthful intake error
+      // beats a run that fails opaquely three stages later.
+      if (!gitOk(worktreePath, ["rev-parse", "--verify", "-q", "HEAD"])) {
+        throw new Error(`base '${baseBranch}' did not materialise into ${worktreePath} (unborn HEAD)`);
+      }
+
       mkdirSync(join(worktreePath, ".skakel", "scratch"), { recursive: true });
       return refFor(spec, worktreePath);
     },
@@ -428,6 +439,13 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
           }
         }
         if (fetched) {
+          // Diverged histories cannot integrate: if the branch and the fetched base share no common
+          // ancestor, a `git merge` would fail to start (`refusing to merge unrelated histories`).
+          // Detect it up front so the outcome is an explicit `diverged` rather than depending on the
+          // catch below to classify the git error. This is the belt to the catch's braces.
+          if (!gitOk(worktreePath, ["merge-base", "HEAD", "FETCH_HEAD"])) {
+            return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "diverged" };
+          }
           try {
             // A non-fast-forward merge writes a commit, so pass the same committer identity as the commit.
             git(worktreePath, [
@@ -441,15 +459,34 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
             ], auth?.env);
             integration = "clean";
             headSha = git(worktreePath, ["rev-parse", "HEAD"]).trim();
-          } catch {
-            // Conflict: capture the conflicted paths, abort the merge (leaving the worktree clean), and
-            // do NOT push. The hub turns `integration: "conflict"` into a manual-merge elicitation.
-            const conflictFiles = git(worktreePath, ["diff", "--name-only", "--diff-filter=U"])
-              .split("\n")
-              .map((l) => l.trim())
-              .filter(Boolean);
-            git(worktreePath, ["merge", "--abort"]);
-            return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "conflict", conflictFiles };
+          } catch (mergeErr) {
+            // A merge can fail two very different ways, and they need different recovery:
+            //  (1) it STARTED and hit content conflicts - MERGE_HEAD exists and there are unmerged
+            //      paths. Capture them, `merge --abort` (leaves the worktree clean), push nothing; the
+            //      hub turns `integration: "conflict"` into a manual-merge elicitation.
+            //  (2) it FAILED TO START - no MERGE_HEAD (e.g. `refusing to merge unrelated histories`, an
+            //      unborn HEAD). Here `git merge --abort` would itself throw ("no merge to abort") and
+            //      MASK the real error as an opaque `push failed: Command failed: git merge --abort`.
+            //      So we must NOT abort a merge that never began; distinguish the two by MERGE_HEAD.
+            const inMerge = gitOk(worktreePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"]);
+            if (inMerge) {
+              const conflictFiles = git(worktreePath, ["diff", "--name-only", "--diff-filter=U"])
+                .split("\n")
+                .map((l) => l.trim())
+                .filter(Boolean);
+              git(worktreePath, ["merge", "--abort"]);
+              return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "conflict", conflictFiles };
+            }
+            // Unrelated/diverged histories: no shared ancestor, so the base can never auto-integrate.
+            // Report it as its own outcome (nothing pushed) rather than a content conflict - a
+            // `--allow-unrelated-histories` merge would only splice a garbage tree, so an agent cannot
+            // resolve it; the branch needs rebuilding from base.
+            const msg = (mergeErr as Error).message;
+            if (/unrelated histories|refusing to merge/i.test(msg)) {
+              return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "diverged" };
+            }
+            // Any other merge-start failure: surface the REAL git error truthfully instead of masking it.
+            throw mergeErr;
           }
         }
         git(worktreePath, ["push", remote, `HEAD:refs/heads/${branch}`], netEnv(auth?.env));

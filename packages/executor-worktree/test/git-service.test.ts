@@ -67,6 +67,26 @@ function advanceRemoteMain(remote: string, file: string, content: string, messag
   }
 }
 
+/** Push a branch to the bare remote whose root commit is UNRELATED to `main` (an orphan history, no
+ *  shared ancestor). Stands in for a per-issue branch that predates a base rewrite / was created empty
+ *  and grew its own root - the shape that makes a push-time base merge refuse `unrelated histories`. */
+function pushUnrelatedBranch(remote: string, branch: string): void {
+  const seed = mkdtempSync(join(tmpdir(), "dahrk-orphan-"));
+  try {
+    git(seed, ["clone", remote, "."]);
+    git(seed, ["config", "user.email", "harness@dahrk.test"]);
+    git(seed, ["config", "user.name", "Dahrk"]);
+    git(seed, ["checkout", "--orphan", "orphan-tmp"]);
+    git(seed, ["rm", "-rf", "--cached", "."]); // drop main's tree from the index so the root is clean
+    writeFileSync(join(seed, "ORPHAN.md"), "# unrelated root\n");
+    git(seed, ["add", "ORPHAN.md"]);
+    git(seed, ["commit", "-m", "unrelated root"]);
+    git(seed, ["push", "origin", `HEAD:refs/heads/${branch}`]);
+  } finally {
+    rmSync(seed, { recursive: true, force: true });
+  }
+}
+
 test("sanitizeBranchName produces a valid ref", () => {
   assert.equal(sanitizeBranchName("skakel/run A..b"), "skakel/run-A.b");
 });
@@ -273,6 +293,47 @@ test("commitAndPush reports a conflict and pushes nothing when the advanced base
     assert.throws(
       () => git(ref.worktreePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"]),
       "the merge was aborted (no MERGE_HEAD)",
+    );
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
+test("commitAndPush reports `diverged` (never a masked `merge --abort` error) on unrelated histories", async () => {
+  // Regression for the DHK-256 failure: the run's branch shared no history with the base, so the
+  // push-time `git merge FETCH_HEAD` refused ("unrelated histories") WITHOUT starting a merge (no
+  // MERGE_HEAD). The old catch ran `git merge --abort` unconditionally, which threw "no merge to
+  // abort" and MASKED the real cause as `push failed: Command failed: git merge --abort`. This must
+  // now surface as an explicit `diverged` outcome, push nothing, and leave no half-merge behind.
+  const remote = makeBareRemote();
+  pushUnrelatedBranch(remote, "skakel/issue-DIVERGED");
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-DIVERGED";
+
+  try {
+    // createWorktree checks out the existing (unrelated-history) per-issue branch from the mirror.
+    const ref = await svc.createWorktree({
+      repoId: "repo-diverged",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-diverged-1",
+      branch,
+    });
+    writeFileSync(join(ref.worktreePath, "ORPHAN.md"), "# this run's change\n");
+
+    // Must NOT throw (the old masking bug threw here). Must report `diverged`.
+    const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
+    assert.equal(r.integration, "diverged", "unrelated histories are reported as diverged");
+    assert.equal(r.pushed, false, "nothing is pushed when the base cannot integrate");
+
+    // No merge was left in progress (we never started or aborted one).
+    assert.throws(
+      () => git(ref.worktreePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"]),
+      "no half-merge is left behind",
     );
   } finally {
     rmSync(remote, { recursive: true, force: true });

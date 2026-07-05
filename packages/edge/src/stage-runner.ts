@@ -797,6 +797,23 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
             summary: `base advanced; merge conflict on ${job.branch} (manual merge needed)`,
           };
         }
+        // The branch and base share no common history (unrelated/diverged), so the base can never
+        // auto-integrate and nothing was pushed. Unlike a content conflict, an agent cannot resolve
+        // this - the branch needs rebuilding from base - so it is a real failure, not an `ok` conflict
+        // outcome. Surface it truthfully. (Forward-compat: once `@dahrk/contracts` ships a `diverged`
+        // IntegrationOutcome, forward `status: "ok", integration: "diverged"` for a native hub elicitation.)
+        if (r.integration === "diverged") {
+          return {
+            jobId,
+            status: "fail",
+            branch: job.branch,
+            headSha: r.headSha,
+            pushed: false,
+            nothingToCommit: r.nothingToCommit,
+            commitsAhead: r.commitsAhead,
+            summary: `branch history diverged from ${job.base}; cannot auto-integrate on ${job.branch} (the branch likely needs rebuilding from ${job.base})`,
+          };
+        }
         // Ambient nodes only: the hub set `openPr` so the edge best-effort opens the PR here (it holds
         // the host's `gh` auth), symmetric with the ambient push. Skip if the push landed nothing.
         // Failure is non-fatal - carried back as prError so the run stays green on the pushed branch.
