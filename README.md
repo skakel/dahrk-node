@@ -64,7 +64,7 @@ pm2 logs dahrk-node                           # watch for the connect / welcome 
 ```
 
 `pm2 restart dahrk-node` after a `git pull`; `pm2 stop` / `pm2 delete dahrk-node` to stop or remove.
-The hub URL defaults to `wss://hub.dahrk.net`; override it by exporting `DAHRK_HUB_URL`. pm2 does not
+The hub URL defaults to `wss://api.dahrk.ai`; override it by exporting `DAHRK_HUB_URL`. pm2 does not
 parse `.env` itself, so either export the token in your shell or use direnv to load `.env` before
 starting; never commit the token.
 
@@ -89,13 +89,13 @@ it missing / invalid / expired?). It exits non-zero if any check fails.
 
 ## Configuration
 
-The token-only install needs just an enrolment token; the hub URL defaults to `wss://hub.dahrk.net`
+The token-only install needs just an enrolment token; the hub URL defaults to `wss://api.dahrk.ai`
 and everything else is auto-detected or pushed from the hub on connect. Flags win over the matching
 env var.
 
 | Flag / env | Purpose |
 |---|---|
-| `--hub-url` / `DAHRK_HUB_URL` | Hub WebSocket URL (optional; defaults to `wss://hub.dahrk.net`). |
+| `--hub-url` / `DAHRK_HUB_URL` | Hub WebSocket URL (optional; defaults to `wss://api.dahrk.ai`). |
 | `--token` / `DAHRK_ENROL_TOKEN` | Enrolment token (required). |
 | `--name` / `DAHRK_NODE_NAME` | Display-name override (else the hub assigns one). |
 | `DAHRK_RUNTIMES` | Comma list to override runtime auto-detection (`claude-code,codex,pi`). |

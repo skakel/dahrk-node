@@ -32,7 +32,7 @@ import { runDoctor } from "./doctor.js";
 const CLIENT_VERSION = process.env.npm_package_version ?? "0.0.0";
 
 /** Canonical hosted hub; used when neither DAHRK_HUB_URL nor --hub-url is set. */
-export const DEFAULT_HUB_URL = "wss://hub.dahrk.net";
+export const DEFAULT_HUB_URL = "wss://api.dahrk.ai";
 
 const list = (v: string | undefined): string[] =>
   (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);

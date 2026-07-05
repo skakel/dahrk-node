@@ -122,10 +122,10 @@ test("commitAndPush commits the worktree and pushes the per-issue branch to the 
 
     // The harness stamps its own author/committer identity on the commit, independent of the
     // fixture repo's local git config (set to "Dahrk <harness@dahrk.test>" above). Default is
-    // Dahrk <noreply@dahrk.net>.
+    // Dahrk <noreply@dahrk.ai>.
     assert.equal(
       git(remote, ["show", "-s", "--format=%an <%ae> | %cn <%ce>", branch]).trim(),
-      "Dahrk <noreply@dahrk.net> | Dahrk <noreply@dahrk.net>",
+      "Dahrk <noreply@dahrk.ai> | Dahrk <noreply@dahrk.ai>",
     );
 
     // The bare remote now carries the branch with the file (the push landed).

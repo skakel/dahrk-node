@@ -2,7 +2,7 @@
 // from anywhere inside this clone - no dependency on any other repo. The only value you must supply is
 // the enrolment token (a secret): put DAHRK_ENROL_TOKEN in a gitignored .env (loaded via direnv) or
 // export it in your shell before starting. Everything else is defaulted or auto-detected:
-//   - hub URL defaults to wss://hub.dahrk.net (override with DAHRK_HUB_URL);
+//   - hub URL defaults to wss://api.dahrk.ai (override with DAHRK_HUB_URL);
 //   - a stable node id is minted and persisted at ~/.dahrk/node.json;
 //   - installed runtimes (claude / codex / pi) are auto-detected.
 // Runs from source via the bundled tsx - no build step. The legacy SKAKEL_* env names are still

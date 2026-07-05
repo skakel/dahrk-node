@@ -162,7 +162,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
   const mirrorsDir =
     opts.mirrorsDir ?? process.env.DAHRK_MIRRORS_DIR ?? process.env.SKAKEL_MIRRORS_DIR ?? join(homedir(), ".dahrk", "mirrors");
   const authorName = opts.authorName ?? process.env.DAHRK_GIT_AUTHOR_NAME ?? "Dahrk";
-  const authorEmail = opts.authorEmail ?? process.env.DAHRK_GIT_AUTHOR_EMAIL ?? "noreply@dahrk.net";
+  const authorEmail = opts.authorEmail ?? process.env.DAHRK_GIT_AUTHOR_EMAIL ?? "noreply@dahrk.ai";
   const log = opts.logger ?? noopLogger;
 
   const git = (cwd: string, args: string[], env?: NodeJS.ProcessEnv): string =>

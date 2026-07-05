@@ -6,6 +6,15 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+
+- Point the default hub URL at the canonical hosted endpoint `wss://api.dahrk.ai`. The 0.1.0 default
+  (`wss://hub.dahrk.net`) did not resolve, so a token-only `dahrk start` failed with
+  `getaddrinfo ENOTFOUND hub.dahrk.net`. Override via `--hub-url` / `DAHRK_HUB_URL` is unchanged.
+- Default the git commit author/committer identity email to `noreply@dahrk.ai` (was `noreply@dahrk.net`).
+
 ## [0.1.0]
 
 First published release of the `dahrk-node` edge client.
@@ -29,5 +38,6 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/dahrkai/dahrk-node/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dahrkai/dahrk-node/releases/tag/v0.1.0
