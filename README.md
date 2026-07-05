@@ -30,10 +30,11 @@ brew install dahrkai/tap/dahrk                     # Homebrew
 curl -fsSL https://dahrk.ai/install.sh | sh        # curl
 ```
 
-Then connect a node with an enrolment token from [app.dahrk.ai](https://app.dahrk.ai):
+Then connect a node with an enrolment token from [app.dahrk.ai](https://app.dahrk.ai) (run
+`dahrk doctor` first to preflight Node, runtimes, hub reachability, and the token):
 
 ```bash
-dahrk --token <enrolment-token>
+dahrk start --token <enrolment-token>
 ```
 
 The node auto-detects which agent runtimes are installed (claude / codex / pi), mints and persists a
@@ -48,7 +49,7 @@ Requires **Node 22+** and **pnpm 11+**.
 ```bash
 pnpm install
 pnpm build
-pnpm --filter dahrk-node dev --token <enrolment-token>
+DAHRK_HUB_URL=ws://localhost:7071 pnpm --filter dahrk-node dev start --token <enrolment-token>
 ```
 
 ### Run it durably (pm2)
@@ -66,6 +67,25 @@ pm2 logs dahrk-node                           # watch for the connect / welcome 
 The hub URL defaults to `wss://hub.dahrk.net`; override it by exporting `DAHRK_HUB_URL`. pm2 does not
 parse `.env` itself, so either export the token in your shell or use direnv to load `.env` before
 starting; never commit the token.
+
+## Commands
+
+```bash
+dahrk start --token <t> [--name <n>] [--hub-url <u>] [--ephemeral]   # run the node
+dahrk doctor [--token <t>] [--hub-url <u>]                           # preflight checks
+dahrk help [start|doctor]                                            # usage
+dahrk version                                                        # print the client version
+```
+
+`start` is the default, so `dahrk --token <t>` (no subcommand) still runs the node.
+
+`dahrk doctor` runs a preflight before you commit to `start` and reports a clear pass/fail for:
+the **Node version**, which **agent runtimes** are installed (with versions), **hub reachability**
+(does the WebSocket connect?), and **token validity** (does the hub accept the enrolment token, or is
+it missing / invalid / expired?). It exits non-zero if any check fails.
+
+`--ephemeral` mints a throwaway node id for the run instead of reading/persisting `~/.dahrk/node.json`
+- handy for CI or one-shot nodes that should leave no local state.
 
 ## Configuration
 
