@@ -125,6 +125,19 @@ export interface StageRunner {
 const nowIso = (): string => new Date().toISOString();
 const PREVIEW = 500;
 
+/**
+ * Forward-compat shim over `@dahrk/contracts@0.1.0`, which predates DHK-264's backup-push fields. The
+ * hub sends `PushJob.mode:"backup"` to preserve a run's committed HEAD on a durable `dahrk/wip/<runId>`
+ * ref after a `deliver` push hit a base-advanced conflict; the edge echoes that ref back as
+ * `PushResult.wipRef`. `decode` on the wire is a plain `JSON.parse`, so `mode` rides through intact even
+ * though the published type omits it (mirrors how this file already forwards the not-yet-published
+ * `diverged` integration outcome). Drop these shims and bump the `@dahrk/contracts` dependency once the
+ * contract publishing PR (harness #262) has released these fields.
+ */
+type PushMode = "deliver" | "backup";
+type PushJobWithMode = PushJob & { mode?: PushMode };
+type PushResultWithWip = PushResult & { wipRef?: string };
+
 /** Upload bytes to a hub-minted presigned URL (heavy trace payloads bypass the control socket). */
 const putBytes = async (url: string, body: Buffer, contentType: string): Promise<void> => {
   await fetch(url, { method: "PUT", headers: { "content-type": contentType }, body: new Uint8Array(body) });
@@ -753,97 +766,146 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         return { jobId, status: "fail", summary: `edge does not serve repo "${job.workspaceRef.repoId}"` };
       }
       lastUsed.set(runId, Date.now());
-
-      // Resolve the run's sticky worktree so the just-run stages' uncommitted diff is present. The
-      // pipeline pushes immediately after the last stage, so retention has not pruned it. Re-create
-      // off the stable branch only as a defensive fallback (the branch's prior commits are on the
-      // remote; any lost-but-uncommitted stage edits cannot be recovered here - they are gone).
-      let ref = worktrees.get(runId);
-      if (!ref) {
-        ref = await deps.gitService.createWorktree({
-          repoId: job.workspaceRef.repoId,
-          gitUrl: job.workspaceRef.gitUrl,
-          baseBranch: job.workspaceRef.baseBranch,
-          runId,
-          repo: job.workspaceRef.repo,
-          branch: job.branch,
-          ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
-        });
-        worktrees.set(runId, ref);
-      }
-
+      // Worktree-survival invariant (DHK-264 follow-up #2): count the push as in-flight for its whole
+      // duration so `applyRetention`'s `prunable` guard (`inFlight === 0`) cannot reap this run's
+      // worktree mid-push. Together with the `lastUsed` bump above (which makes this the most-recently-
+      // used run, so LRU/age pruning evicts others first), it keeps the worktree alive for a follow-up
+      // backup push - which depends on the committed HEAD still being present in that worktree.
+      inFlight.set(runId, (inFlight.get(runId) ?? 0) + 1);
       try {
-        const r = await deps.gitService.commitAndPush(ref, {
-          message: job.message,
-          branch: job.branch,
-          base: job.base,
-          ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
-        });
-        // the base advanced and merging it into the branch conflicted, so nothing was pushed.
-        // There is nothing to open a PR for; forward the conflict outcome and let the hub raise a
-        // manual-merge elicitation. `status: "ok"` (the executor did its job deterministically; a
-        // conflict is a real, non-error outcome, not a push failure that should trigger retries).
-        if (r.integration === "conflict") {
+        const mode: PushMode = (job as PushJobWithMode).mode ?? "deliver";
+
+        // Work-preservation push (DHK-264): the hub dispatches `mode:"backup"` after a `deliver` push
+        // hit a base-advanced conflict, to save the run's committed HEAD on a durable `dahrk/wip/<runId>`
+        // ref before the worktree is reaped. It MUST use the run's sticky worktree (which still holds the
+        // HEAD) and take the merge-free path - no base integration, no conflict/diverged branch, no PR. If
+        // the worktree is already gone the work cannot be preserved, so fail truthfully rather than
+        // re-cloning the branch (which would push the base tip and silently lose the run's work).
+        if (mode === "backup") {
+          const ref = worktrees.get(runId);
+          if (!ref) {
+            return {
+              jobId,
+              status: "fail",
+              branch: job.branch,
+              summary: `backup push: run ${runId} has no live worktree; committed HEAD cannot be preserved`,
+            };
+          }
+          try {
+            const r = await deps.gitService.backupPush(ref, {
+              message: job.message,
+              branch: job.branch,
+              ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
+            });
+            const result: PushResultWithWip = {
+              jobId,
+              status: "ok",
+              branch: job.branch,
+              headSha: r.headSha,
+              pushed: r.pushed,
+              nothingToCommit: r.nothingToCommit,
+              wipRef: r.wipRef,
+              summary: `backup: preserved ${r.headSha.slice(0, 7)} on ${r.wipRef} (no base merge, no PR)`,
+            };
+            return result;
+          } catch (e) {
+            return { jobId, status: "fail", branch: job.branch, summary: `backup push failed: ${(e as Error).message}` };
+          }
+        }
+
+        // Resolve the run's sticky worktree so the just-run stages' uncommitted diff is present. The
+        // pipeline pushes immediately after the last stage, so retention has not pruned it. Re-create
+        // off the stable branch only as a defensive fallback (the branch's prior commits are on the
+        // remote; any lost-but-uncommitted stage edits cannot be recovered here - they are gone).
+        let ref = worktrees.get(runId);
+        if (!ref) {
+          ref = await deps.gitService.createWorktree({
+            repoId: job.workspaceRef.repoId,
+            gitUrl: job.workspaceRef.gitUrl,
+            baseBranch: job.workspaceRef.baseBranch,
+            runId,
+            repo: job.workspaceRef.repo,
+            branch: job.branch,
+            ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
+          });
+          worktrees.set(runId, ref);
+        }
+
+        try {
+          const r = await deps.gitService.commitAndPush(ref, {
+            message: job.message,
+            branch: job.branch,
+            base: job.base,
+            ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
+          });
+          // the base advanced and merging it into the branch conflicted, so nothing was pushed.
+          // There is nothing to open a PR for; forward the conflict outcome and let the hub raise a
+          // manual-merge elicitation. `status: "ok"` (the executor did its job deterministically; a
+          // conflict is a real, non-error outcome, not a push failure that should trigger retries).
+          if (r.integration === "conflict") {
+            return {
+              jobId,
+              status: "ok",
+              branch: job.branch,
+              headSha: r.headSha,
+              pushed: false,
+              nothingToCommit: r.nothingToCommit,
+              commitsAhead: r.commitsAhead,
+              integration: "conflict",
+              ...(r.conflictFiles ? { conflictFiles: r.conflictFiles } : {}),
+              summary: `base advanced; merge conflict on ${job.branch} (manual merge needed)`,
+            };
+          }
+          // The branch and base share no common history (unrelated/diverged), so the base can never
+          // auto-integrate and nothing was pushed. Unlike a content conflict, an agent cannot resolve
+          // this - the branch needs rebuilding from base - so it is a real failure, not an `ok` conflict
+          // outcome. Surface it truthfully. (Forward-compat: once `@dahrk/contracts` ships a `diverged`
+          // IntegrationOutcome, forward `status: "ok", integration: "diverged"` for a native hub elicitation.)
+          if (r.integration === "diverged") {
+            return {
+              jobId,
+              status: "fail",
+              branch: job.branch,
+              headSha: r.headSha,
+              pushed: false,
+              nothingToCommit: r.nothingToCommit,
+              commitsAhead: r.commitsAhead,
+              summary: `branch history diverged from ${job.base}; cannot auto-integrate on ${job.branch} (the branch likely needs rebuilding from ${job.base})`,
+            };
+          }
+          // Ambient nodes only: the hub set `openPr` so the edge best-effort opens the PR here (it holds
+          // the host's `gh` auth), symmetric with the ambient push. Skip if the push landed nothing.
+          // Failure is non-fatal - carried back as prError so the run stays green on the pushed branch.
+          const pr =
+            job.openPr && r.pushed
+              ? await deps.gitService.openPrAmbient(ref, {
+                  branch: job.branch,
+                  base: job.base,
+                  title: job.openPr.title,
+                  body: job.openPr.body,
+                })
+              : undefined;
           return {
             jobId,
             status: "ok",
             branch: job.branch,
             headSha: r.headSha,
-            pushed: false,
+            pushed: r.pushed,
             nothingToCommit: r.nothingToCommit,
             commitsAhead: r.commitsAhead,
-            integration: "conflict",
-            ...(r.conflictFiles ? { conflictFiles: r.conflictFiles } : {}),
-            summary: `base advanced; merge conflict on ${job.branch} (manual merge needed)`,
+            ...(r.integration ? { integration: r.integration } : {}),
+            ...(pr?.prUrl ? { prUrl: pr.prUrl } : {}),
+            ...(pr?.prNumber !== undefined ? { prNumber: pr.prNumber } : {}),
+            ...(pr?.prError ? { prError: pr.prError } : {}),
+            summary: r.nothingToCommit
+              ? `no changes to commit; ${r.pushed ? "branch pushed" : "nothing pushed"}`
+              : `committed ${r.headSha.slice(0, 7)} and pushed ${job.branch}`,
           };
+        } catch (e) {
+          return { jobId, status: "fail", summary: `push failed: ${(e as Error).message}` };
         }
-        // The branch and base share no common history (unrelated/diverged), so the base can never
-        // auto-integrate and nothing was pushed. Unlike a content conflict, an agent cannot resolve
-        // this - the branch needs rebuilding from base - so it is a real failure, not an `ok` conflict
-        // outcome. Surface it truthfully. (Forward-compat: once `@dahrk/contracts` ships a `diverged`
-        // IntegrationOutcome, forward `status: "ok", integration: "diverged"` for a native hub elicitation.)
-        if (r.integration === "diverged") {
-          return {
-            jobId,
-            status: "fail",
-            branch: job.branch,
-            headSha: r.headSha,
-            pushed: false,
-            nothingToCommit: r.nothingToCommit,
-            commitsAhead: r.commitsAhead,
-            summary: `branch history diverged from ${job.base}; cannot auto-integrate on ${job.branch} (the branch likely needs rebuilding from ${job.base})`,
-          };
-        }
-        // Ambient nodes only: the hub set `openPr` so the edge best-effort opens the PR here (it holds
-        // the host's `gh` auth), symmetric with the ambient push. Skip if the push landed nothing.
-        // Failure is non-fatal - carried back as prError so the run stays green on the pushed branch.
-        const pr =
-          job.openPr && r.pushed
-            ? await deps.gitService.openPrAmbient(ref, {
-                branch: job.branch,
-                base: job.base,
-                title: job.openPr.title,
-                body: job.openPr.body,
-              })
-            : undefined;
-        return {
-          jobId,
-          status: "ok",
-          branch: job.branch,
-          headSha: r.headSha,
-          pushed: r.pushed,
-          nothingToCommit: r.nothingToCommit,
-          commitsAhead: r.commitsAhead,
-          ...(r.integration ? { integration: r.integration } : {}),
-          ...(pr?.prUrl ? { prUrl: pr.prUrl } : {}),
-          ...(pr?.prNumber !== undefined ? { prNumber: pr.prNumber } : {}),
-          ...(pr?.prError ? { prError: pr.prError } : {}),
-          summary: r.nothingToCommit
-            ? `no changes to commit; ${r.pushed ? "branch pushed" : "nothing pushed"}`
-            : `committed ${r.headSha.slice(0, 7)} and pushed ${job.branch}`,
-        };
-      } catch (e) {
-        return { jobId, status: "fail", summary: `push failed: ${(e as Error).message}` };
+      } finally {
+        inFlight.set(runId, Math.max(0, (inFlight.get(runId) ?? 1) - 1));
       }
     },
 

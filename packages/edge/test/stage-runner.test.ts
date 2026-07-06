@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JobRequest, Runner, RunnerContext, TraceEvent, TraceMeta } from "@dahrk/contracts";
+import type { JobRequest, PushJob, Runner, RunnerContext, TraceEvent, TraceMeta } from "@dahrk/contracts";
 import { createGitService, createMockRunner } from "@dahrk/executor-worktree";
 import { createStageRunner, type BlobPutRequestArgs, type TraceSink } from "../src/stage-runner.js";
 
@@ -394,4 +394,72 @@ test("the Job's runtimeEnv is threaded onto the runner ctx (injection boundary)"
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/** A recording GitService stub: enough surface for the runPush routing tests, no real git. */
+function recordingGitService() {
+  const calls: { method: string; branch?: string }[] = [];
+  const ref = { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath: "/tmp/wt", scratchPath: "/tmp/wt/.skakel" };
+  const svc = {
+    createWorktree: async (spec: { branch?: string }) => {
+      calls.push({ method: "createWorktree", ...(spec.branch ? { branch: spec.branch } : {}) });
+      return ref;
+    },
+    commitAndPush: async (_r: unknown, opts: { branch: string }) => {
+      calls.push({ method: "commitAndPush", branch: opts.branch });
+      return { headSha: "deadbeef1234567", pushed: true, nothingToCommit: false, commitsAhead: 1, integration: "clean" as const };
+    },
+    backupPush: async (_r: unknown, opts: { branch: string }) => {
+      calls.push({ method: "backupPush", branch: opts.branch });
+      return { headSha: "cafebabe7654321", pushed: true, nothingToCommit: false, wipRef: opts.branch };
+    },
+    openPrAmbient: async () => ({ prError: "not exercised" }),
+    teardownWorktree: async () => undefined,
+  };
+  return { svc, calls };
+}
+
+const mkPushJob = (over: Partial<PushJob> & { mode?: "deliver" | "backup" }): PushJob => ({
+  tenantId: "t_default",
+  runId: "run-push-1",
+  jobId: "job-push-1",
+  awakeableId: "awk-push",
+  workspaceRef: { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
+  branch: "skakel/issue-PUSH",
+  base: "main",
+  message: "deliver",
+  ...over,
+});
+
+test("runPush mode:backup routes to backupPush on the sticky worktree and returns wipRef", async () => {
+  const { svc, calls } = recordingGitService();
+  const runner = createStageRunner({ gitService: svc as never, makeRunner: createMockRunner, rules: [], sendProgress: () => undefined });
+
+  // A first deliver push seeds the run's sticky worktree (via the createWorktree fallback).
+  await runner.runPush(mkPushJob({ jobId: "job-deliver", branch: "skakel/issue-PUSH" }));
+  assert.ok(calls.some((c) => c.method === "commitAndPush"), "deliver took the commitAndPush path");
+
+  // The backup push reuses that worktree and force-preserves HEAD on the wip ref - no commitAndPush.
+  const wipRef = "dahrk/wip/run-push-1";
+  const before = calls.length;
+  const res = await runner.runPush(mkPushJob({ jobId: "job-backup", mode: "backup", branch: wipRef, message: "preserve" }));
+  const backupCalls = calls.slice(before);
+
+  assert.equal(res.status, "ok");
+  assert.equal((res as { wipRef?: string }).wipRef, wipRef, "the preserved ref is echoed back");
+  assert.equal(res.pushed, true);
+  assert.equal(res.headSha, "cafebabe7654321");
+  assert.deepEqual(backupCalls, [{ method: "backupPush", branch: wipRef }], "only backupPush ran (no merge, no PR)");
+});
+
+test("runPush mode:backup fails truthfully when the run has no live worktree", async () => {
+  const { svc, calls } = recordingGitService();
+  const runner = createStageRunner({ gitService: svc as never, makeRunner: createMockRunner, rules: [], sendProgress: () => undefined });
+
+  // No prior stage/deliver for this run, so the sticky worktree is absent. Backup must NOT re-clone the
+  // branch (that would push the base tip and lose the work) - it fails, preserving nothing silently.
+  const res = await runner.runPush(mkPushJob({ runId: "run-missing", jobId: "job-backup-miss", mode: "backup", branch: "dahrk/wip/run-missing" }));
+  assert.equal(res.status, "fail");
+  assert.match(res.summary, /no live worktree/);
+  assert.equal(calls.length, 0, "neither backupPush nor createWorktree was called");
 });

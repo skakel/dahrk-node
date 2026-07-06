@@ -342,6 +342,64 @@ test("commitAndPush reports `diverged` (never a masked `merge --abort` error) on
   }
 });
 
+test("backupPush preserves the run's HEAD on a disposable wip ref with no base merge and no PR", async () => {
+  // DHK-264: a `deliver` that hit a base-advanced conflict would leave nothing pushed and lose the
+  // run's committed HEAD with the reaped worktree. `backupPush` force-pushes HEAD as-is to a throwaway
+  // `dahrk/wip/<runId>` ref WITHOUT integrating the base, so the work is retrievable on origin.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-BACKUP";
+  const wipRef = "dahrk/wip/run-backup-1";
+
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-backup",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-backup-1",
+      branch,
+    });
+    // The base advances on the SAME file this run touched: a deliver push would conflict and push
+    // nothing. The backup push must ignore the base entirely and preserve HEAD regardless.
+    advanceRemoteMain(remote, "README.md", "# remote change\n", "parallel edited README");
+    writeFileSync(join(ref.worktreePath, "README.md"), "# this run's change\n");
+    // Engine-owned scratch must never enter the preserved ref either.
+    writeFileSync(join(ref.scratchPath, "state.json"), "{}\n");
+
+    const r = await svc.backupPush(ref, { message: "preserve wip", branch: wipRef });
+    assert.equal(r.pushed, true);
+    assert.equal(r.nothingToCommit, false);
+    assert.equal(r.wipRef, wipRef);
+    assert.equal(r.headSha, git(ref.worktreePath, ["rev-parse", "HEAD"]).trim(), "returns the preserved sha");
+
+    // The wip ref exists on the remote and carries THIS run's HEAD, verbatim - no base merge.
+    assert.doesNotThrow(() => git(remote, ["rev-parse", "--verify", wipRef]));
+    assert.equal(git(remote, ["rev-parse", wipRef]).trim(), r.headSha, "the wip ref points at the preserved sha");
+    assert.match(git(remote, ["show", `${wipRef}:README.md`]), /this run's change/);
+    const tree = git(remote, ["ls-tree", "-r", "--name-only", wipRef]);
+    assert.ok(!tree.split("\n").some((p) => p.startsWith(".skakel/scratch")), "scratch is excluded from the wip ref");
+    // No PR was opened and the per-issue branch was NOT pushed (backup only touches the wip ref).
+    assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "the per-issue branch is untouched");
+
+    // The wip ref is disposable: a second backup force-updates it to the new HEAD.
+    writeFileSync(join(ref.worktreePath, "more.txt"), "further work\n");
+    const r2 = await svc.backupPush(ref, { message: "preserve wip 2", branch: wipRef });
+    assert.notEqual(r2.headSha, r.headSha, "a new commit advanced HEAD");
+    assert.equal(git(remote, ["rev-parse", wipRef]).trim(), r2.headSha, "the wip ref was force-updated");
+
+    // A no-op backup (nothing new to commit) still preserves the existing HEAD.
+    const r3 = await svc.backupPush(ref, { message: "noop backup", branch: wipRef });
+    assert.equal(r3.nothingToCommit, true);
+    assert.equal(r3.headSha, r2.headSha);
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
 test("commitAndPush succeeds when the target repo's own .gitignore ignores .skakel/scratch", async () => {
   // The harness repo (which Skakel dogfoods on) gitignores `.skakel/scratch/`. Naming scratch as an
   // explicit `:!.skakel/scratch` pathspec made `git add` fail ("paths are ignored ... use -f") and so

@@ -82,6 +82,28 @@ export interface CommitPushResult {
   conflictFiles?: string[];
 }
 
+/** Options for {@link GitService.backupPush}: a merge-free push of the run's HEAD to a disposable ref. */
+export interface BackupPushOpts {
+  /** Commit message for any pending (uncommitted) work captured before the backup push. */
+  message: string;
+  /** The disposable WIP ref to force-update with HEAD (e.g. `dahrk/wip/<runId>`). */
+  branch: string;
+  /** Brokered HTTPS push token; absent = ambient host credentials are used. */
+  credentialToken?: string;
+}
+
+/** Outcome of {@link GitService.backupPush}. */
+export interface BackupPushResult {
+  /** HEAD sha after the (possible) commit - the sha now preserved on the WIP ref. */
+  headSha: string;
+  /** True if the WIP ref was force-updated on the remote. */
+  pushed: boolean;
+  /** True when the worktree had no uncommitted changes to commit before the push. */
+  nothingToCommit: boolean;
+  /** The ref HEAD was force-pushed to (echoes `opts.branch`, sanitised). */
+  wipRef: string;
+}
+
 /** Options for {@link GitService.openPrAmbient}. */
 export interface OpenPrOpts {
   /** The pushed branch to open the PR from. */
@@ -113,6 +135,15 @@ export interface GitService {
    * inference. Pushes via the brokered token when given, else ambient host credentials.
    */
   commitAndPush(ref: WorkspaceRef, opts: CommitPushOpts): Promise<CommitPushResult>;
+  /**
+   * Merge-free work preservation (DHK-264): commit any pending work and force-push HEAD directly to
+   * `opts.branch` (a disposable `dahrk/wip/<runId>` ref) on the REAL remote, WITHOUT fetching or merging
+   * the base and WITHOUT opening a PR. Dispatched by the hub when a `deliver` push hit a base-advanced
+   * conflict, so the run's committed HEAD is saved before its worktree is reaped (the merge that
+   * `commitAndPush` does would abort and push nothing here). The WIP ref is disposable, so it is
+   * force-updated. Returns the preserved sha and the ref it landed on.
+   */
+  backupPush(ref: WorkspaceRef, opts: BackupPushOpts): Promise<BackupPushResult>;
   /**
    * Ambient-node PR fallback: after a successful push, best-effort open (or reuse) the PR via the
    * host's `gh` CLI, using the host's ambient `gh` auth (or `GH_TOKEN`/`GITHUB_TOKEN`). Symmetric with
@@ -224,6 +255,33 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     } catch (e) {
       log.warn(`could not set worktree scratch exclude at ${worktreePath}: ${(e as Error).message}`);
     }
+  };
+
+  /**
+   * Stage everything except the engine-owned `.skakel/scratch` dir and commit iff something is staged.
+   * Shared by the deliver push and the merge-free backup push. Untracks scratch if a prior commit
+   * captured it, then `add -A` the rest; a commit is written only when the worktree is dirty (so a
+   * no-op push commits nothing). Returns the resulting HEAD sha and whether a commit was made.
+   */
+  const commitPending = (worktreePath: string, message: string): { headSha: string; dirty: boolean } => {
+    const SCRATCH = ".skakel/scratch";
+    excludeScratchLocally(worktreePath);
+    git(worktreePath, ["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", SCRATCH]);
+    git(worktreePath, ["add", "-A", "--", "."]);
+    // Commit only when something is actually staged (`diff --cached --quiet` exits non-zero iff so).
+    const dirty = !gitOk(worktreePath, ["diff", "--cached", "--quiet"]);
+    if (dirty) {
+      git(worktreePath, [
+        "-c",
+        `user.name=${authorName}`,
+        "-c",
+        `user.email=${authorEmail}`,
+        "commit",
+        "-m",
+        message,
+      ]);
+    }
+    return { headSha: git(worktreePath, ["rev-parse", "HEAD"]).trim(), dirty };
   };
 
   /**
@@ -373,28 +431,10 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       }
       const branch = sanitizeBranchName(opts.branch);
       // The engine-owned scratch dir (state.json, traces, issue.md) lives in the worktree so stages
-      // can read/write it, but it is RUNTIME state and must never enter the PR. Untrack it if a prior
-      // commit captured it (so continuation drops it), then stage everything else. Excluding it here -
-      // not relying on each target repo's .gitignore - protects every repo the harness runs against.
-      const SCRATCH = ".skakel/scratch";
-      excludeScratchLocally(worktreePath);
-      git(worktreePath, ["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", SCRATCH]);
-      git(worktreePath, ["add", "-A", "--", "."]);
-      // Commit only when something is actually staged (`diff --cached --quiet` exits non-zero iff so).
-      const hasStaged = !gitOk(worktreePath, ["diff", "--cached", "--quiet"]);
-      if (hasStaged) {
-        git(worktreePath, [
-          "-c",
-          `user.name=${authorName}`,
-          "-c",
-          `user.email=${authorEmail}`,
-          "commit",
-          "-m",
-          opts.message,
-        ]);
-      }
-      const dirty = hasStaged;
-      let headSha = git(worktreePath, ["rev-parse", "HEAD"]).trim();
+      // can read/write it, but it is RUNTIME state and must never enter the PR. `commitPending` untracks
+      // it (so continuation drops it), stages everything else, and commits only if the worktree is dirty.
+      const { headSha: committedSha, dirty } = commitPending(worktreePath, opts.message);
+      let headSha = committedSha;
       // How far the branch is ahead of its base, for a human-readable "N commits" in Linear. The base
       // may be a bare name (e.g. `main`) resolved via the mirror's tracking ref; best-effort, so a
       // failure (base not present locally) yields 0 rather than aborting the push.
@@ -495,6 +535,30 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
         auth?.cleanup();
       }
       return { headSha, pushed, nothingToCommit: !dirty, commitsAhead, ...(integration ? { integration } : {}) };
+    },
+
+    async backupPush(ref, opts) {
+      const { worktreePath } = ref;
+      if (!existsSync(worktreePath) || !gitOk(worktreePath, ["rev-parse", "--git-dir"])) {
+        throw new Error(`worktree missing for backup push: ${worktreePath}`);
+      }
+      const wipRef = sanitizeBranchName(opts.branch);
+      // Commit any pending work so the WIP ref captures the FULL run state, not just the last commit.
+      const { headSha, dirty } = commitPending(worktreePath, opts.message);
+      // Force-push HEAD directly to the disposable WIP ref on the REAL remote (never `origin`, which for
+      // a mirror-backed worktree may be the local mirror). Deliberately NO base fetch/merge and NO PR:
+      // the ref only has to preserve this run's committed HEAD before the worktree is reaped, so the
+      // integration that `commitAndPush` does (which would abort on the very conflict that triggered this
+      // backup) is skipped. The ref is disposable, so `--force` overwrites any prior WIP tip. The brokered
+      // token (when given) authorises the push via its askpass helper; else ambient host credentials.
+      const auth = opts.credentialToken ? setupAuth(opts.credentialToken) : undefined;
+      const remote = opts.credentialToken ? withTokenUser(ref.gitUrl) : ref.gitUrl;
+      try {
+        git(worktreePath, ["push", "--force", remote, `HEAD:refs/heads/${wipRef}`], netEnv(auth?.env));
+      } finally {
+        auth?.cleanup();
+      }
+      return { headSha, pushed: true, nothingToCommit: !dirty, wipRef };
     },
 
     async openPrAmbient(ref, opts) {
