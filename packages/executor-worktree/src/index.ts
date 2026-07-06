@@ -29,6 +29,8 @@ export type {
   WorktreeSpec,
   CommitPushOpts,
   CommitPushResult,
+  BackupPushOpts,
+  BackupPushResult,
   OpenPrOpts,
   OpenPrResult,
 } from "./git-service.js";
