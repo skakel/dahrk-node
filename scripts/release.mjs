@@ -195,7 +195,7 @@ function sanitizeNotes(text) {
     .replace(/\brun-[a-z0-9]{6,}\b/gi, '') // internal run IDs
     .replace(/\(\s*[,\s]*\)/g, '') // parens emptied by the removals: "(DHK-284)" -> ""
     .replace(/[ \t]+([),.:;])/g, '$1') // space before punctuation left by a removal
-    .replace(/[ \t]{2,}/g, ' ') // squeeze doubled spaces
+    .replace(/(\S)[ \t]{2,}/g, '$1 ') // squeeze doubled spaces mid-line (preserve leading indent)
     .replace(/[ \t]+$/gm, '') // trailing whitespace
     .replace(/\n{3,}/g, '\n\n') // collapse gaps a trailer line left behind
 }

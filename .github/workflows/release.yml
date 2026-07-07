@@ -71,19 +71,52 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Bump Homebrew tap formula
-        if: env.TAP_PUSH_TOKEN != ''
+      - name: Extract changelog notes
+        id: notes
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          set -euo pipefail
-          # Wait for the just-published tarball to be fetchable, then hash it.
+          # Pull the section for this version out of CHANGELOG.md (between "## [VERSION]" and the next
+          # "## "). Matches a dated heading (`## [x.y.z] - YYYY-MM-DD`) too — the version is a prefix.
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="$VERSION" '
+              $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+              grab && /^## / { exit }
+              grab { print }
+            ' CHANGELOG.md > /tmp/notes.md
+          fi
+          if [ ! -s /tmp/notes.md ]; then
+            echo "Release ${VERSION}." > /tmp/notes.md
+          fi
+          echo "path=/tmp/notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.notes.outputs.path }}
+
+      # Homebrew is a secondary channel, and a freshly published npm tarball can take several minutes to
+      # propagate to the registry CDN. Keep this LAST and NON-FATAL: npm + the GitHub release above are
+      # the release, so a slow tarball must never fail the run or block them. If it doesn't appear in
+      # time, warn and skip — bump the tap later once the tarball is live (see packaging/homebrew).
+      - name: Bump Homebrew tap formula
+        if: env.TAP_PUSH_TOKEN != ''
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -uo pipefail
           TARBALL="https://registry.npmjs.org/dahrk-node/-/dahrk-node-${VERSION}.tgz"
-          for attempt in $(seq 1 12); do
-            if curl -fsSL "$TARBALL" -o /tmp/dahrk.tgz; then break; fi
-            echo "tarball not available yet (attempt $attempt), retrying..."
-            sleep 10
+          # Poll up to ~10 minutes for the tarball to propagate.
+          for attempt in $(seq 1 30); do
+            if curl -fsSL "$TARBALL" -o /tmp/dahrk.tgz && [ -s /tmp/dahrk.tgz ]; then break; fi
+            echo "tarball not available yet (attempt $attempt/30), retrying in 20s..."
+            sleep 20
           done
+          if [ ! -s /tmp/dahrk.tgz ]; then
+            echo "::warning::npm tarball for ${VERSION} did not propagate in time; skipped the Homebrew tap bump. Re-run it once the tarball is live."
+            exit 0
+          fi
           SHA=$(shasum -a 256 /tmp/dahrk.tgz | cut -d' ' -f1)
           echo "sha256=$SHA"
 
@@ -101,26 +134,3 @@ jobs:
             git commit -am "dahrk ${VERSION}"
             git push
           fi
-
-      - name: Extract changelog notes
-        id: notes
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          # Pull the section for this version out of CHANGELOG.md (between "## [VERSION]" and the next "## ").
-          if [ -f CHANGELOG.md ]; then
-            awk -v ver="$VERSION" '
-              $0 ~ "^## \\[" ver "\\]" { grab=1; next }
-              grab && /^## / { exit }
-              grab { print }
-            ' CHANGELOG.md > /tmp/notes.md
-          fi
-          if [ ! -s /tmp/notes.md ]; then
-            echo "Release ${VERSION}." > /tmp/notes.md
-          fi
-          echo "path=/tmp/notes.md" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: ${{ steps.notes.outputs.path }}
