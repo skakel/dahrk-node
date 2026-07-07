@@ -121,17 +121,25 @@ pnpm test        # Node built-in test runner (no Docker, no network, no live mod
 The `dahrk-node` client (in `apps/edge-node`) is published to npm on a git tag. Releases follow
 [Keep a Changelog](https://keepachangelog.com/) and [semver](https://semver.org/):
 
-1. Move the `## [Unreleased]` entries in [`CHANGELOG.md`](CHANGELOG.md) into a new `## [x.y.z]` section.
-2. Bump `version` in `apps/edge-node/package.json` to match.
-3. Commit, then tag and push:
-   ```bash
-   git tag vX.Y.Z && git push origin vX.Y.Z
-   ```
+1. (Optional) hand-write this release's notes under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md);
+   otherwise leave it empty and the release command drafts them from the commit log.
+2. Run `pnpm release <version>`, review/edit the changelog in the PR it opens, and merge.
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) then gates that the tag equals the
-package version, runs the CI checks, publishes to npm, bumps the Homebrew tap formula, and cuts a
-GitHub release from the changelog. See [`packaging/homebrew/README.md`](packaging/homebrew/README.md)
-for the tap, and the workflow header for the required secrets (`NPM_TOKEN`, `TAP_PUSH_TOKEN`).
+`pnpm release` ([`scripts/release.mjs`](scripts/release.mjs)) bumps the version in both `package.json`
+files, rewrites the changelog (moving `[Unreleased]` into a `[x.y.z]` section and repointing the
+compare links), and opens a `Release x.y.z` PR. When `[Unreleased]` is empty it drafts the section from
+the commits since the last tag using Claude; hand-written entries are always used verbatim. Flags:
+`--dry-run` (preview, write nothing), `--ai-polish` (refine even hand-written entries), `--no-ai` (skip
+the model). The AI draft needs credentials via the Anthropic SDK (`ANTHROPIC_API_KEY`, or an
+`ant auth login` profile); `--no-ai` runs without any.
+
+Merging the PR lets [`.github/workflows/tag-release.yml`](.github/workflows/tag-release.yml) push the
+`vX.Y.Z` tag, which triggers [`.github/workflows/release.yml`](.github/workflows/release.yml): it gates
+that the tag equals the package version, runs the CI checks, publishes to npm, bumps the Homebrew tap
+formula, and cuts a GitHub release from the changelog. See
+[`packaging/homebrew/README.md`](packaging/homebrew/README.md) for the tap, and the workflow headers for
+the required secrets (`NPM_TOKEN`, `TAP_PUSH_TOKEN`, `RELEASE_PAT`, and optionally `ANTHROPIC_API_KEY`
+for drafting changelogs in CI).
 
 ## Attribution
 
