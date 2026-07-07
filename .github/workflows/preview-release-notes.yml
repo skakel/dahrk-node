@@ -1,0 +1,57 @@
+name: Preview release notes
+
+# Manually preview the release notes for a prospective version, using the same drafting path as
+# `pnpm release` (hand-written [Unreleased] entries win; otherwise claude-opus-4-8 drafts from the
+# commit log). Publishes nothing — no tag, no npm, no PR — so it's a safe way to see the notes (and to
+# exercise the ANTHROPIC_API_KEY secret) before cutting a release.
+#
+# Run it from the Actions tab: "Preview release notes" -> Run workflow -> enter the version.
+#
+# Uses the ANTHROPIC_API_KEY secret for the AI draft; if it's unset the script falls back to the
+# commit-subject list (still sanitised of internal identifiers).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to preview notes for (x.y.z)"
+        required: true
+        type: string
+      ai_polish:
+        description: "Force an AI draft even if CHANGELOG [Unreleased] has hand-written entries"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags, so the commit range resolves
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Draft release notes
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          POLISH=""
+          if [ "${{ inputs.ai_polish }}" = "true" ]; then POLISH="--ai-polish"; fi
+          pnpm release "${{ inputs.version }}" --dry-run $POLISH --out=notes.md
+          {
+            echo "## Draft release notes for v${{ inputs.version }}"
+            echo
+            echo "> Preview only — nothing was tagged or published. Review, then hand-write into"
+            echo "> CHANGELOG's [Unreleased] or let \`pnpm release\` regenerate them."
+            echo
+            echo '```markdown'
+            cat notes.md
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
