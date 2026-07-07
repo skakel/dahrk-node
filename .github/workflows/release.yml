@@ -2,10 +2,11 @@ name: Release
 
 # Tag-driven release for the `dahrk-node` npm package (the edge client; binary/command `dahrk`).
 #
-# Cut a release by bumping apps/edge-node/package.json, moving the CHANGELOG [Unreleased] entries into
-# a versioned section, committing, then pushing a matching tag:
-#
-#   git tag v0.1.0 && git push origin v0.1.0
+# Cut a release with `pnpm release <version>` (see README "Releasing"): it bumps apps/edge-node and root
+# package.json, rewrites the CHANGELOG, and opens a "Release x.y.z" PR. Merging that PR lets
+# tag-release.yml push the matching vX.Y.Z tag, which fires this workflow. (Manual equivalent, if you
+# skip the tooling: bump the version, move the CHANGELOG [Unreleased] entries into a versioned section,
+# commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.)
 #
 # This workflow then: gates that the tag equals the package version, runs the CI checks, publishes to
 # npm, bumps the Homebrew tap formula, and cuts a GitHub release from the changelog.
@@ -17,6 +18,9 @@ name: Release
 #   TAP_PUSH_TOKEN  - a PAT with `repo` scope on github.com/dahrkai/homebrew-tap. Optional: if unset,
 #                     the tap-bump step is skipped (e.g. before the tap repo exists). See
 #                     packaging/homebrew/README.md.
+#   RELEASE_PAT     - used by tag-release.yml (not this workflow) to push the tag so this workflow fires;
+#                     a tag pushed by the default GITHUB_TOKEN would not re-trigger it. See
+#                     tag-release.yml. Optional: if unset, push the tag manually.
 
 on:
   push:
