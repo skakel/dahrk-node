@@ -6,6 +6,15 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Changed
+
+- Release tooling: harden generated release notes so internal identifiers never reach the public
+  changelog. Linear-style keys, internal run IDs, and commit trailers are stripped from every notes
+  source (hand-written, AI-drafted, or the commit-log fallback), drafts prefer GitHub `(#N)`
+  references, and version headings are dated. (#10)
+- Release tooling: add a manual "Preview release notes" CI workflow that drafts the notes for a
+  prospective version without tagging or publishing, so they can be reviewed before a release. (#11)
+
 ## [0.1.2]
 
 ### Added
