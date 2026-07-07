@@ -6,6 +6,22 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.2]
+
+### Added
+
+- Work-preservation backup push (DHK-284): a new merge-free `mode: "backup"` force-pushes the run's
+  HEAD to `dahrk/wip/<runId>` with no base merge or PR, so in-flight work survives without touching the
+  integration branch.
+
+### Fixed
+
+- Stop masking push-integration merge failures. A push whose base merge failed before a merge even
+  started (e.g. unrelated histories, no `MERGE_HEAD`) previously surfaced an opaque
+  `git merge --abort` error that destroyed the real diagnostic. Such cases now report a distinct
+  `diverged` outcome and re-throw genuine merge-start failures truthfully, with a merge-base
+  short-circuit and a fail-fast guard against an unborn HEAD.
+
 ## [0.1.1]
 
 ### Fixed
@@ -38,6 +54,7 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/dahrkai/dahrk-node/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/dahrkai/dahrk-node/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dahrkai/dahrk-node/releases/tag/v0.1.0
