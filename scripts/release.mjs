@@ -89,7 +89,9 @@ if (unreleased && !AI_POLISH) {
 } else {
   section = await draftSection(unreleased)
 }
-section = section.trim()
+// Scrub internal identifiers regardless of source (hand-written, AI, or fallback) — these notes are
+// public.
+section = sanitizeNotes(section).trim()
 if (!section) die('resolved an empty changelog section — nothing to release')
 
 // ---- compute file rewrites ----------------------------------------------------------------------
@@ -148,8 +150,9 @@ function rewriteChangelog(version, section, prevVersion) {
   let text = readFileSync(CHANGELOG, 'utf8')
 
   // Replace the [Unreleased] block (heading + body, up to the next `## ` or the link refs) with an
-  // empty [Unreleased] followed by the new version section.
-  const block = `## [Unreleased]\n\n## [${version}]\n\n${section}\n\n`
+  // empty [Unreleased] followed by the new dated version section (Keep a Changelog convention).
+  const date = new Date().toISOString().slice(0, 10)
+  const block = `## [Unreleased]\n\n## [${version}] - ${date}\n\n${section}\n\n`
   text = text.replace(/^## \[Unreleased\]\s*\n[\s\S]*?(?=^## |\n\[Unreleased\]:)/m, block)
 
   // Compare links at the foot.
@@ -174,11 +177,28 @@ function bumpPackage(path, version) {
   return JSON.stringify(pkg, null, 2) + '\n'
 }
 
+// Strip internal identifiers so they can never reach the public notes, whatever the source. Removes
+// Linear-style tracker keys, internal run IDs, and commit trailers, then tidies the fallout (empty
+// parens left behind, doubled spaces, trailing whitespace).
+function sanitizeNotes(text) {
+  return text
+    .replace(/^(?:Co-authored-by|Signed-off-by):.*$/gim, '') // commit trailers
+    .replace(/\b(?:DHK|SKA|LABS|TEST|HAR|SL)-\d+\b/g, '') // Linear-style keys
+    .replace(/\brun-[a-z0-9]{6,}\b/gi, '') // internal run IDs
+    .replace(/\(\s*[,\s]*\)/g, '') // parens emptied by the removals: "(DHK-284)" -> ""
+    .replace(/[ \t]+([),.:;])/g, '$1') // space before punctuation left by a removal
+    .replace(/[ \t]{2,}/g, ' ') // squeeze doubled spaces
+    .replace(/[ \t]+$/gm, '') // trailing whitespace
+    .replace(/\n{3,}/g, '\n\n') // collapse gaps a trailer line left behind
+}
+
 // Draft a Keep-a-Changelog section from the commit log using claude-opus-4-8. Falls back to the raw
 // commit list if --no-ai, no SDK/key, or a refusal.
 async function draftSection(unreleasedFallback) {
   const range = prevTag ? `${prevTag}..HEAD` : 'HEAD'
-  const log = git('log', '--no-merges', `--pretty=format:- %s%n%b`, range).trim()
+  // Subjects only (no `%b` bodies) — bodies carry trailers, internal `run-…` IDs, and tracker keys we
+  // don't want in public notes. Subjects keep the human summary + the `(#N)` GitHub ref.
+  const log = git('log', '--no-merges', `--pretty=format:- %s`, range).trim()
   const rawList = log || unreleasedFallback || `- Release ${version}.`
 
   if (NO_AI) {
@@ -201,9 +221,15 @@ async function draftSection(unreleasedFallback) {
       model: 'claude-opus-4-8',
       max_tokens: 2000,
       system:
-        'You write concise Keep a Changelog entries for the dahrk-node release notes. ' +
-        'Group changes under ### Added / ### Changed / ### Fixed (omit empty groups). ' +
-        'British English, no em dashes. Describe user-facing impact, not commit mechanics. ' +
+        'You write public release notes for dahrk-node, the open-source Dahrk edge client. ' +
+        'Audience: people who install and run the client, not its developers. Describe what changed ' +
+        'and why it matters to them, not the commit mechanics. ' +
+        'Lead with the most notable change, then group the rest under ### Added / ### Changed / ' +
+        '### Fixed (omit empty groups). One bullet per change. ' +
+        'Where a commit subject carries a GitHub reference like "(#7)", keep that "(#N)" reference on ' +
+        'the bullet. NEVER include internal tracker keys (e.g. DHK-284, SKA-…, LABS-…, TEST-…, HAR-…, ' +
+        'SL-…), internal run IDs (run-…), branch names, or commit trailers (Co-authored-by, etc.). ' +
+        'No raw commit messages. British English, no em dashes. ' +
         'Output only the markdown body — no version heading, no preamble, no code fences.',
       messages: [
         {
