@@ -29,6 +29,9 @@ const positional = args.filter((a) => !a.startsWith('--'))
 const DRY_RUN = flags.has('--dry-run')
 const NO_AI = flags.has('--no-ai')
 const AI_POLISH = flags.has('--ai-polish')
+// --out=<file>: also write the resolved (sanitised) notes to a file. Used by the preview-release-notes
+// CI job to capture just the notes; works in --dry-run too.
+const OUT = (args.find((a) => a.startsWith('--out=')) ?? '').slice('--out='.length) || null
 
 const die = (msg) => {
   console.error(`\x1b[31mrelease:\x1b[0m ${msg}`)
@@ -93,6 +96,11 @@ if (unreleased && !AI_POLISH) {
 // public.
 section = sanitizeNotes(section).trim()
 if (!section) die('resolved an empty changelog section — nothing to release')
+
+if (OUT) {
+  writeFileSync(OUT, section + '\n')
+  step(`wrote notes to ${OUT}`)
+}
 
 // ---- compute file rewrites ----------------------------------------------------------------------
 const changelogNext = rewriteChangelog(version, section, prevVersion)
