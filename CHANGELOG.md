@@ -6,14 +6,16 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-07
+
 ### Changed
 
 - Release tooling: harden generated release notes so internal identifiers never reach the public
-  changelog. Linear-style keys, internal run IDs, and commit trailers are stripped from every notes
-  source (hand-written, AI-drafted, or the commit-log fallback), drafts prefer GitHub `(#N)`
-  references, and version headings are dated. (#10)
+ changelog. Linear-style keys, internal run IDs, and commit trailers are stripped from every notes
+ source (hand-written, AI-drafted, or the commit-log fallback), drafts prefer GitHub `(#N)`
+ references, and version headings are dated. (#10)
 - Release tooling: add a manual "Preview release notes" CI workflow that drafts the notes for a
-  prospective version without tagging or publishing, so they can be reviewed before a release. (#11)
+ prospective version without tagging or publishing, so they can be reviewed before a release. (#11)
 
 ## [0.1.2]
 
@@ -63,7 +65,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/dahrkai/dahrk-node/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/dahrkai/dahrk-node/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/dahrkai/dahrk-node/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dahrkai/dahrk-node/releases/tag/v0.1.0
