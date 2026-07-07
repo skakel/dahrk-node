@@ -10,7 +10,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
-- Work-preservation backup push (DHK-284): a new merge-free `mode: "backup"` force-pushes the run's
+- Work-preservation backup push (#7): a new merge-free `mode: "backup"` force-pushes the run's
   HEAD to `dahrk/wip/<runId>` with no base merge or PR, so in-flight work survives without touching the
   integration branch.
 
@@ -20,7 +20,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   started (e.g. unrelated histories, no `MERGE_HEAD`) previously surfaced an opaque
   `git merge --abort` error that destroyed the real diagnostic. Such cases now report a distinct
   `diverged` outcome and re-throw genuine merge-start failures truthfully, with a merge-base
-  short-circuit and a fail-fast guard against an unborn HEAD.
+  short-circuit and a fail-fast guard against an unborn HEAD. (#6)
 
 ## [0.1.1]
 

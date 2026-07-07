@@ -122,7 +122,10 @@ The `dahrk-node` client (in `apps/edge-node`) is published to npm on a git tag. 
 [Keep a Changelog](https://keepachangelog.com/) and [semver](https://semver.org/):
 
 1. (Optional) hand-write this release's notes under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md);
-   otherwise leave it empty and the release command drafts them from the commit log.
+   otherwise leave it empty and the release command drafts them from the commit log. These notes are
+   public: write for people running the client, and reference the GitHub PR/issue as `(#123)` — never
+   an internal tracker key. (`pnpm release` also strips internal keys, `run-…` IDs, and commit trailers
+   as a backstop, but keep the source clean.)
 2. Run `pnpm release <version>`, review/edit the changelog in the PR it opens, and merge.
 
 `pnpm release` ([`scripts/release.mjs`](scripts/release.mjs)) bumps the version in both `package.json`
