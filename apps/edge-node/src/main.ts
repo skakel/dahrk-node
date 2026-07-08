@@ -26,8 +26,9 @@ import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { detectRuntimes, startEdgeNode, type EdgeOptions } from "@dahrk/edge";
 import type { CredentialMode, Runtime } from "@dahrk/contracts";
-import { parseCli, usage, type StartFlags } from "./cli.js";
+import { parseCli, usage, type RunFlags, type StartFlags } from "./cli.js";
 import { runDoctor } from "./doctor.js";
+import { runPreflight } from "./preflight.js";
 
 const CLIENT_VERSION = process.env.npm_package_version ?? "0.0.0";
 
@@ -215,7 +216,31 @@ async function start(flags: StartFlags): Promise<void> {
   await startEdgeNode(buildEdgeOptions(env, resolved));
 }
 
-/** Dispatch the CLI: `start` (default), `doctor`, `help`, `version`. Returns nothing for `start`
+/** The workflows `dahrk run` can dispatch. The seam is deliberately small: `preflight` is the first
+ *  (and, for now, only) target. An unknown workflow is a usage error listing what is available. */
+export const KNOWN_WORKFLOWS = ["preflight"] as const;
+
+/** Run a workflow locally through the engine against the node's worktree (issue-less: no Linear, no
+ *  OAuth). Resolves the workflow name, runs it, and returns the process exit code (non-zero on an
+ *  unsound floor / failure). An unknown workflow returns exit 2 and lists the available ones. */
+async function runWorkflow(flags: RunFlags): Promise<number> {
+  if (flags.workflow !== "preflight") {
+    console.error(`unknown workflow: ${flags.workflow}\n`);
+    console.error(`Available workflows: ${KNOWN_WORKFLOWS.join(", ")}`);
+    return 2;
+  }
+  const env = applyEnvAliases(process.env);
+  const hubUrl = flags.hubUrl ?? env.DAHRK_HUB_URL;
+  const token = flags.token ?? env.DAHRK_ENROL_TOKEN;
+  return runPreflight({
+    ...(flags.repo ? { repoPath: flags.repo } : {}),
+    ...(hubUrl ? { hubUrl } : {}),
+    ...(token ? { token } : {}),
+    clientVersion: CLIENT_VERSION,
+  });
+}
+
+/** Dispatch the CLI: `start` (default), `run`, `doctor`, `help`, `version`. Returns nothing for `start`
  *  (it blocks on the socket); the others print and let the caller exit. */
 async function main(): Promise<void> {
   // The invoked program name for usage text. When run from source/dist the entry file is `main.*`,
@@ -244,6 +269,9 @@ async function main(): Promise<void> {
       });
       break;
     }
+    case "run":
+      process.exitCode = await runWorkflow(parsed.flags);
+      break;
     case "start":
       await start(parsed.flags);
       break;

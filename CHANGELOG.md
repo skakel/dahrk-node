@@ -8,6 +8,14 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- `dahrk run <workflow>`: run a workflow through the engine locally against this node's worktree, the
+  engine-backed twin of `doctor` and the first slice of a general `dahrk run`. The first workflow is
+  `preflight`, which sequences `check node` / `check repo` / `check tools` stages, synthesises a
+  plain-English read, and links the full report at `app.dahrk.ai/r/<runId>`, streaming `[n/5] <stage>`
+  progress as it goes. It runs with no Linear, no OAuth, and no issue, and exits non-zero only on an
+  unsound floor (old Node, not a git repo, git missing, worktree unwritable); a tool or hub it cannot
+  reach is a finding, not a failure. (DHK-330)
+
 - Harden `deliver`: when a run branch adds nothing over the (possibly advanced) base - an empty delta,
   or one consisting solely of the engine-owned scratch dir or other git-ignored paths - the push now
   short-circuits to an explicit `noop` outcome. Nothing is pushed and no PR is opened; the run closes

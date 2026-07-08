@@ -92,8 +92,9 @@ starting; never commit the token.
 
 ```bash
 dahrk start --token <t> [--name <n>] [--hub-url <u>] [--ephemeral]   # run the node
+dahrk run <workflow> [--repo <p>] [--hub-url <u>] [--token <t>]      # run a workflow (engine-backed)
 dahrk doctor [--token <t>] [--hub-url <u>]                           # preflight checks
-dahrk help [start|doctor]                                            # usage
+dahrk help [start|run|doctor]                                       # usage
 dahrk version                                                        # print the client version
 ```
 
@@ -103,6 +104,14 @@ dahrk version                                                        # print the
 the **Node version**, which **agent runtimes** are installed (with versions), **hub reachability**
 (does the WebSocket connect?), and **token validity** (does the hub accept the enrolment token, or is
 it missing / invalid / expired?). It exits non-zero if any check fails.
+
+`dahrk run <workflow>` runs a workflow locally against this node's worktree - the engine-backed twin
+of `doctor`, and the first slice of a general `dahrk run`. The first workflow is `preflight`: it
+sequences **check node**, **check repo**, and **check tools** stages, synthesises a plain-English read,
+and links the full report at `app.dahrk.ai/r/<runId>`, streaming `[n/5] <stage>` progress as it goes.
+It runs with no Linear, no OAuth, and no issue - just the machine and the engine - and exits non-zero
+when the floor is unsound (old Node, no git repo, git missing, worktree unwritable). A tool or hub it
+cannot reach is a finding, not a failure.
 
 `--ephemeral` mints a throwaway node id for the run instead of reading/persisting `~/.dahrk/node.json`
 - handy for CI or one-shot nodes that should leave no local state.

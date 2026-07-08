@@ -28,6 +28,37 @@ test("`doctor` subcommand parses connection flags", () => {
   }
 });
 
+test("`run` parses the workflow positional plus repo/hub/token flags", () => {
+  const p = parseCli(["run", "preflight", "--repo", "/w/app", "--hub-url", "ws://h:1", "--token", "t"]);
+  assert.equal(p.kind, "run");
+  if (p.kind === "run") {
+    assert.deepEqual(p.flags, { workflow: "preflight", repo: "/w/app", hubUrl: "ws://h:1", token: "t" });
+  }
+});
+
+test("`run` needs a workflow: bare `run` is an error", () => {
+  const p = parseCli(["run"]);
+  assert.equal(p.kind, "error");
+  assert.equal(p.kind === "error" && /missing workflow/.test(p.message), true);
+});
+
+test("`run` takes one workflow at a time: a second positional is an error", () => {
+  const p = parseCli(["run", "preflight", "extra"]);
+  assert.equal(p.kind, "error");
+  assert.equal(p.kind === "error" && /unexpected argument "extra"/.test(p.message), true);
+});
+
+test("`run` keeps an unknown workflow name (the dispatcher, not the parser, rejects it)", () => {
+  const p = parseCli(["run", "frobnicate"]);
+  assert.equal(p.kind, "run");
+  assert.equal(p.kind === "run" && p.flags.workflow, "frobnicate");
+});
+
+test("a `run` subcommand's --help scopes to `run`", () => {
+  assert.deepEqual(parseCli(["run", "--help"]), { kind: "help", command: "run" });
+  assert.deepEqual(parseCli(["help", "run"]), { kind: "help", command: "run" });
+});
+
 test("help spellings: `help`, `--help`, and scoped `help <command>`", () => {
   assert.deepEqual(parseCli(["help"]), { kind: "help" });
   assert.deepEqual(parseCli(["--help"]), { kind: "help" });
@@ -65,4 +96,7 @@ test("usage text names the bin and the commands", () => {
   assert.match(top, /doctor/);
   assert.match(usage("dahrk-node", "start"), /--ephemeral/);
   assert.match(usage("dahrk-node", "doctor"), /token validity/);
+  assert.match(top, /run/);
+  assert.match(usage("dahrk-node", "run"), /<workflow>/);
+  assert.match(usage("dahrk-node", "run"), /preflight/);
 });
