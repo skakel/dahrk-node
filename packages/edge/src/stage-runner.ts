@@ -838,6 +838,24 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
             base: job.base,
             ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
           });
+          // Nothing to deliver (DHK-318): the branch's delta over the (possibly advanced) base is empty
+          // or only engine scratch, so the work is already present on the base. Close as a successful
+          // no-op - nothing pushed, no PR, no conflictFiles - rather than attempting an integration that
+          // could error on a stray scratch path. `status: "ok"` with `nothingToCommit`, so the run reaches
+          // a non-error terminal state. (`noop` is not yet in `@dahrk/contracts`'s IntegrationOutcome, so
+          // it is conveyed as an absent integration - "treated as clean" no-op - like `diverged` above.)
+          if (r.integration === "noop") {
+            return {
+              jobId,
+              status: "ok",
+              branch: job.branch,
+              headSha: r.headSha,
+              pushed: false,
+              nothingToCommit: true,
+              commitsAhead: r.commitsAhead,
+              summary: `no changes to deliver on ${job.branch} - work already present on ${job.base}`,
+            };
+          }
           // the base advanced and merging it into the branch conflicted, so nothing was pushed.
           // There is nothing to open a PR for; forward the conflict outcome and let the hub raise a
           // manual-merge elicitation. `status: "ok"` (the executor did its job deterministically; a

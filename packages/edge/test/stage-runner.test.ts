@@ -452,6 +452,36 @@ test("runPush mode:backup routes to backupPush on the sticky worktree and return
   assert.deepEqual(backupCalls, [{ method: "backupPush", branch: wipRef }], "only backupPush ran (no merge, no PR)");
 });
 
+test("runPush forwards a `noop` integration as a clean, non-error no-op (no PR, no conflictFiles)", async () => {
+  // DHK-318: commitAndPush reports `noop` when the branch adds nothing over the base. The runner must
+  // close the push as a successful no-op - status ok, nothing pushed, no PR opened, no conflictFiles -
+  // so the run reaches a non-error terminal state.
+  const calls: string[] = [];
+  const ref = { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath: "/tmp/wt", scratchPath: "/tmp/wt/.skakel" };
+  const svc = {
+    createWorktree: async () => ref,
+    commitAndPush: async () => {
+      calls.push("commitAndPush");
+      return { headSha: "deadbeef1234567", pushed: false, nothingToCommit: true, commitsAhead: 0, integration: "noop" as const };
+    },
+    backupPush: async () => ({ headSha: "x", pushed: false, nothingToCommit: true, wipRef: "w" }),
+    openPrAmbient: async () => {
+      calls.push("openPrAmbient");
+      return {};
+    },
+    teardownWorktree: async () => undefined,
+  };
+  const runner = createStageRunner({ gitService: svc as never, makeRunner: createMockRunner, rules: [], sendProgress: () => undefined });
+
+  const res = await runner.runPush(mkPushJob({ jobId: "job-noop", openPr: { title: "t", body: "b" } }));
+  assert.equal(res.status, "ok", "a no-op is a non-error terminal outcome");
+  assert.equal(res.pushed, false);
+  assert.equal(res.nothingToCommit, true);
+  assert.equal((res as { conflictFiles?: string[] }).conflictFiles, undefined, "no conflictFiles on a no-op");
+  assert.ok(!calls.includes("openPrAmbient"), "no PR is opened when nothing was delivered");
+  assert.match(res.summary, /already present/);
+});
+
 test("runPush mode:backup fails truthfully when the run has no live worktree", async () => {
   const { svc, calls } = recordingGitService();
   const runner = createStageRunner({ gitService: svc as never, makeRunner: createMockRunner, rules: [], sendProgress: () => undefined });

@@ -6,6 +6,14 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- Harden `deliver`: when a run branch adds nothing over the (possibly advanced) base - an empty delta,
+  or one consisting solely of the engine-owned scratch dir or other git-ignored paths - the push now
+  short-circuits to an explicit `noop` outcome. Nothing is pushed and no PR is opened; the run closes
+  as a successful "already delivered" no-op rather than risking a base-advanced merge conflict on a
+  stray scratch path. A genuine code delta still integrates and pushes as before. (DHK-318)
+
 ## [0.1.3] - 2026-07-07
 
 ### Changed
