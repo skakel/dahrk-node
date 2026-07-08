@@ -23,6 +23,11 @@ export interface GitLogger {
 }
 const noopLogger: GitLogger = { info: () => {}, warn: () => {} };
 
+/** The engine-owned scratch dir (state.json, traces, issue.md): runtime state that lives in the
+ *  worktree for stages to read/write but must NEVER enter a commit or the PR. Excluded from git and
+ *  untracked before every push; also the yardstick for the "nothing to deliver" no-op below. */
+const SCRATCH_DIR = ".skakel/scratch";
+
 /** Everything the node needs to build a worktree with no local repo config: the registry identity
  *  (`repoId`/`gitUrl`) it clones on demand, the base branch, and the run it is for. `repo` is the
  *  logical name carried onto the ref (defaults to `repoId`). */
@@ -75,9 +80,11 @@ export interface CommitPushResult {
   /** Outcome of merging the freshly fetched base into the branch before pushing. `conflict` means the
    *  merge started and hit content conflicts (aborted, nothing pushed); `diverged` means the merge
    *  could not even START - the branch and base share no common history (unrelated/diverged), so it can
-   *  never auto-integrate and nothing was pushed; absent when integration was skipped (no base given, or
-   *  the base fetch failed) so the legacy push-only path is treated as clean. */
-  integration?: "clean" | "conflict" | "diverged";
+   *  never auto-integrate and nothing was pushed; `noop` means the branch contributes nothing over the
+   *  base (empty or scratch-only delta), so there was nothing to ship (nothing pushed, no PR); absent
+   *  when integration was skipped (no base given, or the base fetch failed) so the legacy push-only path
+   *  is treated as clean. */
+  integration?: "clean" | "conflict" | "diverged" | "noop";
   /** The conflicted paths when `integration === "conflict"` (`git diff --name-only --diff-filter=U`). */
   conflictFiles?: string[];
 }
@@ -243,7 +250,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
    * committed; best-effort (a write failure is non-fatal, the `git rm --cached` untrack still runs).
    */
   const excludeScratchLocally = (worktreePath: string): void => {
-    const entry = ".skakel/scratch/";
+    const entry = `${SCRATCH_DIR}/`;
     try {
       const rel = git(worktreePath, ["rev-parse", "--git-path", "info/exclude"]).trim();
       const excludePath = isAbsolute(rel) ? rel : join(worktreePath, rel);
@@ -264,9 +271,8 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
    * no-op push commits nothing). Returns the resulting HEAD sha and whether a commit was made.
    */
   const commitPending = (worktreePath: string, message: string): { headSha: string; dirty: boolean } => {
-    const SCRATCH = ".skakel/scratch";
     excludeScratchLocally(worktreePath);
-    git(worktreePath, ["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", SCRATCH]);
+    git(worktreePath, ["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", SCRATCH_DIR]);
     git(worktreePath, ["add", "-A", "--", "."]);
     // Commit only when something is actually staged (`diff --cached --quiet` exits non-zero iff so).
     const dirty = !gitOk(worktreePath, ["diff", "--cached", "--quiet"]);
@@ -485,6 +491,27 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
           // catch below to classify the git error. This is the belt to the catch's braces.
           if (!gitOk(worktreePath, ["merge-base", "HEAD", "FETCH_HEAD"])) {
             return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "diverged" };
+          }
+          // Nothing to deliver (DHK-318): the branch's own contribution over the freshly fetched base
+          // (`FETCH_HEAD...HEAD`, the diff since their merge base) is empty or consists solely of the
+          // engine-owned scratch dir or otherwise git-ignored paths. Short-circuit to an explicit `noop`
+          // BEFORE merging/pushing, so a run whose work is already on the base - or whose only delta is a
+          // stray scratch file some prompt regression committed - closes as a clean "already delivered"
+          // outcome instead of risking a base-advanced merge conflict on that scratch path. Independent
+          // of the harness-side gitignore fix: even a committed scratch path cannot become a push error.
+          const delta = git(worktreePath, ["diff", "--name-only", "FETCH_HEAD...HEAD"])
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+          // `--no-index` so a path is judged purely by the ignore rules, not by whether it is tracked:
+          // a scratch file a regression already committed is still recognised as ignored (plain
+          // `check-ignore` never reports a tracked path).
+          const isScratchPath = (p: string): boolean =>
+            p === SCRATCH_DIR ||
+            p.startsWith(`${SCRATCH_DIR}/`) ||
+            gitOk(worktreePath, ["check-ignore", "-q", "--no-index", "--", p]);
+          if (!delta.some((p) => !isScratchPath(p))) {
+            return { headSha, pushed: false, nothingToCommit: true, commitsAhead, integration: "noop" };
           }
           try {
             // A non-fast-forward merge writes a commit, so pass the same committer identity as the commit.

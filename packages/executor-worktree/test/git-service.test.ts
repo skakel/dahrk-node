@@ -342,6 +342,77 @@ test("commitAndPush reports `diverged` (never a masked `merge --abort` error) on
   }
 });
 
+test("commitAndPush reports `noop` and pushes nothing when the branch adds nothing over an advanced base", async () => {
+  // DHK-318: every stage found the work already merged and made no code change, so the branch's own
+  // delta over the (advanced) base is empty. This must close as an explicit `noop` - nothing pushed,
+  // no PR - rather than fast-forwarding to base and opening a phantom, zero-diff PR.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-TEST-noop";
+
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-noop",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-noop-1",
+      branch,
+    });
+    // The base advances on the remote after our worktree branched, but this run makes NO code change
+    // (its only footprint is engine scratch, which never commits).
+    advanceRemoteMain(remote, "base.txt", "from a parallel run\n", "parallel landed first");
+    writeFileSync(join(ref.scratchPath, "state.json"), "{}\n");
+
+    const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
+    assert.equal(r.integration, "noop", "an empty branch delta is an explicit no-op");
+    assert.equal(r.pushed, false, "nothing is pushed when there is nothing to deliver");
+    assert.equal(r.nothingToCommit, true);
+    assert.equal(r.conflictFiles, undefined, "a no-op carries no conflictFiles");
+    assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "no branch was pushed on a no-op");
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
+test("commitAndPush reports `noop` when the branch's only committed delta is a git-ignored scratch path", async () => {
+  // Belt-and-braces for DHK-318, independent of the harness-side gitignore fix: a prompt regression
+  // force-commits a stray scratch file that the target repo git-ignores. The branch's only delta over
+  // base is that ignored path, so delivery is a clean no-op - the stray file can never turn a push into
+  // a base-advanced merge conflict.
+  const remote = makeBareRemote("scratch.log\n");
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-TEST-scratch-noop";
+
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-scratch-noop",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-scratch-noop-1",
+      branch,
+    });
+    // Force-commit a git-ignored scratch file (simulating a prompt regression that bypassed the ignore).
+    writeFileSync(join(ref.worktreePath, "scratch.log"), "stray planning scratch\n");
+    git(ref.worktreePath, ["add", "-f", "scratch.log"]);
+    git(ref.worktreePath, ["-c", "user.email=r@dahrk.test", "-c", "user.name=Regression", "commit", "-m", "stray scratch"]);
+
+    const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
+    assert.equal(r.integration, "noop", "a scratch-only delta is a no-op");
+    assert.equal(r.pushed, false, "the stray scratch file is not delivered");
+    assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "no branch was pushed");
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
 test("backupPush preserves the run's HEAD on a disposable wip ref with no base merge and no PR", async () => {
   // DHK-264: a `deliver` that hit a base-advanced conflict would leave nothing pushed and lose the
   // run's committed HEAD with the reaped worktree. `backupPush` force-pushes HEAD as-is to a throwaway
