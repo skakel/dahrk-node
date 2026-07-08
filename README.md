@@ -1,28 +1,36 @@
 # Dahrk node
 
-**Dahrk** is a Linear-native agent-workflow harness: a hosted **hub** dispatches deterministic,
-multi-stage agent workflows, one per Linear issue, to deliberate **nodes** - the runnable in this
-repository. Each stage runs in an isolated git worktree via a pluggable runtime (Claude Code, Codex,
-Pi), and the node streams progress and results back to the hub. The engine that sequences stages is
-pure TypeScript and never lets a model decide control flow; inference happens only *inside* a stage.
+**Deterministic multi-stage agent workflows, one per Linear issue, run on a node you own.**
 
-A node runs in one of two modes: an **edge node** (unmanaged, self-hosted, dials OUT - no inbound
-ports) or a **managed node** (a Dahrk-hosted container pool). This repo is the **open node**: it has
-no dependency on the hub, sharing only the wire protocol and types published as
+Dahrk is a Linear-native agent-workflow harness. A hosted **hub** dispatches deterministic,
+multi-stage agent workflows to **nodes** that run each stage in an isolated git worktree. The engine
+that sequences stages is pure TypeScript and **never lets a model decide control flow**; inference
+happens only *inside* a stage. That determinism boundary is the whole point: reproducible pipelines,
+not an agent improvising its own steps.
+
+This repository is that node: the installable `dahrk-node` client (command `dahrk`) you run yourself.
+
+<!-- Hero demo GIF goes here once recorded (tracked separately). -->
+
+## Honest open-core framing
+
+The node is **Apache-2.0 and runs on your machine**. It dials OUT to the hub over WebSocket (no
+inbound ports), auto-detects your agent runtimes (Claude Code, Codex, Pi), and streams progress and
+results back. It has no dependency on the hub beyond the wire protocol and types published as
 [`@dahrk/contracts`](https://www.npmjs.com/package/@dahrk/contracts).
 
-## Packages
+It is also, by design, an **open-source edge for a hosted harness**: the node does nothing on its own.
+The workflows, sequencing, and dispatch live in the hosted Dahrk hub, so you need a Dahrk account and
+an enrolment token to do anything useful. Open node, hosted brain: we would rather say that plainly
+than have you find out at the connect step.
 
-| Package | What it is |
-|---|---|
-| [`packages/edge`](packages/edge) (`@dahrk/edge`) | The node's brain: the WebSocket client, the stage runner, tool/stage-entry policy, and stage-exit hooks. |
-| [`packages/executor-worktree`](packages/executor-worktree) (`@dahrk/executor-worktree`) | The worktree executor: runner adapters (Claude Agent SDK, Codex SDK, Pi), a vendored GitService for worktree lifecycle, and the trace producer. |
-| [`apps/edge-node`](apps/edge-node) (published as [`dahrk-node`](https://www.npmjs.com/package/dahrk-node)) | The installable entrypoint (command `dahrk`). Dials out to the hub over WebSocket and runs stages in worktrees. No inbound ports. |
+Sign up and mint a token at [app.dahrk.ai](https://app.dahrk.ai); full docs live at
+[dahrk.ai/docs](https://dahrk.ai/docs). If that model fits how you work, a ⭐ helps others find it.
 
-## Install
+## 30-second quickstart
 
-Three channels, all installing the same version and providing the `dahrk` command. They need
-**Node 22+** and a logged-in agent runtime (e.g. the `claude` CLI).
+Needs **Node 22+** and a logged-in agent runtime (e.g. the `claude` CLI). Pick any channel; all
+install the same version and provide the `dahrk` command:
 
 ```bash
 npm install -g dahrk-node                          # npm
@@ -30,17 +38,29 @@ brew install dahrkai/tap/dahrk                     # Homebrew
 curl -fsSL https://dahrk.ai/install.sh | sh        # curl
 ```
 
-Then connect a node with an enrolment token from [app.dahrk.ai](https://app.dahrk.ai) (run
-`dahrk doctor` first to preflight Node, runtimes, hub reachability, and the token):
+Get an enrolment token from [app.dahrk.ai](https://app.dahrk.ai), preflight, then connect:
 
 ```bash
-dahrk start --token <enrolment-token>
+dahrk doctor --token <enrolment-token>   # checks Node, runtimes, hub reachability, and the token
+dahrk start  --token <enrolment-token>   # dial out and wait for Jobs
 ```
 
-The node auto-detects which agent runtimes are installed (claude / codex / pi), mints and persists a
-stable node id under `~/.dahrk/node.json`, dials out to the hub, and waits for Jobs. It advertises no
-inbound ports; repositories are cloned on demand from each Job's git URL. To keep it running across
-reboots, put it under a process manager (see [pm2](#run-it-durably-pm2) below).
+The node auto-detects which runtimes are installed (claude / codex / pi), mints and persists a stable
+node id under `~/.dahrk/node.json`, dials out to the hub, and waits for Jobs. It advertises no inbound
+ports; repositories are cloned on demand from each Job's git URL. To keep it running across reboots,
+put it under a process manager (see [pm2](#run-it-durably-pm2) below).
+
+## What's in this repo
+
+A node runs in one of two modes: an **edge node** (self-managed, self-hosted, dials OUT - no inbound
+ports) or a **managed node** (a Dahrk-hosted container pool). This repo is the **open node**, and
+ships three workspace packages:
+
+| Package | What it is |
+|---|---|
+| [`packages/edge`](packages/edge) (`@dahrk/edge`) | The node's brain: the WebSocket client, the stage runner, tool/stage-entry policy, and stage-exit hooks. |
+| [`packages/executor-worktree`](packages/executor-worktree) (`@dahrk/executor-worktree`) | The worktree executor: runner adapters (Claude Agent SDK, Codex SDK, Pi), a vendored GitService for worktree lifecycle, and the trace producer. |
+| [`apps/edge-node`](apps/edge-node) (published as [`dahrk-node`](https://www.npmjs.com/package/dahrk-node)) | The installable entrypoint (command `dahrk`). Dials out to the hub over WebSocket and runs stages in worktrees. No inbound ports. |
 
 ## Run from source (development)
 
