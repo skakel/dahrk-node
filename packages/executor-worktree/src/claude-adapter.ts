@@ -18,7 +18,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { HumanTurn, JobResult, JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
+import type { HumanTurn, JobResult, JobStatus, PolicyOutcome, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumeClaudeMessage, newBufferState, type BufferState } from "./claude-mappers.js";
 import {
   makeEmit,
@@ -51,6 +51,10 @@ const HANDED_BACK_ARTIFACT_PATH = ".skakel/scratch/output/document.md";
  */
 const CLAUDE_CODE_SYSTEM_PROMPT = { type: "preset", preset: "claude_code" } as const;
 
+type PolicyAwareRunnerContext = RunnerContext & {
+  authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
+};
+
 const userMsg = (text: string): SDKUserMessage => ({
   type: "user",
   parent_tool_use_id: null,
@@ -59,6 +63,18 @@ const userMsg = (text: string): SDKUserMessage => ({
 
 const sessionIdOf = (msg: SDKMessage): string | undefined =>
   "session_id" in msg && typeof msg.session_id === "string" ? msg.session_id : undefined;
+
+const policyCanUseTool = async (
+  ctx: PolicyAwareRunnerContext,
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> => {
+  const verdict = ctx.authorizeToolUse?.(toolName, input);
+  if (verdict?.verdict === "deny") {
+    return { behavior: "deny", message: verdict.reason ?? `tool "${toolName}" denied by policy ${verdict.policy}` };
+  }
+  return { behavior: "allow", updatedInput: input };
+};
 
 /**
  * Brokered MCP servers: point each declared server at the node's gateway proxy
@@ -151,7 +167,7 @@ export function createClaudeRunner(): Runner {
         // Tools stay allowed by canUseTool below; we do NOT set a restrictive allowedTools here.
         ...(mcpServers ? { mcpServers } : {}),
         // Headless: allow tools to run without an interactive permission prompt (M6 wires policy).
-        canUseTool: async (_toolName, input) => ({ behavior: "allow", updatedInput: input }),
+        canUseTool: async (toolName, input) => policyCanUseTool(ctx, toolName, input),
       };
       const state = newBufferState();
       let status: JobStatus = "ok";
@@ -199,7 +215,7 @@ export function createClaudeRunner(): Runner {
         canUseTool: async (toolName, input) =>
           summarising && toolName !== stageTool.allowedToolName
             ? { behavior: "deny", message: "Summarise from the work you just did; reply with the sentence only, no tools." }
-            : { behavior: "allow", updatedInput: input },
+            : policyCanUseTool(ctx, toolName, input),
         maxTurns: MAX_TURNS,
         includePartialMessages: false,
       };
