@@ -10,9 +10,10 @@
  * heartbeat, retention, allowed repos) - so the operator no longer hand-sets `DAHRK_TENANT_ID` or
  * `DAHRK_RUNTIMES`. No inbound ports; repos are cloned on demand from each Job's gitUrl.
  *
- * The CLI is subcommand-based (`start`, `doctor`, `help`, `version`), but `start` is the default so the
- * pre-subcommand invocation (`dahrk-node --token X`) still works. `dahrk doctor` runs a preflight
- * (Node version, runtimes, hub reachability, token validity) before you commit to `start`.
+ * The CLI is subcommand-based (`start`, `run`, `doctor`, `update`, `help`, `version`), but `start` is the
+ * default so the pre-subcommand invocation (`dahrk-node --token X`) still works. `dahrk doctor` runs a
+ * preflight (Node version, runtimes, hub reachability, token validity) before you commit to `start`, and
+ * `dahrk update` self-updates the client in place to the latest published release.
  *
  * Everything remains overridable for power users and the managed profile: `--token` / `--name` /
  * `--hub-url` flags win over the matching `DAHRK_*` env vars (the legacy `SKAKEL_*` names are still
@@ -29,6 +30,7 @@ import type { CredentialMode, Runtime } from "@dahrk/contracts";
 import { parseCli, usage, type RunFlags, type StartFlags } from "./cli.js";
 import { runDoctor } from "./doctor.js";
 import { runPreflight } from "./preflight.js";
+import { runUpdate } from "./update.js";
 
 const CLIENT_VERSION = process.env.npm_package_version ?? "0.0.0";
 
@@ -271,6 +273,10 @@ async function main(): Promise<void> {
     }
     case "run":
       process.exitCode = await runWorkflow(parsed.flags);
+      break;
+    case "update":
+      // Self-update is issue-less and hub-less: no env/flag overlay, just current vs latest.
+      process.exitCode = await runUpdate({ currentVersion: CLIENT_VERSION, check: parsed.flags.check });
       break;
     case "start":
       await start(parsed.flags);

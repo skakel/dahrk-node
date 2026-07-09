@@ -4,6 +4,7 @@
  *   dahrk start  --token <t> [--name <n>] [--hub-url <u>] [--ephemeral]   run the node
  *   dahrk run <workflow> [--repo <p>] [--hub-url <u>] [--token <t>]       run a workflow (engine-backed)
  *   dahrk doctor [--token <t>] [--hub-url <u>]                            preflight checks
+ *   dahrk update [--check]                                               self-update to the latest client
  *   dahrk help [command] | --help                                        usage
  *   dahrk version | --version                                            print the client version
  *
@@ -13,7 +14,7 @@
  */
 import { parseArgs } from "node:util";
 
-export type Command = "start" | "run" | "doctor";
+export type Command = "start" | "run" | "doctor" | "update";
 
 /** Connection + identity flags shared by `start` and `doctor` (doctor ignores the run-only ones). */
 export interface StartFlags {
@@ -35,15 +36,22 @@ export interface RunFlags {
   hubUrl?: string;
 }
 
+/** `dahrk update` flags: the sole option is `--check`, a dry run that reports whether an update is
+ *  available without applying it. */
+export interface UpdateFlags {
+  check: boolean;
+}
+
 export type ParsedCli =
   | { kind: "start"; flags: StartFlags }
   | { kind: "run"; flags: RunFlags }
   | { kind: "doctor"; flags: StartFlags }
+  | { kind: "update"; flags: UpdateFlags }
   | { kind: "help"; command?: Command }
   | { kind: "version" }
   | { kind: "error"; message: string };
 
-const COMMANDS = new Set<Command>(["start", "run", "doctor"]);
+const COMMANDS = new Set<Command>(["start", "run", "doctor", "update"]);
 const isCommand = (s: string): s is Command => (COMMANDS as Set<string>).has(s);
 
 /** Parse the argv tail (i.e. `process.argv.slice(2)`) into a command + flags, or a help/error verdict. */
@@ -72,6 +80,8 @@ export function parseCli(argv: string[]): ParsedCli {
   // `run` takes a required `<workflow>` positional plus repo/hub/token flags, so it parses on its own
   // path (the other commands forbid positionals).
   if (command === "run") return parseRun(flagArgs);
+  // `update` has its own tiny flag set (`--check`), distinct from the connection flags below.
+  if (command === "update") return parseUpdate(flagArgs);
 
   let values;
   try {
@@ -136,6 +146,26 @@ function parseRun(flagArgs: string[]): ParsedCli {
   return { kind: "run", flags };
 }
 
+/** Parse the tail of `dahrk update [--check]`: a single optional boolean flag, no positionals. A
+ *  `--help` scopes help to `update`. */
+function parseUpdate(flagArgs: string[]): ParsedCli {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args: flagArgs,
+      options: {
+        check: { type: "boolean", default: false },
+        help: { type: "boolean", default: false },
+      },
+      allowPositionals: false,
+    }));
+  } catch (e) {
+    return { kind: "error", message: (e as Error).message };
+  }
+  if (values.help) return { kind: "help", command: "update" };
+  return { kind: "update", flags: { check: values.check ?? false } };
+}
+
 /** The usage/help text. `bin` is the invoked program name; `command` scopes help to one subcommand. */
 export function usage(bin: string, command?: Command): string {
   if (command === "start") {
@@ -178,6 +208,18 @@ export function usage(bin: string, command?: Command): string {
       "  --hub-url <url>    Hub WebSocket URL to reach (or set DAHRK_HUB_URL).",
     ].join("\n");
   }
+  if (command === "update") {
+    return [
+      `Usage: ${bin} update [--check]`,
+      "",
+      "Update this client in place to the latest published release. Detects how it was installed",
+      "(npm / Homebrew / curl) and runs the right upgrade, or prints the exact command when it cannot.",
+      "Reports current -> latest, and a no-op when already current.",
+      "",
+      "Options:",
+      "  --check    Report whether an update is available without applying it (dry run).",
+    ].join("\n");
+  }
   return [
     `Usage: ${bin} <command> [options]`,
     "",
@@ -185,6 +227,7 @@ export function usage(bin: string, command?: Command): string {
     "  start     Run the edge node (default). Needs a --token and a hub URL.",
     "  run       Run a workflow locally (engine-backed), e.g. `run preflight`.",
     "  doctor    Preflight checks: Node, runtimes, hub reachability, token validity.",
+    "  update    Update the client to the latest release (or print how for your channel).",
     "  version   Print the client version.",
     "  help      Show this help, or `help <command>` for a command's options.",
     "",

@@ -8,6 +8,13 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- `dahrk update`: a local, user-initiated self-update to the latest published client. It reads this
+  build's version, asks the npm registry for the newest release (the single source of "latest" across
+  every channel), and - when behind - detects how the client was installed (npm / Homebrew / curl) and
+  runs the right upgrade in place, or prints the exact command when it cannot safely automate it. It
+  reports `current -> latest`, is a no-op when already current, and `--check` reports availability
+  without applying. No hub involvement; the same local path a future remote upgrade reuses. (DHK-315)
+
 - `dahrk run <workflow>`: run a workflow through the engine locally against this node's worktree, the
   engine-backed twin of `doctor` and the first slice of a general `dahrk run`. The first workflow is
   `preflight`, which sequences `check node` / `check repo` / `check tools` stages, synthesises a

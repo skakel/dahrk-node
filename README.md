@@ -94,7 +94,8 @@ starting; never commit the token.
 dahrk start --token <t> [--name <n>] [--hub-url <u>] [--ephemeral]   # run the node
 dahrk run <workflow> [--repo <p>] [--hub-url <u>] [--token <t>]      # run a workflow (engine-backed)
 dahrk doctor [--token <t>] [--hub-url <u>]                           # preflight checks
-dahrk help [start|run|doctor]                                       # usage
+dahrk update [--check]                                              # self-update to the latest client
+dahrk help [start|run|doctor|update]                               # usage
 dahrk version                                                        # print the client version
 ```
 
@@ -112,6 +113,12 @@ and links the full report at `app.dahrk.ai/r/<runId>`, streaming `[n/5] <stage>`
 It runs with no Linear, no OAuth, and no issue - just the machine and the engine - and exits non-zero
 when the floor is unsound (old Node, no git repo, git missing, worktree unwritable). A tool or hub it
 cannot reach is a finding, not a failure.
+
+`dahrk update` upgrades the client in place to the latest published release. It reads this build's
+version, asks the npm registry for the newest one, and - if you are behind - detects how you installed
+(npm / Homebrew / curl) and runs the right upgrade, or prints the exact command when it cannot tell.
+It reports `current -> latest`, and is a no-op when you are already current. `--check` reports whether
+an update is available without applying it.
 
 `--ephemeral` mints a throwaway node id for the run instead of reading/persisting `~/.dahrk/node.json`
 - handy for CI or one-shot nodes that should leave no local state.

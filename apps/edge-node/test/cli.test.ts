@@ -59,6 +59,21 @@ test("a `run` subcommand's --help scopes to `run`", () => {
   assert.deepEqual(parseCli(["help", "run"]), { kind: "help", command: "run" });
 });
 
+test("`update` parses `--check`; bare `update` defaults check off", () => {
+  assert.deepEqual(parseCli(["update"]), { kind: "update", flags: { check: false } });
+  assert.deepEqual(parseCli(["update", "--check"]), { kind: "update", flags: { check: true } });
+});
+
+test("`update` takes no positionals and rejects unknown flags", () => {
+  assert.equal(parseCli(["update", "now"]).kind, "error");
+  assert.equal(parseCli(["update", "--token", "t"]).kind, "error");
+});
+
+test("an `update` subcommand's --help scopes to `update`", () => {
+  assert.deepEqual(parseCli(["update", "--help"]), { kind: "help", command: "update" });
+  assert.deepEqual(parseCli(["help", "update"]), { kind: "help", command: "update" });
+});
+
 test("help spellings: `help`, `--help`, and scoped `help <command>`", () => {
   assert.deepEqual(parseCli(["help"]), { kind: "help" });
   assert.deepEqual(parseCli(["--help"]), { kind: "help" });
@@ -99,4 +114,6 @@ test("usage text names the bin and the commands", () => {
   assert.match(top, /run/);
   assert.match(usage("dahrk-node", "run"), /<workflow>/);
   assert.match(usage("dahrk-node", "run"), /preflight/);
+  assert.match(top, /update/);
+  assert.match(usage("dahrk-node", "update"), /--check/);
 });
