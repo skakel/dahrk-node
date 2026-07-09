@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
   HumanTurn,
   JobProgress,
@@ -24,6 +24,7 @@ import type {
   TraceMeta,
   WorkspaceRef,
 } from "@dahrk/contracts";
+import type { PolicyOutcome } from "@dahrk/contracts";
 import { attachedDocBasename } from "@dahrk/contracts";
 import {
   createTraceWriter,
@@ -137,6 +138,9 @@ const PREVIEW = 500;
 type PushMode = "deliver" | "backup";
 type PushJobWithMode = PushJob & { mode?: PushMode };
 type PushResultWithWip = PushResult & { wipRef?: string };
+type PolicyAwareRunnerContext = RunnerContext & {
+  authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
+};
 
 /** Upload bytes to a hub-minted presigned URL (heavy trace payloads bypass the control socket). */
 const putBytes = async (url: string, body: Buffer, contentType: string): Promise<void> => {
@@ -252,12 +256,29 @@ function capContent(raw: string): string {
   return raw.length > ARTIFACT_CAP_BYTES ? raw.slice(0, ARTIFACT_CAP_BYTES) : raw;
 }
 
+function resolveWorktreeRelativePath(ref: WorkspaceRef, relPath: string): string | undefined {
+  if (isAbsolute(relPath)) return undefined;
+  const root = resolve(ref.worktreePath);
+  const target = resolve(root, relPath);
+  const fromRoot = relative(root, target);
+  if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    return undefined;
+  }
+  return target;
+}
+
+function isSafeWorktreeRelativePath(ref: WorkspaceRef, relPath: string): boolean {
+  return resolveWorktreeRelativePath(ref, relPath) !== undefined;
+}
+
 /** Read the file a stage declared via `emitArtifact` (worktree-relative) so a later `attach-document`
  *  action can publish it to Linear. Best-effort: a missing/unreadable file returns undefined and the
  *  action surfaces the absence. Reading is data assembly, not control flow. */
 function readEmittedArtifact(ref: WorkspaceRef, relPath: string): { path: string; content: string } | undefined {
+  const path = resolveWorktreeRelativePath(ref, relPath);
+  if (!path) return undefined;
   try {
-    const raw = readFileSync(join(ref.worktreePath, relPath), "utf8");
+    const raw = readFileSync(path, "utf8");
     return { path: relPath, content: capContent(raw) };
   } catch {
     return undefined;
@@ -326,7 +347,7 @@ export function resolveStageArtifact(
     const declared = readEmittedArtifact(ref, emitArtifact);
     if (declared && declared.content.trim().length > 0) return { artifact: declared, source: "declared-file" };
   }
-  if (handedBack && handedBack.content.trim().length > 0) {
+  if (handedBack && handedBack.content.trim().length > 0 && isSafeWorktreeRelativePath(ref, handedBack.path)) {
     return { artifact: { path: handedBack.path, content: capContent(handedBack.content) }, source: "tool-handoff" };
   }
   const scratch = scanScratchOutput(ref, emitArtifact);
@@ -465,8 +486,9 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
       // Pre-create the parent of a declared output artifact so the agent's relative write succeeds
       // even if it does not mkdir first.
       if (job.agentConfig.emitArtifact) {
+        const artifactDir = resolveWorktreeRelativePath(ref, job.agentConfig.emitArtifact);
         const slash = job.agentConfig.emitArtifact.lastIndexOf("/");
-        if (slash > 0) {
+        if (artifactDir && slash > 0) {
           try {
             mkdirSync(join(ref.worktreePath, job.agentConfig.emitArtifact.slice(0, slash)), { recursive: true });
           } catch {
@@ -638,20 +660,50 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
 
       // Run the stage, intercepting tool actions for policy and streaming progress.
       let denied = false;
+      const authorisedActions: string[] = [];
       const runtime = agentConfig.runtime;
+      const actionKey = (tool: string, input: unknown): string => {
+        try {
+          return `${tool}\0${JSON.stringify(input)}`;
+        } catch {
+          return `${tool}\0`;
+        }
+      };
+      const policyReason = (verdict: PolicyOutcome): string => verdict.reason ?? `tool action denied by ${verdict.policy}`;
+      const recordDeny = (verdict: PolicyOutcome, toolUseId?: string): void => {
+        denied = true;
+        const reason = policyReason(verdict);
+        if (toolUseId) {
+          streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "observation", runtime, toolUseId, isError: true, output: { error: reason } }));
+        }
+        streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "state", runtime, event: "policy-deny", detail: reason }));
+        deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: reason });
+      };
+      const authorizeToolUse = (tool: string, input: unknown): PolicyOutcome => {
+        const verdict = evaluatePolicies({ kind: "action", stageId, tool, input }, rules);
+        if (verdict.verdict === "deny") {
+          recordDeny(verdict);
+        } else {
+          authorisedActions.push(actionKey(tool, input));
+        }
+        return verdict;
+      };
       const onTrace = (event: TraceEvent): void => {
         if (event.type === "action") {
-          const verdict = evaluatePolicies(
-            { kind: "action", stageId, tool: event.tool, input: event.input },
-            rules,
-          );
-          if (verdict.verdict === "deny") {
-            denied = true;
-            streamEvent(writer.append(event));
-            streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "observation", runtime, toolUseId: event.toolUseId, isError: true, output: { error: verdict.reason } }));
-            streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "state", runtime, event: "policy-deny", detail: verdict.reason }));
-            deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: verdict.reason });
-            return;
+          const key = actionKey(event.tool, event.input);
+          const authorised = authorisedActions.indexOf(key);
+          if (authorised >= 0) {
+            authorisedActions.splice(authorised, 1);
+          } else {
+            const verdict = evaluatePolicies(
+              { kind: "action", stageId, tool: event.tool, input: event.input },
+              rules,
+            );
+            if (verdict.verdict === "deny") {
+              streamEvent(writer.append(event));
+              recordDeny(verdict, event.toolUseId);
+              return;
+            }
           }
         }
         streamEvent(writer.append(event));
@@ -668,7 +720,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
 
       const runner = deps.makeRunner(runtime);
       active.set(jobId, runner);
-      const ctx: RunnerContext = {
+      const ctx: PolicyAwareRunnerContext = {
         config: agentConfig,
         workspace: ref,
         sessionId: job.sessionId,
@@ -685,6 +737,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // The adapter persists each runtime-native record under the attempt's raw/ sidecar
         // and stamps the rawRef onto the emitted event.
         writeRaw: writer.writeRaw,
+        authorizeToolUse,
       };
       // Interactive stages run a multi-turn conversation fed by relayed human turns (M5b);
       // batch stages run to a terminal result. Both emit through the same onTrace.

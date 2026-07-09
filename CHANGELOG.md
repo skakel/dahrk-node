@@ -29,6 +29,11 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   as a successful "already delivered" no-op rather than risking a base-advanced merge conflict on a
   stray scratch path. A genuine code delta still integrates and pushes as before. (DHK-318)
 
+### Fixed
+
+- Enforce edge policy decisions before Claude tool execution, and reject declared or handed-back
+  artifact paths that escape the run worktree.
+
 ## [0.1.3] - 2026-07-07
 
 ### Changed

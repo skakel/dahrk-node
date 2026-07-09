@@ -8,12 +8,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JobRequest, PushJob, Runner, RunnerContext, TraceEvent, TraceMeta } from "@dahrk/contracts";
 import { createGitService, createMockRunner } from "@dahrk/executor-worktree";
-import { createStageRunner, type BlobPutRequestArgs, type TraceSink } from "../src/stage-runner.js";
+import { createStageRunner, resolveStageArtifact, type BlobPutRequestArgs, type TraceSink } from "../src/stage-runner.js";
 
 function initRepo(dir: string): void {
   const git = (...args: string[]): void => void execFileSync("git", args, { cwd: dir, stdio: "ignore" });
@@ -391,6 +391,88 @@ test("the Job's runtimeEnv is threaded onto the runner ctx (injection boundary)"
 
     await runner.runJob(mkJob("job-rtenv-2")); // no runtimeEnv -> absent on ctx (ambient node)
     assert.equal(seen[1]?.runtimeEnv, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude-style runner authorization denies a policy-blocked tool before execution", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dahrk-sr-auth-"));
+  const repo = join(root, "repo");
+  execFileSync("mkdir", ["-p", repo]);
+  initRepo(repo);
+
+  const streamed: TraceEvent[] = [];
+  const progress: JobProgress[] = [];
+  const sink: TraceSink = {
+    event: (f) => void streamed.push(f.event),
+    finalised: () => undefined,
+    requestBlobUrl: async (req) => ({ key: `k/${req.sha256}` }),
+  };
+
+  const makeAuthorizingRunner = (runtime: Runner["runtime"]): Runner => ({
+    runtime,
+    async runBatch(ctx) {
+      const verdict = (ctx as RunnerContext & { authorizeToolUse?: (tool: string, input: unknown) => { verdict: string } })
+        .authorizeToolUse?.("Bash", { command: "sudo true" });
+      assert.equal(verdict?.verdict, "deny");
+      return { status: "ok" };
+    },
+    async runInteractive() {
+      return { status: "ok", summary: "n/a" };
+    },
+    async summarise() {
+      return "n/a";
+    },
+    async cancel() {},
+  });
+
+  const runner = createStageRunner({
+    gitService: createGitService({ worktreesDir: join(root, "wt"), mirrorsDir: join(root, "mir") }),
+    makeRunner: makeAuthorizingRunner,
+    rules: [],
+    sendProgress: (p) => void progress.push(p),
+    trace: sink,
+  });
+
+  const job: JobRequest = {
+    tenantId: "t_default",
+    runId: "run-auth-1",
+    stageId: "build",
+    jobId: "job-auth-1",
+    awakeableId: "awk-auth",
+    executorType: "worktree",
+    agentConfig: { runtime: "claude-code", interaction: "batch" },
+    workspaceRef: { repoId: "repo", gitUrl: repo, repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
+    policies: [{ shell_guard: { mode: "deny" } }],
+    timeout: 60,
+  };
+
+  try {
+    const result = await runner.runJob(job);
+    assert.equal(result.status, "ok");
+    assert.match(result.summary ?? "", /tool actions were blocked/);
+    assert.ok(streamed.some((e) => e.type === "state" && (e as { event?: string }).event === "policy-deny"));
+    assert.ok(!streamed.some((e) => e.type === "action" && e.tool === "Bash"), "the denied Bash action was never emitted/executed");
+    assert.ok(progress.some((p) => p.kind === "error" && /shell command blocked/.test(p.text ?? "")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("artifact resolution rejects paths that escape the worktree", () => {
+  const root = mkdtempSync(join(tmpdir(), "dahrk-artifact-"));
+  const worktreePath = join(root, "worktree");
+  const scratchPath = join(worktreePath, ".skakel", "scratch");
+  execFileSync("mkdir", ["-p", scratchPath]);
+  initRepo(worktreePath);
+  writeFileSync(join(root, "secret.md"), "outside");
+
+  const ref = { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath, scratchPath };
+
+  try {
+    assert.equal(resolveStageArtifact(ref, "../secret.md", undefined), undefined);
+    assert.equal(resolveStageArtifact(ref, undefined, { path: "../secret.md", content: "handoff" }), undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
