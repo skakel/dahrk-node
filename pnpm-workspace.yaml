@@ -9,4 +9,4 @@ allowBuilds:
   esbuild: true
 
 minimumReleaseAgeExclude:
-  - '@dahrk/contracts@0.1.0'
+  - '@dahrk/contracts'
