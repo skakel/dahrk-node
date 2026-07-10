@@ -10,7 +10,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkspaceRef } from "@dahrk/contracts";
-import { createGitService, sanitizeBranchName, parseOwnerRepo } from "../src/git-service.js";
+import { createGitService, resolveWorktreesDir, sanitizeBranchName, parseOwnerRepo } from "../src/git-service.js";
 
 const git = (cwd: string, args: string[]): string =>
   execFileSync("git", args, { cwd, encoding: "utf-8" });
@@ -96,6 +96,28 @@ test("parseOwnerRepo handles SSH and HTTPS git URLs and rejects non-URLs", () =>
   assert.equal(parseOwnerRepo("https://github.com/dahrkai/dahrk-node.git"), "dahrkai/dahrk-node");
   assert.equal(parseOwnerRepo("https://github.com/dahrkai/dahrk-node"), "dahrkai/dahrk-node");
   assert.equal(parseOwnerRepo("not-a-url"), undefined);
+});
+
+test("resolveWorktreesDir single-sources the base the service exposes for hello advertisement", () => {
+  const saved = { d: process.env.DAHRK_WORKTREES_DIR, s: process.env.SKAKEL_WORKTREES_DIR };
+  try {
+    delete process.env.DAHRK_WORKTREES_DIR;
+    delete process.env.SKAKEL_WORKTREES_DIR;
+    // Explicit override wins and is exactly what the service exposes (what the client advertises).
+    assert.equal(resolveWorktreesDir("/custom/wt"), "/custom/wt");
+    assert.equal(createGitService({ worktreesDir: "/custom/wt", mirrorsDir: "/tmp/none" }).worktreesDir, "/custom/wt");
+    // Env override is honoured.
+    process.env.DAHRK_WORKTREES_DIR = "/env/wt";
+    assert.equal(resolveWorktreesDir(), "/env/wt");
+    // Default falls back under the home dir.
+    delete process.env.DAHRK_WORKTREES_DIR;
+    assert.match(resolveWorktreesDir(), /[/\\]\.dahrk[/\\]worktrees$/);
+  } finally {
+    if (saved.d === undefined) delete process.env.DAHRK_WORKTREES_DIR;
+    else process.env.DAHRK_WORKTREES_DIR = saved.d;
+    if (saved.s === undefined) delete process.env.SKAKEL_WORKTREES_DIR;
+    else process.env.SKAKEL_WORKTREES_DIR = saved.s;
+  }
 });
 
 test("openPrAmbient is non-fatal: an unparseable git URL yields a prError, never throws", async () => {

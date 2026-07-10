@@ -305,6 +305,10 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         os: osPlatform(),
         arch: osArch(),
         clientVersion: opts.clientVersion ?? "0.0.0",
+        // Advertise the resolved worktree base so the hub records each run's real worktree location in
+        // the projection instead of an advisory placeholder. Single-sourced from the git service so it
+        // always matches where worktrees actually land.
+        worktreesDir: gitService.worktreesDir,
       });
       // re-send the result of every finished-but-maybe-unacknowledged job. If the hub restarted
       // while a result was in flight (or just after), the new process forgot the awakeable mapping; the

@@ -160,6 +160,10 @@ export interface GitService {
    */
   openPrAmbient(ref: WorkspaceRef, opts: OpenPrOpts): Promise<OpenPrResult>;
   teardownWorktree(ref: WorkspaceRef): Promise<void>;
+  /** The resolved absolute worktree base this service creates run worktrees under
+   *  (`join(worktreesDir, runId)`). Exposed so the client can advertise it to the hub on `hello`, so
+   *  the hub records each run's real worktree location instead of an advisory placeholder. */
+  readonly worktreesDir: string;
 }
 
 /** Derive `owner/repo` from an SSH or HTTPS git URL, for `gh --repo` and compare links. */
@@ -196,9 +200,17 @@ export function sanitizeBranchName(name: string): string {
     .replace(/-{2,}/g, "-");
 }
 
+/**
+ * Resolve the absolute worktree base a git service uses: an explicit override, else
+ * `DAHRK_WORKTREES_DIR`/`SKAKEL_WORKTREES_DIR`, else `~/.dahrk/worktrees`. Exported so the client can
+ * advertise the exact same base to the hub on `hello` (single source of truth with `createGitService`).
+ */
+export function resolveWorktreesDir(override?: string): string {
+  return override ?? process.env.DAHRK_WORKTREES_DIR ?? process.env.SKAKEL_WORKTREES_DIR ?? join(homedir(), ".dahrk", "worktrees");
+}
+
 export function createGitService(opts: GitServiceOptions = {}): GitService {
-  const worktreesDir =
-    opts.worktreesDir ?? process.env.DAHRK_WORKTREES_DIR ?? process.env.SKAKEL_WORKTREES_DIR ?? join(homedir(), ".dahrk", "worktrees");
+  const worktreesDir = resolveWorktreesDir(opts.worktreesDir);
   const mirrorsDir =
     opts.mirrorsDir ?? process.env.DAHRK_MIRRORS_DIR ?? process.env.SKAKEL_MIRRORS_DIR ?? join(homedir(), ".dahrk", "mirrors");
   const authorName = opts.authorName ?? process.env.DAHRK_GIT_AUTHOR_NAME ?? "Dahrk";
@@ -372,6 +384,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
   });
 
   return {
+    worktreesDir,
     async createWorktree(spec) {
       const { repoId, gitUrl, baseBranch, runId } = spec;
       const branchName = sanitizeBranchName(spec.branch ?? `dahrk/${runId}`);
