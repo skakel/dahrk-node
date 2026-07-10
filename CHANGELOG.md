@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-10
+
 ### Added
 
 - `dahrk update`: a local, user-initiated self-update to the latest published client. It reads this
@@ -13,7 +15,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   every channel), and - when behind - detects how the client was installed (npm / Homebrew / curl) and
   runs the right upgrade in place, or prints the exact command when it cannot safely automate it. It
   reports `current -> latest`, is a no-op when already current, and `--check` reports availability
-  without applying. No hub involvement; the same local path a future remote upgrade reuses. (DHK-315)
+  without applying. No hub involvement; the same local path a future remote upgrade reuses.
 
 - `dahrk run <workflow>`: run a workflow through the engine locally against this node's worktree, the
   engine-backed twin of `doctor` and the first slice of a general `dahrk run`. The first workflow is
@@ -21,13 +23,13 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   plain-English read, and links the full report at `app.dahrk.ai/r/<runId>`, streaming `[n/5] <stage>`
   progress as it goes. It runs with no Linear, no OAuth, and no issue, and exits non-zero only on an
   unsound floor (old Node, not a git repo, git missing, worktree unwritable); a tool or hub it cannot
-  reach is a finding, not a failure. (DHK-330)
+  reach is a finding, not a failure.
 
 - Harden `deliver`: when a run branch adds nothing over the (possibly advanced) base - an empty delta,
   or one consisting solely of the engine-owned scratch dir or other git-ignored paths - the push now
   short-circuits to an explicit `noop` outcome. Nothing is pushed and no PR is opened; the run closes
   as a successful "already delivered" no-op rather than risking a base-advanced merge conflict on a
-  stray scratch path. A genuine code delta still integrates and pushes as before. (DHK-318)
+  stray scratch path. A genuine code delta still integrates and pushes as before.
 
 ### Fixed
 
@@ -93,7 +95,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/dahrkai/dahrk-node/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/dahrkai/dahrk-node/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/dahrkai/dahrk-node/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/dahrkai/dahrk-node/compare/v0.1.0...v0.1.1
