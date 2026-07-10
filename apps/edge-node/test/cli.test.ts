@@ -59,6 +59,34 @@ test("a `run` subcommand's --help scopes to `run`", () => {
   assert.deepEqual(parseCli(["help", "run"]), { kind: "help", command: "run" });
 });
 
+test("`service` parses the action positional plus connection flags", () => {
+  const p = parseCli(["service", "install", "--token", "t", "--name", "my-mac", "--hub-url", "ws://h:1"]);
+  assert.equal(p.kind, "service");
+  if (p.kind === "service") {
+    assert.deepEqual(p.flags, { action: "install", token: "t", name: "my-mac", hubUrl: "ws://h:1" });
+  }
+  const u = parseCli(["service", "uninstall"]);
+  assert.equal(u.kind, "service");
+  assert.equal(u.kind === "service" && u.flags.action, "uninstall");
+});
+
+test("`service` needs an action: bare `service` is an error", () => {
+  const p = parseCli(["service"]);
+  assert.equal(p.kind, "error");
+  assert.equal(p.kind === "error" && /missing action/.test(p.message), true);
+});
+
+test("`service` rejects an unknown action", () => {
+  const p = parseCli(["service", "frobnicate"]);
+  assert.equal(p.kind, "error");
+  assert.equal(p.kind === "error" && /unknown action "frobnicate"/.test(p.message), true);
+});
+
+test("a `service` subcommand's --help scopes to `service`", () => {
+  assert.deepEqual(parseCli(["service", "--help"]), { kind: "help", command: "service" });
+  assert.deepEqual(parseCli(["help", "service"]), { kind: "help", command: "service" });
+});
+
 test("`update` parses `--check`; bare `update` defaults check off", () => {
   assert.deepEqual(parseCli(["update"]), { kind: "update", flags: { check: false } });
   assert.deepEqual(parseCli(["update", "--check"]), { kind: "update", flags: { check: true } });
@@ -116,4 +144,7 @@ test("usage text names the bin and the commands", () => {
   assert.match(usage("dahrk-node", "run"), /preflight/);
   assert.match(top, /update/);
   assert.match(usage("dahrk-node", "update"), /--check/);
+  assert.match(top, /service/);
+  assert.match(usage("dahrk-node", "service"), /install\|uninstall/);
+  assert.match(usage("dahrk-node", "service"), /launchd/);
 });

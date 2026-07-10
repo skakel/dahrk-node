@@ -30,6 +30,7 @@ import type { CredentialMode, Runtime } from "@dahrk/contracts";
 import { parseCli, usage, type RunFlags, type StartFlags } from "./cli.js";
 import { runDoctor } from "./doctor.js";
 import { runPreflight } from "./preflight.js";
+import { runServiceInstall, runServiceUninstall } from "./service.js";
 import { runUpdate } from "./update.js";
 
 const CLIENT_VERSION = process.env.npm_package_version ?? "0.0.0";
@@ -274,6 +275,24 @@ async function main(): Promise<void> {
     case "run":
       process.exitCode = await runWorkflow(parsed.flags);
       break;
+    case "service": {
+      if (parsed.flags.action === "uninstall") {
+        process.exitCode = await runServiceUninstall();
+        break;
+      }
+      // Install bakes the resolved connection/identity into the unit: flags win over the env vars
+      // (legacy SKAKEL_* aliases folded in first).
+      const env = applyEnvAliases(process.env);
+      const token = parsed.flags.token ?? env.DAHRK_ENROL_TOKEN;
+      const name = parsed.flags.name ?? env.DAHRK_NODE_NAME;
+      const hubUrl = parsed.flags.hubUrl ?? env.DAHRK_HUB_URL;
+      process.exitCode = await runServiceInstall({
+        ...(token ? { token } : {}),
+        ...(name ? { name } : {}),
+        ...(hubUrl ? { hubUrl } : {}),
+      });
+      break;
+    }
     case "update":
       // Self-update is issue-less and hub-less: no env/flag overlay, just current vs latest.
       process.exitCode = await runUpdate({ currentVersion: CLIENT_VERSION, check: parsed.flags.check });

@@ -3,6 +3,7 @@
  *
  *   dahrk start  --token <t> [--name <n>] [--hub-url <u>] [--ephemeral]   run the node
  *   dahrk run <workflow> [--repo <p>] [--hub-url <u>] [--token <t>]       run a workflow (engine-backed)
+ *   dahrk service install|uninstall [--token <t>] [--name <n>] [--hub-url <u>]  install as an always-on service
  *   dahrk doctor [--token <t>] [--hub-url <u>]                            preflight checks
  *   dahrk update [--check]                                               self-update to the latest client
  *   dahrk help [command] | --help                                        usage
@@ -14,7 +15,10 @@
  */
 import { parseArgs } from "node:util";
 
-export type Command = "start" | "run" | "doctor" | "update";
+export type Command = "start" | "run" | "service" | "doctor" | "update";
+
+/** The two things `dahrk service` can do: register the always-on service, or remove it. */
+export type ServiceAction = "install" | "uninstall";
 
 /** Connection + identity flags shared by `start` and `doctor` (doctor ignores the run-only ones). */
 export interface StartFlags {
@@ -36,6 +40,15 @@ export interface RunFlags {
   hubUrl?: string;
 }
 
+/** `dahrk service <action>` flags: which action, plus the connection/identity flags baked into the
+ *  generated unit (uninstall ignores them). */
+export interface ServiceFlags {
+  action: ServiceAction;
+  token?: string;
+  name?: string;
+  hubUrl?: string;
+}
+
 /** `dahrk update` flags: the sole option is `--check`, a dry run that reports whether an update is
  *  available without applying it. */
 export interface UpdateFlags {
@@ -45,13 +58,14 @@ export interface UpdateFlags {
 export type ParsedCli =
   | { kind: "start"; flags: StartFlags }
   | { kind: "run"; flags: RunFlags }
+  | { kind: "service"; flags: ServiceFlags }
   | { kind: "doctor"; flags: StartFlags }
   | { kind: "update"; flags: UpdateFlags }
   | { kind: "help"; command?: Command }
   | { kind: "version" }
   | { kind: "error"; message: string };
 
-const COMMANDS = new Set<Command>(["start", "run", "doctor", "update"]);
+const COMMANDS = new Set<Command>(["start", "run", "service", "doctor", "update"]);
 const isCommand = (s: string): s is Command => (COMMANDS as Set<string>).has(s);
 
 /** Parse the argv tail (i.e. `process.argv.slice(2)`) into a command + flags, or a help/error verdict. */
@@ -80,6 +94,8 @@ export function parseCli(argv: string[]): ParsedCli {
   // `run` takes a required `<workflow>` positional plus repo/hub/token flags, so it parses on its own
   // path (the other commands forbid positionals).
   if (command === "run") return parseRun(flagArgs);
+  // `service` takes a required `install`/`uninstall` action positional plus the connection flags.
+  if (command === "service") return parseService(flagArgs);
   // `update` has its own tiny flag set (`--check`), distinct from the connection flags below.
   if (command === "update") return parseUpdate(flagArgs);
 
@@ -146,6 +162,49 @@ function parseRun(flagArgs: string[]): ParsedCli {
   return { kind: "run", flags };
 }
 
+const SERVICE_ACTIONS = new Set<ServiceAction>(["install", "uninstall"]);
+const isServiceAction = (s: string): s is ServiceAction => (SERVICE_ACTIONS as Set<string>).has(s);
+
+/** Parse the tail of `dahrk service <action> [flags]`: a required `install`/`uninstall` positional plus
+ *  the connection/identity flags. A `--help` scopes help to `service`; a missing/unknown/extra action
+ *  is an error. */
+function parseService(flagArgs: string[]): ParsedCli {
+  let values;
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: flagArgs,
+      options: {
+        token: { type: "string" },
+        name: { type: "string" },
+        "hub-url": { type: "string" },
+        help: { type: "boolean", default: false },
+      },
+      allowPositionals: true,
+    }));
+  } catch (e) {
+    return { kind: "error", message: (e as Error).message };
+  }
+  if (values.help) return { kind: "help", command: "service" };
+  if (positionals.length === 0) {
+    return { kind: "error", message: "service: missing action (`dahrk service install` or `uninstall`)" };
+  }
+  if (positionals.length > 1) {
+    return { kind: "error", message: `service: unexpected argument "${positionals[1]}" (one action at a time)` };
+  }
+  const action = positionals[0] as string;
+  if (!isServiceAction(action)) {
+    return { kind: "error", message: `service: unknown action "${action}" (expected install or uninstall)` };
+  }
+  const flags: ServiceFlags = {
+    action,
+    ...(values.token ? { token: values.token } : {}),
+    ...(values.name ? { name: values.name } : {}),
+    ...(values["hub-url"] ? { hubUrl: values["hub-url"] } : {}),
+  };
+  return { kind: "service", flags };
+}
+
 /** Parse the tail of `dahrk update [--check]`: a single optional boolean flag, no positionals. A
  *  `--help` scopes help to `update`. */
 function parseUpdate(flagArgs: string[]): ParsedCli {
@@ -197,6 +256,24 @@ export function usage(bin: string, command?: Command): string {
       "  --token <token>    Enrolment token to verify against the hub (or set DAHRK_ENROL_TOKEN).",
     ].join("\n");
   }
+  if (command === "service") {
+    return [
+      `Usage: ${bin} service install|uninstall [options]`,
+      "",
+      "Install (or remove) the node as an always-on service that starts on boot and restarts on",
+      "failure - a launchd LaunchAgent on macOS, a systemd user service on Linux. No pm2, no root.",
+      "The node id persisted at ~/.dahrk/node.json means it re-attaches as the same node across reboots.",
+      "",
+      "Actions:",
+      "  install      Generate and register the service, then start it.",
+      "  uninstall    Stop, deregister, and remove the service.",
+      "",
+      "Options (install; baked into the service, uninstall ignores them):",
+      "  --token <token>    Enrolment token (required; or set DAHRK_ENROL_TOKEN).",
+      "  --hub-url <url>    Hub WebSocket URL (or set DAHRK_HUB_URL).",
+      "  --name <name>      Display-name override (else the hub assigns one).",
+    ].join("\n");
+  }
   if (command === "doctor") {
     return [
       `Usage: ${bin} doctor [options]`,
@@ -226,6 +303,7 @@ export function usage(bin: string, command?: Command): string {
     "Commands:",
     "  start     Run the edge node (default). Needs a --token and a hub URL.",
     "  run       Run a workflow locally (engine-backed), e.g. `run preflight`.",
+    "  service   Install/uninstall the node as an always-on service (launchd/systemd).",
     "  doctor    Preflight checks: Node, runtimes, hub reachability, token validity.",
     "  update    Update the client to the latest release (or print how for your channel).",
     "  version   Print the client version.",

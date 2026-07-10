@@ -48,7 +48,36 @@ dahrk start  --token <enrolment-token>   # dial out and wait for Jobs
 The node auto-detects which runtimes are installed (claude / codex / pi), mints and persists a stable
 node id under `~/.dahrk/node.json`, dials out to the hub, and waits for Jobs. It advertises no inbound
 ports; repositories are cloned on demand from each Job's git URL. To keep it running across reboots,
-put it under a process manager (see [pm2](#run-it-durably-pm2) below).
+install it as a service (see [`dahrk service install`](#run-it-as-a-service-dahrk-service-install) below).
+
+## Run it as a service (`dahrk service install`)
+
+To keep a node always-on without a process manager, install it as a native service. It generates and
+registers a **launchd** LaunchAgent on macOS or a **systemd** user service on Linux that runs
+`dahrk start` on boot, restarts it on failure, and streams logs - no pm2, no root:
+
+```bash
+dahrk service install --token <enrolment-token>   # register + start
+dahrk service uninstall                            # stop + remove
+```
+
+Because the node id is persisted at `~/.dahrk/node.json`, the service re-attaches as the **same** node
+across restarts - no hand-set `DAHRK_NODE_ID`. The token (and any `--name` / `--hub-url`) is baked into
+the service's environment block, not its command line, so it never shows up in `ps`. Your current `PATH`
+is snapshotted into that block too, so the daemon finds `git` and the runtime CLIs (claude / codex / pi)
+the same way your shell does - install the service from a shell where `dahrk doctor` already sees them.
+
+- **macOS** writes `~/Library/LaunchAgents/ai.dahrk.node.plist` and loads it with `launchctl`. Logs land
+  at `~/.dahrk/logs/node.{out,err}.log` (`tail -f ~/.dahrk/logs/node.err.log`).
+- **Linux** writes `~/.config/systemd/user/dahrk-node.service`, runs `systemctl --user enable --now`, and
+  enables **linger** (`loginctl enable-linger`) so the node starts at boot and survives logout - the
+  thing a headless VPS needs. Logs go to the journal (`journalctl --user -u dahrk-node -f`). If enabling
+  linger needs privilege on your host, run `sudo loginctl enable-linger $USER` once.
+
+On a clean Mac or a clean Linux VPS this yields a node that survives a reboot and re-attaches. A bad or
+missing token exits 78 (`EX_CONFIG`): on Linux systemd stops the service rather than restarting it, and
+on macOS launchd throttles retries to one every 10s - either way the misconfiguration stays visible in
+the logs instead of hammering the hub.
 
 ## What's in this repo
 
@@ -72,9 +101,11 @@ pnpm build
 DAHRK_HUB_URL=ws://localhost:7071 pnpm --filter dahrk-node dev start --token <enrolment-token>
 ```
 
-### Run it durably (pm2)
+### Run it durably from source (pm2)
 
-For a long-running node, use the bundled pm2 config - self-contained, runs from source, no build step:
+Running an **installed** client? Prefer [`dahrk service install`](#run-it-as-a-service-dahrk-service-install)
+above. For a long-running node **from a source checkout**, use the bundled pm2 config - self-contained,
+runs from source, no build step:
 
 ```bash
 pnpm install
@@ -93,9 +124,10 @@ starting; never commit the token.
 ```bash
 dahrk start --token <t> [--name <n>] [--hub-url <u>] [--ephemeral]   # run the node
 dahrk run <workflow> [--repo <p>] [--hub-url <u>] [--token <t>]      # run a workflow (engine-backed)
+dahrk service install|uninstall [--token <t>] [--name <n>] [--hub-url <u>]  # always-on service
 dahrk doctor [--token <t>] [--hub-url <u>]                           # preflight checks
 dahrk update [--check]                                              # self-update to the latest client
-dahrk help [start|run|doctor|update]                               # usage
+dahrk help [start|run|service|doctor|update]                       # usage
 dahrk version                                                        # print the client version
 ```
 
@@ -119,6 +151,10 @@ version, asks the npm registry for the newest one, and - if you are behind - det
 (npm / Homebrew / curl) and runs the right upgrade, or prints the exact command when it cannot tell.
 It reports `current -> latest`, and is a no-op when you are already current. `--check` reports whether
 an update is available without applying it.
+
+`dahrk service install` registers the node as an always-on service (launchd on macOS, systemd on Linux)
+that runs `dahrk start` on boot and restarts it on failure; `dahrk service uninstall` removes it. See
+[Run it as a service](#run-it-as-a-service-dahrk-service-install) above.
 
 `--ephemeral` mints a throwaway node id for the run instead of reading/persisting `~/.dahrk/node.json`
 - handy for CI or one-shot nodes that should leave no local state.
