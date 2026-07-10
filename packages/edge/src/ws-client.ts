@@ -61,6 +61,9 @@ export interface EdgeOptions {
   heartbeatMs?: number;
   /** Worktree retention (omitted = keep all run worktrees on the edge). */
   retention?: RetentionPolicy;
+  /** Abort to stop the node: closes the socket and suppresses the reconnect. For embedders that own
+   *  the process lifecycle (and for tests); `main.ts` lets process exit do it. */
+  signal?: AbortSignal;
 }
 
 const log = (line: string): void => void process.stdout.write(`${line}\n`);
@@ -74,6 +77,8 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
 
   let ws: WebSocket | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastPongAt = 0;
   let shuttingDown = false;
   // Set once the startup promise is wired; called on a fatal hub rejection so a pre-connect failure
   // rejects `startEdgeNode` (main.ts then exits non-zero) and a post-connect one stops the poll.
@@ -81,6 +86,31 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
 
   const send = (msg: EdgeToHub): void => {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(encode(msg));
+  };
+
+  // Consecutive missed pongs before we call the socket dead. Three beats is 15s at the 5000ms
+  // default: long enough to ride out a slow hub, far short of the hub's 2100s stage backstop.
+  const MISSED_PONGS_BEFORE_DEAD = 3;
+
+  // One timer drives both liveness directions. Our `heartbeat` frame is application-level and
+  // one-way (the hub only stamps `lastHeartbeatAt`), so it can never tell us the path is gone: a
+  // half-open TCP connection leaves `readyState` at OPEN forever and `send()` writes into the void.
+  // That is how the 2026-07-09 incident stayed invisible - the node streamed trace events at a hub
+  // whose `nodes` map no longer held it, so it never reconnected and never got its Job re-sent. The
+  // protocol-level ping is answered automatically by the hub's `ws` server, so a missing pong is
+  // proof the path is dead: terminate and let the `close` handler reconnect.
+  const startHeartbeat = (sock: WebSocket, intervalMs: number): void => {
+    if (heartbeat) clearInterval(heartbeat);
+    lastPongAt = Date.now();
+    heartbeat = setInterval(() => {
+      if (Date.now() - lastPongAt > MISSED_PONGS_BEFORE_DEAD * intervalMs) {
+        log(`EDGE_STALE:${Date.now() - lastPongAt}ms without a pong, terminating socket`);
+        sock.terminate(); // -> `close` -> the existing 500ms reconnect
+        return;
+      }
+      send({ type: "heartbeat" });
+      if (sock.readyState === WebSocket.OPEN) sock.ping();
+    }, intervalMs);
   };
 
   // the edge sends each result exactly once, but a hub restart loses the in-memory map that
@@ -138,10 +168,10 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
 
   // In-flight job/push ids, so a re-dispatched frame for a job that is STILL running is dropped rather
   // than starting a second runner on the same run worktree. The hub re-dispatches the SAME
-  // jobId/awakeableId on its dispatch deadline, and the bridge re-sends every pending job on each
-  // reconnect (502/521 churn); both carry a stable jobId, so this guard de-dups both. A frame whose
-  // original genuinely lost its result (awakeable never resolved; id cleared on completion) is NOT in
-  // the set, so it re-runs - the intended recovery. on_fail retries use a fresh jobId and are allowed.
+  // jobId/awakeableId on its dispatch deadline, on every re-arm tick, and on each reconnect (502/521
+  // churn); all carry a stable jobId, so this guard de-dups them. on_fail retries use a fresh jobId
+  // and are allowed. A frame for a FINISHED job is not in this set - it is answered from `lastResults`
+  // instead, and only a job we have neither running nor a cached result for genuinely re-runs.
   const running = new Set<string>();
 
   const onMessage = async (raw: string): Promise<void> => {
@@ -152,9 +182,8 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       // runner reads deps.tenantId/deps.retention at call time, and Jobs only arrive after this point.
       stageDeps.tenantId = msg.tenantId;
       if (opts.retention === undefined && msg.retention) stageDeps.retention = msg.retention;
-      if (opts.heartbeatMs === undefined && msg.heartbeatMs > 0) {
-        if (heartbeat) clearInterval(heartbeat);
-        heartbeat = setInterval(() => send({ type: "heartbeat" }), msg.heartbeatMs);
+      if (opts.heartbeatMs === undefined && msg.heartbeatMs > 0 && ws) {
+        startHeartbeat(ws, msg.heartbeatMs);
       }
       log(`EDGE_WELCOMED:${msg.name} tenant=${msg.tenantId} credentialMode=${msg.credentialMode}`);
       return;
@@ -189,6 +218,12 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         log(`PUSH_DUPLICATE:${job.runId} ${job.jobId}`);
         return;
       }
+      const cachedPush = lastResults.get(job.jobId);
+      if (cachedPush) {
+        send(cachedPush);
+        log(`PUSH_REPLAY:${job.runId} ${job.jobId}`);
+        return;
+      }
       running.add(job.jobId);
       log(`PUSH_STARTED:${job.runId} ${job.branch}`);
       try {
@@ -219,6 +254,12 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       // A re-dispatch of a still-running stage: drop it. The original runJob still owns the worktree
       // and will resolve the (shared) awakeable; a second runner here would corrupt the worktree.
       log(`JOB_DUPLICATE:${job.stageId} ${job.jobId}`);
+      return;
+    }
+    const cachedJob = lastResults.get(job.jobId);
+    if (cachedJob) {
+      send(cachedJob);
+      log(`JOB_REPLAY:${job.stageId} ${job.jobId}`);
       return;
     }
     running.add(job.jobId);
@@ -270,12 +311,16 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       // bridge now resolves it idempotently, so this re-send is what un-wedges the run. A no-op when the
       // hub already has the result (4xx on the duplicate resolve).
       for (const frame of lastResults.values()) send(frame);
-      heartbeat = setInterval(() => send({ type: "heartbeat" }), opts.heartbeatMs ?? 5000);
+      startHeartbeat(sock, opts.heartbeatMs ?? 5000);
     });
     sock.on("message", (raw) => void onMessage(raw.toString()));
+    sock.on("pong", () => {
+      lastPongAt = Date.now();
+    });
     sock.on("error", (e) => log(`EDGE_ERROR ${(e as Error).message}`));
     sock.on("close", (code: number, reason: Buffer) => {
       if (heartbeat) clearInterval(heartbeat);
+      heartbeat = undefined;
       // A hub enrolment rejection is fatal: the token/config is wrong, not a transient drop.
       // Do NOT reconnect (that would loop silently). Exit with EX_CONFIG (78) - a DISTINCT
       // code so a supervisor (pm2 `stop_exit_codes`) can stop the node on a bad/missing token instead
@@ -288,9 +333,22 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         onFatal?.(new Error(`hub rejected edge enrolment (${code}): ${detail}`));
         return;
       }
-      if (!shuttingDown) setTimeout(connect, 500); // reconnect with a small backoff
+      if (!shuttingDown) reconnectTimer = setTimeout(connect, 500); // reconnect with a small backoff
     });
   };
+
+  opts.signal?.addEventListener(
+    "abort",
+    () => {
+      shuttingDown = true;
+      if (heartbeat) clearInterval(heartbeat);
+      heartbeat = undefined;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+      ws?.close(1000, "shutting down");
+    },
+    { once: true },
+  );
 
   connect();
   // Resolve once connected; the open socket + heartbeat keep the process alive. Reject instead if the
