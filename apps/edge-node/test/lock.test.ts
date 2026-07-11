@@ -62,3 +62,19 @@ test("release gives the lock back, so the next start is not refused by a ghost",
   assert.equal(d.written(), undefined);
   assert.equal(acquireLock(deps()).ok, true);
 });
+
+test("release does NOT delete a lock that has since become someone else's", () => {
+  // How this happens, and it did: we reclaim a pidfile as stale (or lose the race the comment on
+  // acquireLock admits to), a second node takes the lock, and then WE exit. An unconditional delete on the
+  // way out would remove the live node's pidfile, disarming the one guard against two nodes dialling the
+  // hub with the same identity - and leaving nothing on disk for `dahrk stop` to find them by.
+  const d = deps({ alive: [] });
+  const result = acquireLock(d);
+  assert.equal(result.ok, true);
+  assert.equal(d.written(), "100\n");
+
+  d.writeFile(d.file, "4821\n"); // another node takes over while we are still running
+
+  if (result.ok) result.release();
+  assert.equal(d.written(), "4821\n", "the new holder's lock must survive our exit");
+});

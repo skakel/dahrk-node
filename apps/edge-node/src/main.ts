@@ -46,7 +46,13 @@ import { defaultLockDeps, acquireLock } from "./lock.js";
 import { defaultLogsDeps, rotateIfLarge, runLogs } from "./logs.js";
 import { installProcessSafetyNet, writeCrashRecord } from "./process-safety.js";
 import { runPreflight } from "./preflight.js";
-import { runNodeStart, runNodeStop, runServiceInstall, runServiceUninstall } from "./service.js";
+import {
+  runNodeStart,
+  runNodeStop,
+  runServiceInstall,
+  runServiceUninstall,
+  STOP_FOREIGN_NODE,
+} from "./service.js";
 import { fetchLatestVersion, runUpdate } from "./update.js";
 import {
   checkForUpdate,
@@ -333,7 +339,10 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
  *  stopped rather than as a crash-loop, and so its exit code stays a usable health check. */
 async function stop(env: NodeJS.ProcessEnv): Promise<number> {
   const code = await runNodeStop();
-  if (code === 0) setDesired(env, "stopped");
+  // STOP_FOREIGN_NODE is a non-zero exit, but the service IS stopped and the operator DID mean it - the
+  // node still up is one another supervisor owns. Record the intent anyway, or `status` would read the
+  // stopped service back as a crash-loop.
+  if (code === 0 || code === STOP_FOREIGN_NODE) setDesired(env, "stopped");
   return code;
 }
 

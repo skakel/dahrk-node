@@ -26,7 +26,8 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform as osPlatform, userInfo } from "node:os";
 import { join } from "node:path";
-import { logDir as resolveLogDir } from "./state.js";
+import { isAlive as pidIsAlive, parseLock } from "./lock.js";
+import { lockFile as resolveLockFile, logDir as resolveLogDir } from "./state.js";
 
 /** The unit file carries the enrolment token in its environment block, so it is owner-only. */
 export const UNIT_FILE_MODE = 0o600;
@@ -343,6 +344,11 @@ export interface ServiceDeps {
   run: (argv: string[]) => number;
   /** Run a probe and capture its stdout (parsed, not shown) - `statusCommand`'s counterpart. */
   capture: (argv: string[]) => { code: number; stdout: string };
+  /** The single-instance pidfile (`~/.dahrk/node.pid`). Held by whichever process is doing the work, no
+   *  matter who supervises it, which is what lets `stop` see a node the service does not own. */
+  lockFile: string;
+  /** Is a pid a live process? `lock.ts`'s liveness test, injected so `stop` tests without real processes. */
+  isAlive: (pid: number) => boolean;
   out: (line: string) => void;
 }
 
@@ -536,9 +542,37 @@ export async function runNodeStart(
   return { kind: "running", code: 0 };
 }
 
+/** `dahrk stop` stopped the service but a node outlived it: the exit code that says so. Distinct from 1
+ *  (an unsupported host, where we stopped nothing) because the service really is stopped - and distinct
+ *  from 0 because the host is still running a node, which is the opposite of what was asked for. */
+export const STOP_FOREIGN_NODE = 3;
+
+/**
+ * Who, if anyone, is still running a node once the service has been stopped?
+ *
+ * `stop` drives one supervisor: the launchd / systemd unit we installed. It cannot stop what it did not
+ * start - a node under pm2, in a container, or a `dahrk start --foreground` in some other terminal - and
+ * such a node is not a harmless stray: it holds the same persisted nodeId, so it stays connected and keeps
+ * taking Jobs from the hub while the operator has every reason to believe this host is idle. The pidfile is
+ * what makes it visible, because the worker takes it whoever supervises it.
+ *
+ * The service's own pid is excluded: `launchctl bootout` returns before the process has finished exiting,
+ * so for a moment the pidfile still names a node that is on its way out, and that is not a foreign one.
+ */
+export function foreignNodePid(
+  lock: string | undefined,
+  servicePid: number | undefined,
+  isAlive: (pid: number) => boolean,
+): number | undefined {
+  const held = parseLock(lock);
+  if (held === undefined || held === servicePid) return undefined;
+  return isAlive(held) ? held : undefined;
+}
+
 /**
  * `dahrk stop`: stop the node now and keep it stopped, without deregistering it - so `dahrk start` brings
- * it back. Returns the process exit code (0 = stopped / nothing to stop, 1 = unsupported host).
+ * it back. Returns the process exit code (0 = stopped / nothing to stop, 1 = unsupported host,
+ * 3 = the service is stopped but another supervisor's node is still running).
  */
 export async function runNodeStop(deps: Partial<ServiceDeps> = {}): Promise<number> {
   const d = { ...defaultDeps(), ...deps };
@@ -559,12 +593,31 @@ export async function runNodeStop(deps: Partial<ServiceDeps> = {}): Promise<numb
   if (!d.fileExists(plan.filePath)) {
     d.out("No service installed, so there is nothing to stop.");
     d.out("If you are running a node in a terminal (`dahrk start --foreground`), stop it with Ctrl-C.");
-    return 0;
+    return reportForeignNode(d, undefined) ?? 0;
   }
+
+  // Ask the supervisor for its pid BEFORE we stop it, so that the node the pidfile names can be told apart
+  // from a node somebody else supervises. Without this the check cannot distinguish "still shutting down"
+  // from "never ours in the first place".
+  const servicePid = parseServiceStatus(manager, true, d.capture(statusCommand(manager))).pid;
 
   runCommands(plan.stopCommands, d);
   d.out("Node stopped. It will stay stopped across reboots until you run `dahrk start`.");
-  return 0;
+  return reportForeignNode(d, servicePid) ?? 0;
+}
+
+/** Say so, loudly, when the host is still running a node we did not stop. Returns the exit code to use, or
+ *  undefined when the host really is idle. Silence here is what let a pm2-supervised node keep serving Jobs
+ *  through a `dahrk stop` that reported success. */
+function reportForeignNode(d: ServiceDeps, servicePid: number | undefined): number | undefined {
+  const pid = foreignNodePid(d.readFile(d.lockFile), servicePid, d.isAlive);
+  if (pid === undefined) return undefined;
+  d.out("");
+  d.out(`WARNING: a node is STILL RUNNING on this host (pid ${pid}). \`dahrk stop\` cannot stop it.`);
+  d.out("Something else is supervising it: pm2, a container, or `dahrk start --foreground` in a terminal.");
+  d.out("It is not a stray copy - it holds this node's identity, so it is still connected to the hub and");
+  d.out("still taking Jobs. Stop it where it was started (e.g. `pm2 delete dahrk-node`), or kill the pid.");
+  return STOP_FOREIGN_NODE;
 }
 
 /**
@@ -660,6 +713,8 @@ const defaultDeps = (): ServiceDeps => ({
   nodeBin: stableNodeBin(process.execPath, realpathOrUndefined),
   scriptPath: resolveScriptPath(),
   logDir: resolveLogDir(process.env),
+  lockFile: resolveLockFile(process.env),
+  isAlive: pidIsAlive,
   // Snapshot the operator's PATH at install time so the daemon finds git + the runtime CLIs (Homebrew /
   // npm-global bins) that a supervisor's minimal PATH would otherwise hide.
   pathEnv: process.env.PATH,

@@ -6,6 +6,22 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dahrk stop` no longer reports success while a node keeps running.** `stop` drives the service it
+  installed (launchd / systemd), and it cannot stop a node somebody else supervises: one started under
+  pm2, in a container, or with `dahrk start --foreground` in another terminal. It used to print "Node
+  stopped." regardless, so a pm2-supervised node went on holding this host's identity and taking Jobs
+  from the hub while the operator had every reason to believe the host was idle. `stop` now checks the
+  single-instance pidfile after stopping the service, names the surviving node's pid, says where to go
+  and stop it, and exits 3 rather than 0.
+- **A node exiting no longer deletes another node's lock.** `release()` removed the pidfile
+  unconditionally, so a node that had reclaimed a stale lock (or lost the acquire race) would, on its way
+  out, delete the pidfile of the live node that had since taken it. That left the single-instance guard
+  silently disarmed - the exact condition it exists to prevent - and left `dahrk stop` nothing on disk to
+  find the surviving node by. Release now removes the pidfile only while it still names the releasing
+  process.
+
 ## [0.1.9] - 2026-07-11
 
 ### Fixed

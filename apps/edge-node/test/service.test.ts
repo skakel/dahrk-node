@@ -6,9 +6,11 @@ import {
   renderLaunchdPlist,
   renderSystemdUnit,
   buildPlan,
+  foreignNodePid,
   runNodeStart,
   runNodeStop,
   runServiceInstall,
+  STOP_FOREIGN_NODE,
   runServiceUninstall,
   serviceArgv,
   unitIsCurrent,
@@ -342,8 +344,16 @@ test("availabilityCommand: systemd is probed with `show`, not `is-system-running
   assert.equal(availabilityCommand("launchd"), undefined);
 });
 
-/** A harness for the start/stop shells: a fake host whose unit file and supervisor answers we control. */
-function startHarness(over: Partial<ServiceDeps> & { onDisk?: string } = {}): {
+const LOCK = "/Users/me/.dahrk/node.pid";
+
+/**
+ * A harness for the start/stop shells: a fake host whose unit file and supervisor answers we control.
+ * `lock` is the pidfile's contents and `alive` the pids the fake OS admits to - together they stand in for
+ * a node running under some other supervisor.
+ */
+function startHarness(
+  over: Partial<ServiceDeps> & { onDisk?: string; lock?: string; alive?: number[] } = {},
+): {
   deps: Partial<ServiceDeps>;
   lines: string[];
   writes: Array<{ path: string; content: string }>;
@@ -352,6 +362,7 @@ function startHarness(over: Partial<ServiceDeps> & { onDisk?: string } = {}): {
   const lines: string[] = [];
   const writes: Array<{ path: string; content: string }> = [];
   const ran: string[][] = [];
+  const alive = new Set(over.alive ?? []);
   let onDisk = over.onDisk;
   const deps: Partial<ServiceDeps> = {
     platform: "darwin",
@@ -359,13 +370,15 @@ function startHarness(over: Partial<ServiceDeps> & { onDisk?: string } = {}): {
     nodeBin: BASE.nodeBin,
     scriptPath: BASE.scriptPath,
     logDir: BASE.logDir,
+    lockFile: LOCK,
+    isAlive: (pid) => alive.has(pid),
     pathEnv: undefined,
     mkdirp: () => {},
     writeFile: (path, content) => {
       writes.push({ path, content });
       onDisk = content;
     },
-    readFile: () => onDisk,
+    readFile: (path) => (path === LOCK ? over.lock : onDisk),
     removeFile: () => {},
     fileExists: () => onDisk !== undefined,
     run: (argv) => {
@@ -473,4 +486,36 @@ test("runNodeStop: nothing installed is not an error, and points at how you woul
   assert.equal(h.ran.length, 0);
   assert.match(h.lines.join("\n"), /nothing to stop/);
   assert.match(h.lines.join("\n"), /Ctrl-C/, "the likely case: they are running one in a terminal");
+});
+
+test("foreignNodePid: only a LIVE holder that is not the service's own node counts as foreign", () => {
+  const alive = (pids: number[]) => (pid: number) => pids.includes(pid);
+  assert.equal(foreignNodePid("82324\n", 4821, alive([82324, 4821])), 82324, "another supervisor's node");
+  assert.equal(foreignNodePid("4821\n", 4821, alive([4821])), undefined, "the service's own node, exiting");
+  assert.equal(foreignNodePid("82324\n", 4821, alive([4821])), undefined, "a crashed node's stale pidfile");
+  assert.equal(foreignNodePid(undefined, 4821, alive([])), undefined, "no pidfile at all: nothing running");
+  assert.equal(foreignNodePid("82324\n", undefined, alive([82324])), 82324, "no service running, but a node is");
+});
+
+test("runNodeStop: a node under ANOTHER supervisor survives the stop, and stop must not claim success", async () => {
+  // The real incident: a pm2-supervised node kept taking Jobs straight through a `dahrk stop` that said
+  // "Node stopped." The service pid (4821, per the harness's launchctl answer) is not the one holding the
+  // pidfile, so the holder is somebody else's - and stopping the unit does nothing to it.
+  const h = startHarness({ onDisk: renderLaunchdPlist(BASE), lock: "82324\n", alive: [82324, 4821] });
+
+  assert.equal(await runNodeStop(h.deps), STOP_FOREIGN_NODE, "a non-zero exit: the host is still running a node");
+
+  const out = h.lines.join("\n");
+  assert.match(out, /STILL RUNNING on this host \(pid 82324\)/);
+  assert.match(out, /pm2/, "name the likely culprit, since we cannot stop it for them");
+  assert.match(out, /still taking Jobs/, "the reason it matters: it is not an idle stray");
+});
+
+test("runNodeStop: the service's own node, mid-shutdown, is not mistaken for a foreign one", async () => {
+  // `launchctl unload` returns before the process has gone, so the pidfile still names it. Warning here
+  // would fire on every single healthy stop.
+  const h = startHarness({ onDisk: renderLaunchdPlist(BASE), lock: "4821\n", alive: [4821] });
+
+  assert.equal(await runNodeStop(h.deps), 0);
+  assert.doesNotMatch(h.lines.join("\n"), /STILL RUNNING/);
 });
