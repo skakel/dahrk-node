@@ -19,6 +19,21 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Test coverage for the AskUserQuestion degrade path, DHK-344 (#49)
+
+- No behaviour change. DHK-344 itself was already delivered by #25 (`d8f3b5e`) — the
+  `AskUserQuestion` → `elicit` wiring across `ask-user-question-tool.ts`, `claude-adapter.ts`,
+  `stage-runner.ts` and `ws-client.ts` was fully in place, so the ticket needed no implementation.
+  (The PR title says otherwise; it oversells what is really a test extraction.)
+- What was actually missing was a test. The multi-question degrade rule — v1 surfaces only the first
+  question and folds a note into its prompt rather than denying the call or forcing a retry loop
+  (the DHK-223 D5 degrade philosophy) — lived inlined in the tool handler, reachable only through the
+  MCP tool, and so was never asserted on directly.
+- Extracted it verbatim into a pure `buildElicitFromQuestions` in `ask-user-question-tool.ts` and
+  pinned both branches: a single question carries no note, and >1 surfaces only the first question's
+  options with the total count named in the prompt.
+- Known gap, left out of scope: a question with `multiSelect` set still emits no `console.warn`.
+
 ## [0.1.11] - 2026-07-11
 
 ### Filesystem confinement, DHK-392 (#47)
