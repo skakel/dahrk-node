@@ -233,12 +233,19 @@ function bumpPackage(path, version) {
 // Strip internal identifiers so they can never reach the public notes, whatever the source. Removes
 // Linear-style tracker keys, internal run IDs, and commit trailers, then tidies the fallout (empty
 // parens left behind, doubled spaces, trailing whitespace).
+const KEY = String.raw`(?:DHK|SKA|LABS|TEST|HAR|SL)-\d+`
+const RUN = String.raw`run-[a-z0-9]{6,}`
+const ID = `(?:${KEY}|${RUN})`
+
 function sanitizeNotes(text) {
   return text
     .replace(/^(?:Co-authored-by|Signed-off-by):.*$/gim, '') // commit trailers
-    .replace(/\b(?:DHK|SKA|LABS|TEST|HAR|SL)-\d+\b/g, '') // Linear-style keys
-    .replace(/\brun-[a-z0-9]{6,}\b/gi, '') // internal run IDs
-    .replace(/\(\s*[,\s]*\)/g, '') // parens emptied by the removals: "(DHK-284)" -> ""
+    // A paren group holding nothing but ids, removed whole: "(DHK-284)", "(DHK-1, run-a1b2c3)". Matching
+    // the ids *inside* the parens is what keeps a bare "()" out of scope. Clearing the ids first and then
+    // sweeping empty parens cannot tell the two apart, and ate `release()` -> `release` in 0.1.10.
+    .replace(new RegExp(String.raw`\(\s*${ID}(?:\s*[,;]\s*${ID})*\s*\)`, 'gi'), '')
+    .replace(new RegExp(String.raw`\b${KEY}\b`, 'g'), '') // keys outside parens
+    .replace(new RegExp(String.raw`\b${RUN}\b`, 'gi'), '') // run IDs outside parens
     .replace(/[ \t]+([),.:;])/g, '$1') // space before punctuation left by a removal
     .replace(/(\S)[ \t]{2,}/g, '$1 ') // squeeze doubled spaces mid-line (preserve leading indent)
     .replace(/[ \t]+$/gm, '') // trailing whitespace
