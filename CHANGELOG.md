@@ -30,7 +30,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   Measured against the shell commands from three real run worktrees - 118 commands, each judged against its
   own run's roots - two were denied, and both were the whole-disk scan itself. If a legitimate command is
   wrongly denied anyway, `DAHRK_FS_EXTRA_ROOTS` widens the box and `DAHRK_FS_CONFINE=0` turns it off,
-  without waiting for a release. (DHK-392)
+  without waiting for a release. (#47)
 
 ## [0.1.10] - 2026-07-11
 
