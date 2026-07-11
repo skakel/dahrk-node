@@ -19,6 +19,46 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-07-11
+
+### Filesystem confinement, DHK-392 (#47)
+
+- Found in the wild: a stage agent ran a `find` rooted at `/` and scanned the operator's whole Mac,
+  mounted network volumes included. Nothing stopped it and nothing could — `shell_guard` is a blocklist
+  of seven commands (a root-anchored `find` is not one), `write_scope` only ever inspected the worktree's
+  git *branch* and the repo name (a `Write` to `~/.zshrc` passes on an in-scope branch), `Read`/`Grep`/
+  `Glob` were in no rule's tool set at all, and the Claude adapter set only `cwd`. The gap was already
+  pinned in our own tests: they assert an env-file search and a credential-exfil `curl` *leak* under
+  `shell_guard`.
+- `fs_confine` (`packages/edge/src/builtins.ts`, `fs-roots.ts`, `shell-scan.ts`) is a path-aware rule, on
+  by default whenever a Job has a worktree. Deliberately a **node default, not a workflow policy**: a run
+  always has a worktree, so it needs no declaration and ships without a `@dahrk/contracts` release, and it
+  fails closed. A future `fs_scope` policy widens the same roots — the shape is already there.
+- The load-bearing subtlety: a linked worktree's `.git` is a *file* pointing into
+  `~/.dahrk/mirrors/<repo>`, where index, refs and objects actually live. Deny the mirror and *every* git
+  command in the worktree fails. Read-only allowances (`/usr`, `/opt`, `/etc/gitconfig`, TLS roots,
+  `~/.gitconfig`, the pnpm store) exist for the same reason: deny them and `git commit` and every HTTPS
+  call break. `~/.ssh`, `~/.aws`, `~/.gnupg`, keychains and `/Volumes` are denied above every allowance.
+- The shell scanner is not a shell parser. It rests on one property: a token can only escape the worktree
+  if it is *anchored* outside it (`/`, `~`, `$HOME`, or a `..` that climbs out); everything else resolves
+  inside by construction. The work is in not mistaking a **pattern** for a path — which is precisely what
+  `find / -path <glob>` is made of.
+- Verified against real traffic rather than fixtures: 118 shell commands pulled from three run worktrees,
+  each scanned against *its own* run's roots. Two denied, both the whole-disk scan itself; zero false
+  positives. That corpus caught a bug fixtures never would have — `2>/dev/null` appears on roughly a third
+  of all commands and the first cut denied it as an out-of-worktree write. Pinned as a test.
+- Two limits, stated in the public note as well. Codex and Pi expose no pre-tool hook, so a breach is only
+  detectable *after* the command ran; there the stage now fails loudly instead of leaving "one or more
+  actions were blocked" at the end of a green run. The real fix for those runtimes is containerisation
+  (out of scope). And this is a tool-argument guard, not a syscall sandbox: a path assembled inside a
+  script and never named in the command is invisible to it. `DAHRK_SANDBOX=1` wires the Claude SDK's
+  OS-level sandbox, which does close that, but stays opt-in — the SDK's doc comment ("filesystem
+  restrictions come from permission rules, not these sandbox settings") contradicts its own schema, which
+  exposes `filesystem.allowWrite`/`denyRead`. Not defaulting on behaviour unproven on a real run.
+- Rollout: no running node picks this up by itself (`update-check.ts` only *logs* that an update exists),
+  so the operator must `dahrk update` and restart. `DAHRK_FS_CONFINE=0` and `DAHRK_FS_EXTRA_ROOTS` are in
+  the README because this fails closed on machines we cannot hot-patch.
+
 ## [0.1.10] - 2026-07-11
 
 ## [0.1.9] - 2026-07-11

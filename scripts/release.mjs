@@ -233,11 +233,14 @@ function bumpPackage(path, version) {
 // Strip internal identifiers so they can never reach the public notes, whatever the source. Removes
 // Linear-style tracker keys, internal run IDs, and commit trailers, then tidies the fallout (empty
 // parens left behind, doubled spaces, trailing whitespace).
-const KEY = String.raw`(?:DHK|SKA|LABS|TEST|HAR|SL)-\d+`
-const RUN = String.raw`run-[a-z0-9]{6,}`
-const ID = `(?:${KEY}|${RUN})`
-
 function sanitizeNotes(text) {
+  // Declared in here, not at module scope: the only call site runs during top-level execution, above
+  // this point in the file. Hoisting reaches the function but not a `const` it closes over, so module
+  // -scoped patterns would sit in the temporal dead zone and throw.
+  const KEY = String.raw`(?:DHK|SKA|LABS|TEST|HAR|SL)-\d+`
+  const RUN = String.raw`run-[a-z0-9]{6,}`
+  const ID = `(?:${KEY}|${RUN})`
+
   return text
     .replace(/^(?:Co-authored-by|Signed-off-by):.*$/gim, '') // commit trailers
     // A paren group holding nothing but ids, removed whole: "(DHK-284)", "(DHK-1, run-a1b2c3)". Matching

@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-07-11
+
 ### Fixed
 
 - **A stage can no longer read your whole machine.** An agent looking for a package ran a `find` from the
@@ -404,7 +406,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/dahrkai/dahrk-node/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/dahrkai/dahrk-node/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/dahrkai/dahrk-node/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/dahrkai/dahrk-node/compare/v0.1.7...v0.1.8
