@@ -14,6 +14,12 @@
  * that lost power) leaves a pidfile behind, and a lock that a crash can wedge shut forever is worse than
  * no lock at all. `process.kill(pid, 0)` sends no signal - it just tests whether the pid is ours to signal
  * - so a dead pid is reclaimed silently and the node comes straight back up.
+ *
+ * Release is symmetrical with that: it removes the pidfile only while the pidfile still names US. A lock
+ * reclaimed as stale (or, on the racy path the comment on `acquireLock` admits to, taken from under us)
+ * now belongs to somebody else, and deleting it on our way out would leave a live node holding a lock
+ * that is no longer on disk - the guard silently disarmed, exactly when a second node is what we were
+ * defending against.
  */
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -57,7 +63,14 @@ export function acquireLock(deps: LockDeps): LockResult {
     return { ok: false, heldBy: held };
   }
   deps.writeFile(deps.file, `${deps.pid}\n`);
-  return { ok: true, release: () => deps.removeFile(deps.file) };
+  return { ok: true, release: () => releaseLock(deps) };
+}
+
+/** Give the lock back, but only if we still hold it. Whoever's pid is in the file is the holder, so a file
+ *  naming anyone but us is not ours to delete: we let go of nothing and leave their lock standing. */
+export function releaseLock(deps: LockDeps): void {
+  if (parseLock(deps.readFile(deps.file)) !== deps.pid) return;
+  deps.removeFile(deps.file);
 }
 
 /** True when the pid is a live process. EPERM means it exists but belongs to someone else - still alive,
