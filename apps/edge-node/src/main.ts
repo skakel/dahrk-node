@@ -3,6 +3,11 @@
  *
  *   dahrk start --token <enrolment-token>
  *
+ * The token is needed ONCE. On a successful enrolment it is cached (0600) alongside the node id in
+ * `~/.dahrk/node.json`, so every later `dahrk start` - and every reboot, and the installed service -
+ * re-attaches as the same node with no `--token`. Pass one again only to re-enrol (a rotated token, or
+ * a move to another pool); `--ephemeral` opts out of the disk entirely.
+ *
  * Everything else is either auto-detected on the node or pushed from the hub. On boot the node
  * probes which runtimes are installed (claude / codex / pi), reads or mints a stable node id
  * persisted under `~/.dahrk/node.json`, and dials OUT to the hub over WebSocket. It sends a `hello`
@@ -20,9 +25,10 @@
  * accepted as aliases), and `DAHRK_RUNTIMES`, `DAHRK_CREDENTIAL_MODE`, `DAHRK_NODE_ID`,
  * `DAHRK_TENANT_ID` still act as explicit overrides.
  */
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, platform as osPlatform } from "node:os";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { detectRuntimes, startEdgeNode, type EdgeOptions } from "@dahrk/edge";
@@ -32,6 +38,15 @@ import { runDoctor } from "./doctor.js";
 import { runPreflight } from "./preflight.js";
 import { runServiceInstall, runServiceUninstall } from "./service.js";
 import { runUpdate } from "./update.js";
+import { runStatus, type StatusDeps } from "./status.js";
+import {
+  legacyStateDir,
+  persistEnrolment,
+  readState,
+  resolveEnrolToken,
+  stateFile,
+  writeState,
+} from "./state.js";
 
 const CLIENT_VERSION = process.env.npm_package_version ?? "0.0.0";
 
@@ -53,29 +68,6 @@ export interface ResolvedBoot {
   clientVersion: string;
 }
 
-/** Directory the node persists local state (its id) under. Overridable via DAHRK_STATE_DIR; defaults
- *  to `~/.dahrk` (the same home-dir convention as the git mirror cache). */
-function stateDir(env: NodeJS.ProcessEnv): string {
-  return env.DAHRK_STATE_DIR ?? join(homedir(), ".dahrk");
-}
-
-/** Legacy state dir from before the Dahrk rename; read (never written) so an existing node keeps its
- *  id across the upgrade. Only consulted when DAHRK_STATE_DIR is not set. */
-function legacyStateDir(env: NodeJS.ProcessEnv): string | undefined {
-  return env.DAHRK_STATE_DIR ? undefined : join(homedir(), ".skakel");
-}
-
-function readNodeId(file: string): string | undefined {
-  if (!existsSync(file)) return undefined;
-  try {
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as { nodeId?: unknown };
-    if (typeof parsed.nodeId === "string" && parsed.nodeId) return parsed.nodeId;
-  } catch {
-    // Corrupt state file: fall through and re-mint.
-  }
-  return undefined;
-}
-
 /** Resolve this node's stable id. An explicit `DAHRK_NODE_ID` wins (the managed profile
  *  pins one); otherwise read `~/.dahrk/node.json` (falling back to the legacy `~/.skakel/node.json`
  *  so a pre-rename node keeps its id), minting and persisting a fresh UUID on first boot so the id
@@ -85,22 +77,15 @@ function readNodeId(file: string): string | undefined {
 export function resolveNodeId(env: NodeJS.ProcessEnv, opts: { ephemeral?: boolean } = {}): string {
   if (env.DAHRK_NODE_ID) return env.DAHRK_NODE_ID;
   if (opts.ephemeral) return randomUUID();
-  const dir = stateDir(env);
-  const file = join(dir, "node.json");
-  const existing = readNodeId(file);
+  const existing = readState(stateFile(env)).nodeId;
   if (existing) return existing;
   const legacy = legacyStateDir(env);
   if (legacy) {
-    const legacyId = readNodeId(join(legacy, "node.json"));
+    const legacyId = readState(join(legacy, "node.json")).nodeId;
     if (legacyId) return legacyId;
   }
   const nodeId = randomUUID();
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(file, `${JSON.stringify({ nodeId }, null, 2)}\n`);
-  } catch (e) {
-    console.warn(`could not persist node id to ${file}: ${(e as Error).message}`);
-  }
+  writeState(env, { nodeId });
   return nodeId;
 }
 
@@ -204,10 +189,17 @@ function envWithFlags(env: NodeJS.ProcessEnv, flags: StartFlags): NodeJS.Process
   return merged;
 }
 
-/** Run the node: resolve identity + runtimes, then dial the hub and serve Jobs (blocks until exit). */
+/** Run the node: resolve identity + runtimes, then dial the hub and serve Jobs (blocks until exit).
+ *
+ *  Enrolment is a one-time act: `--token` / `DAHRK_ENROL_TOKEN` wins, but absent both we present the
+ *  token cached by the last successful enrolment, so a bare `dahrk start` (or a reboot) re-attaches
+ *  rather than dying with "an enrolment token is required". We cache the token only once the hub has
+ *  welcomed it, so a typo is never written to disk. */
 async function start(flags: StartFlags): Promise<void> {
   const env = envWithFlags(process.env, flags);
   const nodeId = resolveNodeId(env, { ephemeral: flags.ephemeral });
+  const token = resolveEnrolToken(env, { ephemeral: flags.ephemeral });
+  if (token) env.DAHRK_ENROL_TOKEN = token;
   const runtimes = await resolveRuntimes(env);
   if (runtimes.length === 0) {
     console.warn(
@@ -216,7 +208,41 @@ async function start(flags: StartFlags): Promise<void> {
     );
   }
   const resolved: ResolvedBoot = { nodeId, runtimes, clientVersion: CLIENT_VERSION };
-  await startEdgeNode(buildEdgeOptions(env, resolved));
+  const persist = token !== undefined && !flags.ephemeral;
+  await startEdgeNode({
+    ...buildEdgeOptions(env, resolved),
+    ...(persist
+      ? {
+          onEnrolled: (welcome) =>
+            persistEnrolment(env, { token, name: welcome.name, tenantId: welcome.tenantId }),
+        }
+      : {}),
+  });
+}
+
+/** The real IO `dahrk status` runs on: the host, the state file, the supervisor probe. Kept here (not in
+ *  status.ts) so that module stays free of node:child_process and unit-tests with plain fakes. */
+function statusDeps(env: NodeJS.ProcessEnv): StatusDeps {
+  return {
+    platform: osPlatform(),
+    homeDir: homedir(),
+    env,
+    detectRuntimes: () => resolveRuntimes(env),
+    fileExists: (path) => existsSync(path),
+    capture: (argv) => {
+      const [cmd, ...args] = argv;
+      try {
+        // The probe's output is PARSED, not shown, so capture it rather than inheriting stdio.
+        // stderr is ignored: `launchctl list` on an unknown label writes there and we read the exit code.
+        const stdout = execFileSync(cmd as string, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        return { code: 0, stdout };
+      } catch (e) {
+        const status = (e as { status?: unknown }).status;
+        return { code: typeof status === "number" ? status : 1, stdout: "" };
+      }
+    },
+    out: (line) => void process.stdout.write(`${line}\n`),
+  };
 }
 
 /** The workflows `dahrk run` can dispatch. The seam is deliberately small: `preflight` is the first
@@ -234,7 +260,7 @@ async function runWorkflow(flags: RunFlags): Promise<number> {
   }
   const env = applyEnvAliases(process.env);
   const hubUrl = flags.hubUrl ?? env.DAHRK_HUB_URL;
-  const token = flags.token ?? env.DAHRK_ENROL_TOKEN;
+  const token = flags.token ?? resolveEnrolToken(env);
   return runPreflight({
     ...(flags.repo ? { repoPath: flags.repo } : {}),
     ...(hubUrl ? { hubUrl } : {}),
@@ -267,9 +293,20 @@ async function main(): Promise<void> {
       const env = envWithFlags(process.env, parsed.flags);
       process.exitCode = await runDoctor({
         hubUrl: env.DAHRK_HUB_URL,
-        token: env.DAHRK_ENROL_TOKEN,
+        // Same resolution as `start`, so doctor checks the token the node would actually present:
+        // the flag/env if given, else the one cached by the last successful enrolment.
+        token: resolveEnrolToken(env),
         clientVersion: CLIENT_VERSION,
       });
+      break;
+    }
+    case "status": {
+      // Local only: no dial, no token needed. `hubUrl` is reported (what we WOULD dial), not probed.
+      const env = envWithFlags(process.env, parsed.flags);
+      process.exitCode = await runStatus(
+        { clientVersion: CLIENT_VERSION, hubUrl: env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL },
+        statusDeps(env),
+      );
       break;
     }
     case "run":
@@ -283,7 +320,9 @@ async function main(): Promise<void> {
       // Install bakes the resolved connection/identity into the unit: flags win over the env vars
       // (legacy SKAKEL_* aliases folded in first).
       const env = applyEnvAliases(process.env);
-      const token = parsed.flags.token ?? env.DAHRK_ENROL_TOKEN;
+      // Falls back to the cached token, so `dahrk start --token X` followed by `dahrk service install`
+      // does not make the operator paste the token a second time.
+      const token = parsed.flags.token ?? resolveEnrolToken(env);
       const name = parsed.flags.name ?? env.DAHRK_NODE_NAME;
       const hubUrl = parsed.flags.hubUrl ?? env.DAHRK_HUB_URL;
       process.exitCode = await runServiceInstall({

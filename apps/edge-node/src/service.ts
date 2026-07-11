@@ -23,9 +23,12 @@
  * IO shells that write the file, run the loader, and print the result.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform as osPlatform, userInfo } from "node:os";
 import { join } from "node:path";
+
+/** The unit file carries the enrolment token in its environment block, so it is owner-only. */
+export const UNIT_FILE_MODE = 0o600;
 
 /** The native supervisor we target for a given OS. `unsupported` covers Windows and anything else - we
  *  print how to run under pm2 instead rather than pretend. */
@@ -225,6 +228,54 @@ export function buildPlan(inputs: PlanInputs): ServicePlan {
   };
 }
 
+/** Where the unit lives for a manager, without rendering it (`status` needs the path, not the content). */
+export function unitPath(manager: "launchd" | "systemd", homeDir: string): string {
+  return manager === "launchd"
+    ? join(homeDir, "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`)
+    : join(homeDir, ".config", "systemd", "user", SYSTEMD_UNIT);
+}
+
+/** What `dahrk status` reports about the always-on service. `installed` is "the unit file is on disk";
+ *  `running` is "the supervisor currently has it up" - the two differ exactly when something is wrong
+ *  (installed but dead = a crash-loop or a failed load, which is the case worth surfacing). */
+export interface ServiceStatus {
+  installed: boolean;
+  running: boolean;
+  pid?: number;
+}
+
+/** The query to ask the supervisor whether the unit is up. `launchctl list <label>` prints a plist
+ *  containing `"PID" = N;` when running (and exits non-zero when the label is unknown); `systemctl
+ *  --user show` prints `ActiveState=`/`MainPID=` lines. Pure: the caller runs it and feeds back stdout. */
+export function statusCommand(manager: "launchd" | "systemd"): string[] {
+  return manager === "launchd"
+    ? ["launchctl", "list", LAUNCHD_LABEL]
+    : ["systemctl", "--user", "show", SYSTEMD_UNIT, "-p", "ActiveState", "-p", "MainPID"];
+}
+
+/** Parse the supervisor's answer. `installed` is decided by the unit file (passed in), not by the
+ *  supervisor: a unit written but never loaded is installed-but-not-running, which is what we want to
+ *  say. A non-zero exit means the supervisor does not know the label at all -> not running. */
+export function parseServiceStatus(
+  manager: "launchd" | "systemd",
+  unitExists: boolean,
+  probe: { code: number; stdout: string },
+): ServiceStatus {
+  if (!unitExists) return { installed: false, running: false };
+  if (probe.code !== 0) return { installed: true, running: false };
+  if (manager === "launchd") {
+    // A launchd job that is loaded but not currently up has no "PID" key (only LastExitStatus).
+    const pid = Number(/"PID"\s*=\s*(\d+);/.exec(probe.stdout)?.[1]);
+    return pid > 0 ? { installed: true, running: true, pid } : { installed: true, running: false };
+  }
+  const active = /^ActiveState=(.*)$/m.exec(probe.stdout)?.[1]?.trim();
+  const pid = Number(/^MainPID=(\d+)$/m.exec(probe.stdout)?.[1]);
+  const running = active === "active";
+  return running && pid > 0
+    ? { installed: true, running: true, pid }
+    : { installed: true, running };
+}
+
 /** Injectable IO so the install/uninstall shells run without a real host or supervisor. */
 export interface ServiceDeps {
   platform: NodeJS.Platform;
@@ -386,17 +437,54 @@ function resolveScriptPath(): string {
   }
 }
 
+/**
+ * Pick a Node path for the unit that will still exist after the operator upgrades Node.
+ *
+ * Homebrew installs Node into a VERSIONED Cellar directory (`.../Cellar/node/26.5.0/bin/node`) and
+ * symlinks it from a stable one (`.../opt/node/bin/node`). `process.execPath` resolves symlinks, so it
+ * hands us the versioned path - and `brew upgrade node` deletes that directory. The unit would then
+ * point at a binary that no longer exists, and launchd/systemd would restart it into that same failure
+ * every `ThrottleInterval` forever: a node that silently stops serving Jobs after an unrelated upgrade.
+ *
+ * So when `execPath` is a Cellar path, prefer a stable alias that CURRENTLY resolves to the very same
+ * binary (verified, never assumed). Any other layout (system Node, nvm, a plain tarball) has no such
+ * alias and is returned unchanged.
+ */
+export function stableNodeBin(execPath: string, realpath: (p: string) => string | undefined): string {
+  const m = /^(?<prefix>.*)\/Cellar\/(?<formula>node(?:@[\d.]+)?)\/[^/]+\/bin\/node$/.exec(execPath);
+  const { prefix, formula } = m?.groups ?? {};
+  if (!prefix || !formula) return execPath;
+  const candidates = [`${prefix}/opt/${formula}/bin/node`, `${prefix}/bin/node`];
+  return candidates.find((c) => realpath(c) === execPath) ?? execPath;
+}
+
+const realpathOrUndefined = (p: string): string | undefined => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return undefined;
+  }
+};
+
 const defaultDeps = (): ServiceDeps => ({
   platform: osPlatform(),
   homeDir: homedir(),
-  nodeBin: process.execPath,
+  // Not `process.execPath` raw: that is the versioned Homebrew Cellar path, which the next
+  // `brew upgrade node` deletes out from under the unit. See `stableNodeBin`.
+  nodeBin: stableNodeBin(process.execPath, realpathOrUndefined),
   scriptPath: resolveScriptPath(),
   logDir: join(process.env.DAHRK_STATE_DIR ?? join(homedir(), ".dahrk"), "logs"),
   // Snapshot the operator's PATH at install time so the daemon finds git + the runtime CLIs (Homebrew /
   // npm-global bins) that a supervisor's minimal PATH would otherwise hide.
   pathEnv: process.env.PATH,
   mkdirp: (dir) => void mkdirSync(dir, { recursive: true }),
-  writeFile: (path, content) => writeFileSync(path, content),
+  // The unit's environment block carries the enrolment token, so the file is a secret: write it
+  // owner-only. `writeFileSync`'s `mode` applies only when it CREATES the file, so chmod explicitly
+  // too - re-installing over a unit an older client left at 0644 must tighten it, not keep it.
+  writeFile: (path, content) => {
+    writeFileSync(path, content, { mode: UNIT_FILE_MODE });
+    chmodSync(path, UNIT_FILE_MODE);
+  },
   removeFile: (path) => rmSync(path, { force: true }),
   fileExists: (path) => existsSync(path),
   run: (argv) => {

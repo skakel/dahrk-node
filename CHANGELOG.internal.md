@@ -36,6 +36,36 @@ this file is left verbatim.
   their own release PR without a second reviewer. Also created the `no-changelog` label that `ci.yml`
   has always tested for but which did not exist, leaving the documented escape hatch unusable.
 
+- Persist the enrolment token. New `apps/edge-node/src/state.ts` owns `~/.dahrk/node.json` (it was an
+  inline read/write of `{nodeId}` in `main.ts`): a merging `writeState` so persisting a token cannot
+  drop the id, `0600`/`0700` modes with an explicit `chmod` on write (`writeFileSync`'s `mode` only
+  applies on create, so a pre-existing `0644` file from an older client is tightened the first time we
+  write a token into it), and a corrupt file reading as empty state.
+- Token resolution is now flag -> `DAHRK_ENROL_TOKEN` -> cached, shared by `start` / `doctor` / `run` /
+  `service install`. `buildEdgeOptions` stays pure over env: `start` resolves the token and sets
+  `DAHRK_ENROL_TOKEN` on its env copy before building the options.
+- The cache is written from a new `EdgeOptions.onEnrolled` hook fired by the `welcome` handler in
+  `ws-client.ts`, not at dial time, so only a hub-accepted token is ever persisted. It is wrapped in a
+  try/catch: a disk failure logs `EDGE_ENROL_PERSIST_FAILED` and must never take down a healthy node.
+  Persisting is a no-op when the token already on disk matches, so the reconnect loop does no IO.
+- Sound because the token is a reusable pool-join token, not one-shot: the wire contract requires
+  `enrolToken` on every `hello`, and the client already re-sent the same one on every reconnect.
+- `onEnrolled` also carries the `welcome`'s `name` / `tenantId`, cached into `node.json` so `status` can
+  name the node offline. The no-op-if-unchanged guard now spans all three fields, so the reconnect loop
+  still does no IO in the steady state.
+- `service.ts`: unit files are written `0600` + explicit `chmod` (same create-only-`mode` trap as
+  `node.json`). The unit's env block carries the token, so the module's "never leaks through `ps`"
+  claim was true of argv and false of the file it wrote.
+- `service.ts`: new `stableNodeBin`. `process.execPath` resolves symlinks, so a Homebrew Node reports its
+  versioned Cellar path; `brew upgrade node` then deletes the binary the unit execs, and launchd's
+  `KeepAlive` + `ThrottleInterval: 10` crash-loops it silently forever. We now map `.../Cellar/<formula>/
+  <version>/bin/node` to `.../opt/<formula>/bin/node`, but only when that alias CURRENTLY realpaths to the
+  same binary - a stale symlink is never trusted. nvm / system layouts have no alias and pass through.
+- New `status.ts` (+ `unitPath` / `statusCommand` / `parseServiceStatus` in `service.ts`): a local report,
+  pure renderer + injected IO, no network by design. Exits 1 only on installed-but-not-running. Reports
+  `envToken` separately from the cached token, so a node whose token comes from the unit's env block (or a
+  pre-cache client) does not read as "not enrolled". The token is never printed, not even a prefix.
+
 ## [0.1.7] - 2026-07-11
 
 - Default an interactive stage's exit to `either` rather than `gate` in all three runtime adapters

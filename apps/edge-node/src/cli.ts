@@ -15,7 +15,7 @@
  */
 import { parseArgs } from "node:util";
 
-export type Command = "start" | "run" | "service" | "doctor" | "update";
+export type Command = "start" | "run" | "service" | "doctor" | "status" | "update";
 
 /** The two things `dahrk service` can do: register the always-on service, or remove it. */
 export type ServiceAction = "install" | "uninstall";
@@ -60,12 +60,13 @@ export type ParsedCli =
   | { kind: "run"; flags: RunFlags }
   | { kind: "service"; flags: ServiceFlags }
   | { kind: "doctor"; flags: StartFlags }
+  | { kind: "status"; flags: StartFlags }
   | { kind: "update"; flags: UpdateFlags }
   | { kind: "help"; command?: Command }
   | { kind: "version" }
   | { kind: "error"; message: string };
 
-const COMMANDS = new Set<Command>(["start", "run", "service", "doctor", "update"]);
+const COMMANDS = new Set<Command>(["start", "run", "service", "doctor", "status", "update"]);
 const isCommand = (s: string): s is Command => (COMMANDS as Set<string>).has(s);
 
 /** Parse the argv tail (i.e. `process.argv.slice(2)`) into a command + flags, or a help/error verdict. */
@@ -229,15 +230,18 @@ function parseUpdate(flagArgs: string[]): ParsedCli {
 export function usage(bin: string, command?: Command): string {
   if (command === "start") {
     return [
-      `Usage: ${bin} start --token <token> [options]`,
+      `Usage: ${bin} start [--token <token>] [options]`,
       "",
       "Run the edge node: dial the hub over WebSocket and serve Jobs in git worktrees.",
       "",
+      "A token is needed only to enrol. Once the hub accepts it, it is cached in ~/.dahrk/node.json and",
+      "every later `start` re-attaches without one. Pass --token again to re-enrol (rotated token, new pool).",
+      "",
       "Options:",
-      "  --token <token>    Enrolment token (required; or set DAHRK_ENROL_TOKEN).",
+      "  --token <token>    Enrolment token (first run only; or set DAHRK_ENROL_TOKEN).",
       "  --hub-url <url>    Hub WebSocket URL (or set DAHRK_HUB_URL).",
       "  --name <name>      Display-name override (else the hub assigns one).",
-      "  --ephemeral        Do not persist a node id; mint a throwaway one (CI / one-shot).",
+      "  --ephemeral        Do not persist (or read) node id and token; mint a throwaway id (CI / one-shot).",
     ].join("\n");
   }
   if (command === "run") {
@@ -285,6 +289,18 @@ export function usage(bin: string, command?: Command): string {
       "  --hub-url <url>    Hub WebSocket URL to reach (or set DAHRK_HUB_URL).",
     ].join("\n");
   }
+  if (command === "status") {
+    return [
+      `Usage: ${bin} status`,
+      "",
+      "Report this node's local state: whether it is enrolled (and as whom), its node id, the runtimes",
+      "it can serve, and whether the always-on service is installed and actually running.",
+      "",
+      "Local only - it dials nothing, so it is instant and works offline. Use `doctor` to check the hub",
+      "is reachable and the token still valid. Exits non-zero only when the service is installed but",
+      "not running, so it works as a health check in a script.",
+    ].join("\n");
+  }
   if (command === "update") {
     return [
       `Usage: ${bin} update [--check]`,
@@ -301,9 +317,10 @@ export function usage(bin: string, command?: Command): string {
     `Usage: ${bin} <command> [options]`,
     "",
     "Commands:",
-    "  start     Run the edge node (default). Needs a --token and a hub URL.",
+    "  start     Run the edge node (default). Needs a --token to enrol; cached thereafter.",
     "  run       Run a workflow locally (engine-backed), e.g. `run preflight`.",
     "  service   Install/uninstall the node as an always-on service (launchd/systemd).",
+    "  status    Is this node enrolled, and is the service running? (local, dials nothing)",
     "  doctor    Preflight checks: Node, runtimes, hub reachability, token validity.",
     "  update    Update the client to the latest release (or print how for your channel).",
     "  version   Print the client version.",

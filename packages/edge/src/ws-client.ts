@@ -61,6 +61,12 @@ export interface EdgeOptions {
   heartbeatMs?: number;
   /** Worktree retention (omitted = keep all run worktrees on the edge). */
   retention?: RetentionPolicy;
+  /** Called each time the hub WELCOMES this node, i.e. the enrolment token was accepted, with the
+   *  identity the hub assigned. The CLI uses it to cache the token (so the next bare `dahrk start`
+   *  re-attaches without `--token`) and the name/tenant (so `dahrk status` can name the node without
+   *  dialling). Gating on the welcome, rather than on connect, is what keeps a token the hub would
+   *  reject from ever reaching the disk. */
+  onEnrolled?: (welcome: { name: string; tenantId: string; credentialMode: CredentialMode }) => void;
   /** Abort to stop the node: closes the socket and suppresses the reconnect. For embedders that own
    *  the process lifecycle (and for tests); `main.ts` lets process exit do it. */
   signal?: AbortSignal;
@@ -189,6 +195,17 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         startHeartbeat(ws, msg.heartbeatMs);
       }
       log(`EDGE_WELCOMED:${msg.name} tenant=${msg.tenantId} credentialMode=${msg.credentialMode}`);
+      // The token is now known-good: let the caller cache it. Never fatal - failing to persist only
+      // means the next boot needs `--token` again, which must not take down a healthy node.
+      try {
+        opts.onEnrolled?.({
+          name: msg.name,
+          tenantId: msg.tenantId,
+          credentialMode: msg.credentialMode,
+        });
+      } catch (e) {
+        log(`EDGE_ENROL_PERSIST_FAILED ${(e as Error).message}`);
+      }
       return;
     }
     if (msg.type === "blob-put-url") {
