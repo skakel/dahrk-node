@@ -19,6 +19,20 @@ export interface BuiltinContext {
   runToolCalls: { count: number };
 }
 
+/**
+ * Stage-level read-only lever. Unlike `shell_guard` (a dangerous-command blocklist that lets
+ * benign-but-effectful shell through), this denies every write and shell tool outright, so a
+ * stage's "read-only / safe by construction" intent is actually enforceable (e.g. Preflight).
+ * The matching `@dahrk/contracts` schema addition is a companion change; recognised here so the
+ * edge enforces the flag the moment the engine threads it through `job.policies`.
+ */
+export interface ReadOnlyPolicy {
+  read_only: true;
+}
+
+/** A composed Job policy, plus the edge-local read-only lever pending its contracts schema. */
+export type EdgePolicy = Policy | ReadOnlyPolicy;
+
 const WRITE_TOOLS = new Set([
   "Write",
   "Edit",
@@ -94,12 +108,24 @@ function commandOf(input: unknown): string {
 }
 
 /** Build the edge `PolicyRule`s for one Job from its composed (non-cost) policies. */
-export function buildRules(policies: readonly Policy[], ctx: BuiltinContext): PolicyRule[] {
+export function buildRules(policies: readonly EdgePolicy[], ctx: BuiltinContext): PolicyRule[] {
   const rules: PolicyRule[] = [];
   let stageToolCalls = 0;
 
   for (const p of policies) {
-    if ("write_scope" in p) {
+    if ("read_only" in p && p.read_only) {
+      // Deny-by-default for a read-only stage: block every write and shell tool outright
+      // (WRITE_TOOLS already subsumes SHELL_TOOLS), so no command inspection is needed and
+      // benign-but-effectful shell (curl POST, git push, `>` redirection) cannot leak. Read
+      // tools (Read/Grep/Glob/…) stay allowed.
+      rules.push({
+        name: "read_only",
+        evaluate(event) {
+          if (event.kind !== "action" || !WRITE_TOOLS.has(event.tool)) return null;
+          return { verdict: "deny", policy: "read_only", reason: `read-only stage: "${event.tool}" is not permitted` };
+        },
+      });
+    } else if ("write_scope" in p) {
       const { branches, repos } = p.write_scope;
       rules.push({
         name: "write_scope",
