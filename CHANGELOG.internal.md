@@ -19,6 +19,38 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Runtime detection: retry, re-probe, and say so, DHK-390 (#50)
+
+- Two independent faults compounded. `probe()` in `detect-runtimes.ts` mapped *every* failure — error,
+  non-zero exit, timeout — to "not installed", on a single attempt with a 3s budget. And
+  `resolveRuntimes()` ran once in `main.ts` and froze its answer into `EdgeOptions.runtimes`, which every
+  `hello` and heartbeat then read for the life of the process. A transient miss was therefore latched:
+  conflating "slow" with "absent" is the first bug, never re-asking is what made it permanent.
+- The trigger we think we saw: a cold Node-based CLI on a host mid-IO-churn, which is precisely the state
+  a node is in in the seconds after `dahrk update` restarts it. Reproduced deterministically — under a
+  tight timeout the probe returns `[]`; on a calm host, `['claude-code','codex']`.
+- `probeOnce` now distinguishes retryable from definitive: `ENOENT` (not on `PATH`) short-circuits with no
+  retry, since waiting cannot conjure a binary; anything else (timeout, spawn hiccup, non-zero exit) is
+  retried. Two attempts, 5s each. A CLI that keeps erroring is still, correctly, not advertised — the
+  change narrows what counts as absence, it does not paper over a genuinely broken runtime.
+- `ws-client.ts` gains the re-probe seam: `currentRuntimes` (mutable, replacing reads of the frozen
+  `opts.runtimes`), an extracted `sendHello()`, and an interval (`runtimeRecheckMs`, default 60s,
+  `unref`'d) that re-advertises when the detected set changes. Relies on the hub's `handleAdvertise`
+  accepting a later `hello` as a re-advertisement. `reprobeRuntimes` is optional, so tests and embedders
+  keep the old frozen-set behaviour; `main.ts` wires it to `resolveRuntimes`, which keeps `DAHRK_RUNTIMES`
+  authoritative — a pinned override must never re-probe itself into something else.
+- Observability, the part the incident actually lacked: `RUNTIMES_DETECTED` at boot, and
+  `RUNTIMES_DEGRADED` when a runtime advertised on the *previous* boot is missing now. That diff needs the
+  prior set, so `NodeState.runtimes` is persisted in `node.json` (skipped for `--ephemeral`, which has no
+  disk). `readState` filters to the known runtime ids, so a hand-edited or future-client value cannot
+  smuggle a bogus runtime into the diff.
+- Regression test fails on the old single-attempt code: a fake `claude` that times out on the first probe
+  and answers on the second. Plus round-trip and validation tests for the persisted set.
+- Note for whoever reviews: the run's `reproduce`, `build` and `test` stages each reported "one or more
+  tool actions were blocked by a deny-only policy guard" — the new `fs_confine` rule from #47 biting on a
+  Dahrk-authored run. Worth a look at what it denied; it did not stop the work, but it is the first
+  in-the-wild signal about that rule's false-positive rate.
+
 ### Test coverage for the AskUserQuestion degrade path, DHK-344 (#49)
 
 - No behaviour change. DHK-344 itself was already delivered by #25 (`d8f3b5e`) — the
