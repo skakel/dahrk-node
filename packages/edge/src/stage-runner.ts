@@ -39,6 +39,7 @@ import {
   type ReapReport,
 } from "@dahrk/executor-worktree";
 import { buildRules } from "./builtins.js";
+import { computeFsRoots } from "./fs-roots.js";
 import { createNodeLogger, type NodeLogger } from "./logger.js";
 import { evaluatePolicies, type PolicyRule } from "./policy.js";
 import { startMcpGateway, type McpGateway } from "./mcp-gateway.js";
@@ -756,6 +757,10 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           worktreePath: ref.worktreePath,
           repoName: job.workspaceRef?.repo ?? "",
           runToolCalls: counter,
+          // DHK-392: the stage is confined to the run's worktree (plus its scratch dir, the git object
+          // store it depends on, and the toolchain). A node default, not a workflow policy. A run with
+          // no repo still gets a box - just a smaller one, around its scratch dir.
+          fsRoots: computeFsRoots({ worktreePath: ref.worktreePath, scratchPath: ref.scratchPath }),
         });
         const rules = [...jobRules, ...deps.rules];
 
@@ -768,6 +773,12 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
 
         // Run the stage, intercepting tool actions for policy and streaming progress.
         let denied = false;
+        // DHK-392: a confinement breach caught only AFTER the tool ran. Claude blocks pre-execution
+        // (`canUseTool`), so this can only happen on Codex/Pi, which expose no such hook - there the
+        // command has already scanned whatever it scanned, and a quiet note on the summary would be a
+        // lie. Escalated to a stage failure below. Gated on runtime, not inferred: on Claude a
+        // pre-denied tool can still surface an action event here, and that must NOT fail the stage.
+        let escapedUnblocked = false;
         const authorisedActions: string[] = [];
         const runtime = agentConfig.runtime;
         const actionKey = (tool: string, input: unknown): string => {
@@ -810,6 +821,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
               if (verdict.verdict === "deny") {
                 streamEvent(writer.append(event));
                 recordDeny(verdict, event.toolUseId);
+                if (verdict.policy === "fs_confine" && runtime !== "claude-code") escapedUnblocked = true;
                 return;
               }
             }
@@ -902,6 +914,17 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // recovered-from `rm -rf` on a throwaway scratch dir turned a correctly-completed build into
         // a false-negative.) The deny still surfaces in the trace and in the summary note below.
         let status: JobStatus = timedOut ? "timeout" : result.status;
+
+        // The one deny that DOES kill the stage (DHK-392). On a runtime with no pre-execution hook the
+        // confinement breach was detected after the fact: the command already read what it read. That
+        // is not a guardrail the agent routed around, it is a guardrail that arrived late, and the
+        // honest signal is a loud failure rather than a note at the end of a green stage.
+        if (status === "ok" && escapedUnblocked) {
+          status = "fail";
+          const msg = `stage reached outside the run's worktree and the ${runtime} runtime could not block it before it ran`;
+          writer.append({ seq: 0, ts: nowIso(), type: "error", runtime, kind: "fs-confine-escape", message: msg });
+          deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: msg });
+        }
 
         // R4 stage-exit hooks run in the worktree only if the stage otherwise succeeded.
         if (status === "ok" && job.hooks && job.hooks.length > 0) {

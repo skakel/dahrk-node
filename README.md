@@ -232,9 +232,32 @@ env var.
 | `DAHRK_LOG_FILE_LEVEL` / `DAHRK_LOG_FILE` | Level for `node.jsonl` (default `debug`); set `DAHRK_LOG_FILE=0` to disable the file sink. |
 | `DAHRK_CRASH_EXIT` | Set `1` to exit on an uncaught exception rather than log it and carry on. |
 | `DAHRK_TELEMETRY` | `off` = tell the hub nothing about this node. `health` = health metadata only, never logs. A **ceiling the hub cannot raise**: it may ask for less, never more. Self-managed nodes ship no logs by default anyway - see [`docs/logging.md`](docs/logging.md). |
+| `DAHRK_FS_CONFINE` | Set `0` to disable worktree confinement (see below). On by default; the escape hatch if a legitimate command is wrongly denied. |
+| `DAHRK_FS_EXTRA_ROOTS` / `DAHRK_FS_EXTRA_READ_ROOTS` | Colon-separated extra paths a stage may write / read, for a toolchain that lives somewhere we did not anticipate. |
+| `DAHRK_SANDBOX` | Set `1` to additionally run Claude stages inside the SDK's OS-level sandbox (seatbelt/bubblewrap). Off by default while its behaviour is being proven. |
 
 > The legacy `SKAKEL_*` names are still accepted as aliases for every `DAHRK_*` variable during the
 > rename transition. See [`.env.example`](.env.example).
+
+## What a stage may touch
+
+A node runs agent stages on your machine, so the boundary matters. A stage is confined to the run's
+worktree, its scratch directory, and the git object store the worktree depends on - plus temporary
+directories and the safe `/dev` sinks. It may **read** the toolchain and its config (`/usr`, `/opt`,
+your git config, the TLS roots, the pnpm store) and may write none of it. Your credentials
+(`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains) and mounted volumes (`/Volumes`) are denied outright,
+above every allowance. Anything else - your documents, another repository, another run's worktree -
+is denied before the tool runs.
+
+Be clear about the limits. On the **Claude** runtime this is a genuine pre-execution block. On
+**Codex** and **Pi** the runtime offers no pre-tool hook, so a breach can only be caught after the
+command ran; the node fails the stage loudly rather than pretending it prevented anything. And it is
+a tool-argument guard, not a syscall sandbox: a path assembled inside a script, and never named in
+the command, is not something it can see. `DAHRK_SANDBOX=1` adds the SDK's OS-level sandbox on
+Claude, which does close that gap; it is off by default until its behaviour is proven on real runs.
+
+If a legitimate command is wrongly denied, `DAHRK_FS_EXTRA_ROOTS` widens the box and
+`DAHRK_FS_CONFINE=0` turns it off - no release required. Please report the case.
 
 ## Development
 

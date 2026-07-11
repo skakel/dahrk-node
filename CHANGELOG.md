@@ -6,6 +6,32 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stage can no longer read your whole machine.** An agent looking for a package ran a `find` from the
+  filesystem root and scanned the entire disk, mounted network volumes included - and nothing stopped it.
+  Nothing could: `shell_guard` was a blocklist of seven dangerous commands (a root-anchored `find` is not
+  one of them), `write_scope` only ever looked at the worktree's git *branch*, and the read tools - `Read`,
+  `Grep`, `Glob` - were governed by nothing at all. The working directory was where a stage started, not a
+  wall it could not climb.
+
+  A stage is now confined to the run's worktree, its scratch directory, and the git object store the
+  worktree depends on, plus temporary directories and the safe `/dev` sinks. It may **read** the toolchain
+  and its config (`/usr`, `/opt`, your git config, the TLS roots, the pnpm store) and may write none of it.
+  Your credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains) and `/Volumes` are denied outright, above
+  every allowance. On the Claude runtime the denial happens **before the tool runs**.
+
+  Two honest limits. On Codex and Pi the runtime offers no pre-tool hook, so a breach is only detectable
+  after the command ran - there the node now **fails the stage** rather than leaving a note at the end of a
+  green run. And this is a tool-argument guard, not a syscall sandbox: a path assembled inside a script and
+  never named in the command is not something it can see. `DAHRK_SANDBOX=1` adds the Claude SDK's OS-level
+  sandbox, which does close that gap; it stays off by default until its behaviour is proven on real runs.
+
+  Measured against the shell commands from three real run worktrees - 118 commands, each judged against its
+  own run's roots - two were denied, and both were the whole-disk scan itself. If a legitimate command is
+  wrongly denied anyway, `DAHRK_FS_EXTRA_ROOTS` widens the box and `DAHRK_FS_CONFINE=0` turns it off,
+  without waiting for a release. (#47)
+
 ## [0.1.10] - 2026-07-11
 
 ### Added

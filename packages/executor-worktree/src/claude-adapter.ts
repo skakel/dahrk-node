@@ -11,6 +11,8 @@
  * below (decide the response from the last assistant text, never from a turn that ends on
  * a tool call).
  */
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   query,
   type Options,
@@ -120,6 +122,37 @@ export function buildBrokeredMcpServers(ctx: RunnerContext): Options["mcpServers
   return entries as Options["mcpServers"];
 }
 
+/**
+ * The SDK's OS-level sandbox (seatbelt on macOS, bubblewrap on Linux) - DHK-392, opt-in via
+ * `DAHRK_SANDBOX=1`.
+ *
+ * This is the only layer that can stop an escape the tool-argument guard structurally cannot see: a
+ * script that opens a path never named in argv, or one built from a shell variable. It is opt-in
+ * because the SDK's own doc comment says filesystem limits come from permission rules "not via these
+ * sandbox settings", while its schema exposes `filesystem.allowWrite`/`denyRead` - the two disagree,
+ * and the runtime behaviour is unverified. So: wire it, prove it on a real run, then default it on.
+ *
+ * `failIfUnavailable: false` because `fs_confine` is the primary block and a Linux node without
+ * bubblewrap must still run. `autoAllowBashIfSandboxed` stays FALSE: it would auto-approve Bash,
+ * which is precisely the path our `canUseTool` block lives on.
+ */
+export function sandboxOptions(ctx: RunnerContext): Partial<Options> {
+  if (process.env.DAHRK_SANDBOX !== "1") return {};
+  const home = homedir();
+  return {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: false,
+      autoAllowBashIfSandboxed: false,
+      allowUnsandboxedCommands: false,
+      filesystem: {
+        allowWrite: [ctx.workspace.worktreePath, ctx.workspace.scratchPath, tmpdir()],
+        denyRead: [join(home, ".ssh"), join(home, ".aws"), join(home, ".gnupg"), "/Volumes"],
+      },
+    },
+  };
+}
+
 export function createClaudeRunner(): Runner {
   const abortController = new AbortController();
   let cancelled = false;
@@ -136,7 +169,25 @@ export function createClaudeRunner(): Runner {
     // is a Claude Code SETTINGS key (not a top-level Options field), so it rides the inline `settings`
     // object, which sits at the flag layer and overrides any project/local setting. Mirrors the cyrus
     // reference (EdgeWorker.ts writes the same key into .claude/settings.local.json).
-    settings: { includeCoAuthoredBy: false },
+    settings: {
+      includeCoAuthoredBy: false,
+      // DHK-392, defence in depth. The stage runner's `fs_confine` builtin is the real block (it is
+      // what `canUseTool` below consults, and unlike these rules it covers Grep and Bash). These deny
+      // rules close the same door from inside Claude Code, for the tools its permission system does
+      // cover (Read/Glob/NotebookRead via `Read(...)`, Write/Edit via `Edit(...)`): credentials an
+      // agent has no business reading, and the mounted volumes whose scan started all this. Deny
+      // outranks allow, so a repo's own .claude/settings.json cannot undo them.
+      permissions: {
+        deny: [
+          "Read(//Volumes/**)",
+          "Read(~/.ssh/**)",
+          "Read(~/.aws/**)",
+          "Read(~/.gnupg/**)",
+          "Read(~/Library/Keychains/**)",
+        ],
+      },
+    },
+    ...sandboxOptions(ctx),
     // Inherit the REPO's .mcp.json / .claude settings (build spec section 9): do NOT set
     // strictMcpConfig. Policy enforcement around tools is M6; M4 allows tools to run and the
     // stage runner intercepts denied actions at the trace level.

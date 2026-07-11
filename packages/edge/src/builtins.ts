@@ -9,7 +9,9 @@
  */
 import { execFileSync } from "node:child_process";
 import type { Policy } from "@dahrk/contracts";
+import { withinRoots, type Access, type FsRoots } from "./fs-roots.js";
 import type { PolicyRule } from "./policy.js";
+import { scanCommand } from "./shell-scan.js";
 
 /** Per-Job context the builtins close over (worktree + the run-scoped tool-call counter). */
 export interface BuiltinContext {
@@ -17,6 +19,9 @@ export interface BuiltinContext {
   repoName: string;
   /** Run-scoped tool-call tally, shared across the run's stages (sticky on the edge). */
   runToolCalls: { count: number };
+  /** The filesystem the stage is confined to (DHK-392). Absent only for an embedder that has no
+   *  workspace at all; when present, confinement is ON - it is a node default, not a policy. */
+  fsRoots?: FsRoots;
 }
 
 /**
@@ -107,10 +112,86 @@ function commandOf(input: unknown): string {
   return "";
 }
 
+/** The tools that name a path, and the input fields they name it in. Verified against
+ *  `@anthropic-ai/claude-agent-sdk` (`sdk-tools.d.ts`): Read/Write/Edit carry `file_path`,
+ *  NotebookEdit carries `notebook_path`, Glob/Grep carry `path`. Grep's `glob` is an rg `--glob`
+ *  FILTER, not a root (`**\/*.ts` is not an escape), so it is deliberately not checked. Codex's
+ *  `apply_patch` keys its `changes` record by path; Pi passes raw args. */
+const PATH_FIELDS = ["file_path", "notebook_path", "path", "filePath", "cwd", "directory"];
+
+/** Path-bearing tools that WRITE what they name; the rest read it. The split is what gives the
+ *  read-only roots teeth: a stage may read `~/.gitconfig` and may not write it. */
+const PATH_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"]);
+
+/** Every path an action names, from the shapes the three runtimes actually emit. */
+function pathsIn(input: unknown): string[] {
+  if (!input || typeof input !== "object") return [];
+  const o = input as Record<string, unknown>;
+  const out: string[] = [];
+  for (const f of PATH_FIELDS) {
+    if (typeof o[f] === "string" && o[f]) out.push(o[f] as string);
+  }
+  // Codex's apply_patch: `{ changes: { "<path>": {...} } }` - the paths are the keys.
+  if (o.changes && typeof o.changes === "object") {
+    out.push(...Object.keys(o.changes as Record<string, unknown>));
+  }
+  return out;
+}
+
+/**
+ * Confine the stage to the run's roots (DHK-392). Not a policy the workflow declares: a node-side
+ * DEFAULT, on whenever the Job has a workspace, because an agent that reaches outside its worktree
+ * is a bug rather than a use case. An agent hunting for a package ran `find /` and scanned the
+ * operator's whole machine; this is what stops that, before the tool runs.
+ *
+ * On the Claude runtime this is a genuine pre-execution block (the adapter's `canUseTool` consults
+ * it). Codex and Pi expose no such hook, so there it can only be caught after the fact - which the
+ * stage runner escalates to a stage failure rather than a note nobody reads.
+ *
+ * `DAHRK_FS_CONFINE=0` disables it, and `DAHRK_FS_EXTRA_ROOTS` widens it: a fail-closed heuristic on
+ * machines we cannot hot-patch needs a valve an operator can reach without waiting for a release.
+ */
+export function fsConfineRule(roots: FsRoots): PolicyRule {
+  return {
+    name: "fs_confine",
+    evaluate(event) {
+      if (event.kind !== "action") return null;
+
+      const deny = (path: string, need: Access) => ({
+        verdict: "deny" as const,
+        policy: "fs_confine",
+        reason: `${need === "write" ? "write to" : "read of"} "${path}" is outside the run's worktree`,
+      });
+
+      if (SHELL_TOOLS.has(event.tool)) {
+        const result = scanCommand(commandOf(event.input), roots);
+        if (result.kind === "escape") return deny(result.path, result.need);
+        if (result.kind === "unparseable") {
+          return {
+            verdict: "deny",
+            policy: "fs_confine",
+            reason: `shell command could not be parsed for path confinement (${result.reason})`,
+          };
+        }
+        return null;
+      }
+
+      const need: Access = PATH_WRITE_TOOLS.has(event.tool) ? "write" : "read";
+      for (const p of pathsIn(event.input)) {
+        if (!withinRoots(p, roots, need)) return deny(p, need);
+      }
+      return null;
+    },
+  };
+}
+
 /** Build the edge `PolicyRule`s for one Job from its composed (non-cost) policies. */
 export function buildRules(policies: readonly EdgePolicy[], ctx: BuiltinContext): PolicyRule[] {
   const rules: PolicyRule[] = [];
   let stageToolCalls = 0;
+
+  // First in the list, so the confinement verdict is the one the evaluator short-circuits on.
+  if (ctx.fsRoots && process.env.DAHRK_FS_CONFINE !== "0") rules.push(fsConfineRule(ctx.fsRoots));
 
   for (const p of policies) {
     if ("read_only" in p && p.read_only) {
