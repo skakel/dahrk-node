@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-07-11
+
 ## [0.1.9] - 2026-07-11
 
 ### Observability, ring 0 of DHK-376 (#40)
