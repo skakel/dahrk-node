@@ -11,6 +11,8 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
+  ElicitChoice,
+  ElicitQuestion,
   HumanTurn,
   JobProgress,
   JobRequest,
@@ -88,6 +90,10 @@ export interface StageRunnerDeps {
   rules: readonly PolicyRule[];
   /** Stream a progress frame to the hub. */
   sendProgress: (progress: JobProgress) => void;
+  /** Raise a Linear `select` elicitation for a mid-interactive-stage `AskUserQuestion` (DHK-344): the
+   *  edge emits an `elicit` wire frame the hub turns into an elicitation, and the human's pick rides a
+   *  `turn` frame back to the blocked tool. Best-effort like `sendProgress`; absent in tests. */
+  sendElicit?: (frame: { jobId: string; prompt: string; options: ElicitChoice[]; multiSelect?: boolean }) => void;
   /** Component provisioning: the content-addressed cache the overlay materialises pinned
    *  skills/commands/agents through. Absent = provisioning disabled (no overlay; existing behaviour). */
   packCache?: PackCache;
@@ -140,6 +146,8 @@ type PushJobWithMode = PushJob & { mode?: PushMode };
 type PushResultWithWip = PushResult & { wipRef?: string };
 type PolicyAwareRunnerContext = RunnerContext & {
   authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
+  /** Surface an interactive-stage `AskUserQuestion` as a Linear `select` elicitation (DHK-344). */
+  emitElicit?: (question: ElicitQuestion) => void;
 };
 
 /** Upload bytes to a hub-minted presigned URL (heavy trace payloads bypass the control socket). */
@@ -738,6 +746,19 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // and stamps the rawRef onto the emitted event.
         writeRaw: writer.writeRaw,
         authorizeToolUse,
+        // Wire the interactive AskUserQuestion elicitation seam (DHK-344): the adapter calls this when
+        // the agent asks a structured question, and the edge relays it to the hub as an `elicit` frame.
+        ...(deps.sendElicit
+          ? {
+              emitElicit: (question: ElicitQuestion) =>
+                deps.sendElicit!({
+                  jobId,
+                  prompt: question.prompt,
+                  options: question.options,
+                  ...(question.multiSelect ? { multiSelect: true } : {}),
+                }),
+            }
+          : {}),
       };
       // Interactive stages run a multi-turn conversation fed by relayed human turns (M5b);
       // batch stages run to a terminal result. Both emit through the same onTrace.

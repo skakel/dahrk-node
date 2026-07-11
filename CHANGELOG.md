@@ -6,6 +6,14 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- Interactive stages now surface an agent's structured multiple-choice question as a proper Linear
+  choice prompt with selectable options, instead of the question silently resolving to "the user did
+  not answer" and the agent falling back to a plain-text paragraph nobody could reply to. Your pick is
+  fed straight back to the agent and the stage continues. Only one question is shown at a time; if the
+  agent asks several at once, the first is shown and the rest are noted. (DHK-344)
+
 ## [0.1.4] - 2026-07-10
 
 ### Added

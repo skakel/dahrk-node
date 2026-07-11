@@ -18,7 +18,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { HumanTurn, JobResult, JobStatus, PolicyOutcome, Runner, RunnerContext } from "@dahrk/contracts";
+import type { ElicitQuestion, HumanTurn, JobResult, JobStatus, PolicyOutcome, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumeClaudeMessage, newBufferState, type BufferState } from "./claude-mappers.js";
 import {
   makeEmit,
@@ -27,11 +27,13 @@ import {
   resolveStagePrompt,
   hasSystemPrompt,
   interactiveSeedText,
+  createElicitTurnRouter,
   SUMMARISE_PROMPT,
   ManagedMailbox,
   type EmittableEvent,
 } from "./runner-shared.js";
 import { createStageCompleteTool } from "./stage-complete-tool.js";
+import { createAskUserQuestionTool, ASK_USER_QUESTION_ALIAS } from "./ask-user-question-tool.js";
 
 /** Debounce window for coalescing a burst of rapid human turns into one user message. */
 const COALESCE_MS = Number(process.env.DAHRK_COALESCE_MS ?? process.env.SKAKEL_COALESCE_MS ?? 40);
@@ -53,6 +55,9 @@ const CLAUDE_CODE_SYSTEM_PROMPT = { type: "preset", preset: "claude_code" } as c
 
 type PolicyAwareRunnerContext = RunnerContext & {
   authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
+  /** Surface an interactive-stage `AskUserQuestion` as a Linear `select` elicitation (DHK-344).
+   *  Supplied by the stage runner; absent in tests that do not exercise the elicit path. */
+  emitElicit?: (question: ElicitQuestion) => void;
 };
 
 const userMsg = (text: string): SDKUserMessage => ({
@@ -75,6 +80,29 @@ const policyCanUseTool = async (
   }
   return { behavior: "allow", updatedInput: input };
 };
+
+/**
+ * The interactive-stage tool decision, extracted pure so the DHK-223 tool-parity invariant is
+ * unit-testable without invoking the SDK. The AskUserQuestion shadow (DHK-344) is injected additively
+ * via `mcpServers`/`toolAliases`/`allowedTools` and NEVER appears here as a denial: arbitrary tools
+ * (Bash/Write/Read) run exactly as in a batch stage, gated solely by the edge policy
+ * (`ctx.authorizeToolUse`). The one denial is the engine-owned gate-exit summarisation turn, which is
+ * recap-only: while `summarising`, every tool except the stage-complete exit is denied so the model
+ * produces prose rather than starting fresh stage work.
+ */
+export const interactiveCanUseTool = (
+  summarising: boolean,
+  stageAllowedToolName: string,
+  ctx: PolicyAwareRunnerContext,
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> =>
+  summarising && toolName !== stageAllowedToolName
+    ? Promise.resolve({
+        behavior: "deny",
+        message: "Summarise from the work you just did; reply with the sentence only, no tools.",
+      })
+    : policyCanUseTool(ctx, toolName, input);
 
 /**
  * Brokered MCP servers: point each declared server at the node's gateway proxy
@@ -191,6 +219,37 @@ export function createClaudeRunner(): Runner {
     async runInteractive(ctx, turns, onTrace) {
       const emit = makeEmit("claude-code", onTrace);
       const stageTool = createStageCompleteTool();
+      const { firstReplyMs, idleMs } = interactiveIdleWindows(ctx);
+      let awaitingFirstReply = true;
+
+      // DHK-344: map the agent's structured `AskUserQuestion` onto a Linear `select` elicitation
+      // rather than letting it resolve to the headless default "the user did not answer". The router
+      // owns the relayed human-turn stream, routing each turn to a blocked in-stage elicit if one is
+      // outstanding or otherwise into the conversation mailbox the main loop reads (see
+      // createElicitTurnRouter). One elicit is in flight at a time.
+      const router = createElicitTurnRouter(turns, { signal: abortController.signal, firstReplyMs, idleMs });
+      const askTool = createAskUserQuestionTool({
+        ask: async (question) => {
+          const outcome = await router.ask(awaitingFirstReply, () => {
+            // Fires only when the elicit is actually raised (not busy). The audit trace event: the hub
+            // maps a trace `elicitation` to null (progressToActivity) and raises the Linear
+            // elicitation solely from the `elicit` wire frame, so emitting this does not double-post.
+            emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
+            (ctx as PolicyAwareRunnerContext).emitElicit?.(question);
+          });
+          switch (outcome.kind) {
+            case "reply":
+              return `The user selected: ${outcome.text}`;
+            case "busy":
+              return "Only one question can be asked at a time; wait for the current one to be answered, then ask again.";
+            case "noreply":
+              return "No response from the user; proceed with your best judgement.";
+            case "cancel":
+              return "The question was cancelled.";
+          }
+        },
+      });
+
       // Interactive stages have full tool parity with batch stages: a prompt that writes files or
       // explores the repo works the same as in a batch stage (customers bring all kinds of prompts,
       // and Pi/Codex interactive already allow tools). The S2 spike gated tools to keep the stage
@@ -207,15 +266,18 @@ export function createClaudeRunner(): Runner {
         systemPrompt: hasSystemPrompt(ctx)
           ? { type: "preset", preset: "claude_code", append: resolveStagePrompt(ctx) }
           : CLAUDE_CODE_SYSTEM_PROMPT,
-        // Inject the stage-complete exit tool alongside any brokered MCP servers (parity with batch).
-        mcpServers: { dahrk: stageTool.server, ...(brokered ?? {}) },
-        // Auto-approve the exit tool; `allowedTools` is an auto-approve list, not a whitelist, so it
-        // does not restrict the other tools canUseTool allows.
-        allowedTools: [stageTool.allowedToolName],
+        // Inject the stage-complete exit tool and the AskUserQuestion shadow alongside any brokered
+        // MCP servers (parity with batch).
+        mcpServers: { dahrk: stageTool.server, ask: askTool.server, ...(brokered ?? {}) },
+        // Redirect the built-in AskUserQuestion to the shadow tool so a structured question surfaces
+        // as a Linear elicitation. The redirect is name-only and single-hop; the tool still runs, so
+        // this is mapping, not gating (DHK-344 / DHK-223).
+        toolAliases: { [ASK_USER_QUESTION_ALIAS]: askTool.allowedToolName },
+        // Auto-approve the injected tools; `allowedTools` is an auto-approve list, not a whitelist, so
+        // it does not restrict the other tools canUseTool allows.
+        allowedTools: [stageTool.allowedToolName, askTool.allowedToolName],
         canUseTool: async (toolName, input) =>
-          summarising && toolName !== stageTool.allowedToolName
-            ? { behavior: "deny", message: "Summarise from the work you just did; reply with the sentence only, no tools." }
-            : policyCanUseTool(ctx, toolName, input),
+          interactiveCanUseTool(summarising, stageTool.allowedToolName, ctx, toolName, input),
         maxTurns: MAX_TURNS,
         includePartialMessages: false,
       };
@@ -226,7 +288,9 @@ export function createClaudeRunner(): Runner {
       const q = query({ prompt: mailbox, options });
       active = q;
       const it = q[Symbol.asyncIterator]();
-      const humanIter = turns[Symbol.asyncIterator]();
+      // The interactive loop reads conversational turns from the router, not the raw stream: any turn
+      // that answers an in-stage AskUserQuestion is consumed by the router and never reaches here.
+      const humanIter = router.conversation[Symbol.asyncIterator]();
       const state = newBufferState();
 
       // Pull messages until the in-flight turn settles on a `result`; return its response text.
@@ -239,8 +303,6 @@ export function createClaudeRunner(): Runner {
         }
       };
 
-      const { firstReplyMs, idleMs } = interactiveIdleWindows(ctx);
-      let awaitingFirstReply = true;
       let exited: "tool" | "gate" | "timeout" | "cancelled" | null = null;
       let pending = humanIter.next();
       try {

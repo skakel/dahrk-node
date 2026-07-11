@@ -159,6 +159,9 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     ...(opts.tenantId ? { tenantId: opts.tenantId } : {}),
     rules,
     sendProgress: (progress) => send({ type: "progress", progress }),
+    // DHK-344: relay a mid-interactive-stage AskUserQuestion to the hub as an `elicit` frame; the hub
+    // raises the Linear elicitation and the human's pick returns on the existing `turn` frame.
+    sendElicit: (frame) => send({ type: "elicit", ...frame }),
     trace,
     ...(opts.retention ? { retention: opts.retention } : {}),
   };
