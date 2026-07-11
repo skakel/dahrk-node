@@ -6,6 +6,15 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- Interactive stages that did not set `exit` could never finish. The default was `gate`, which
+  disables the stage-complete tool, so the stage could only end successfully if your reply happened
+  to contain the word "allow" or "approve" - a keyword nothing in the prompt or in Linear mentions.
+  In practice the interview ran on until the idle window expired: the run timed out and the agent's
+  work was discarded. The default is now `either`, which keeps the allow-word path and adds the tool
+  exit, so a stage that omits `exit` can complete. (#31)
+
 ## [0.1.6] - 2026-07-11
 
 ### Fixed
