@@ -6,6 +6,32 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A node no longer destroys the branch of a run that is still in flight, and no longer wedges every
+  re-run of an issue.** Three defects in the worktree/mirror layer interacted (#39):
+
+  - The per-repo cache was a `git clone --mirror`, whose refspec force-syncs local refs to match the
+    remote on every fetch. A run's branch exists only locally until `deliver` pushes it (and the forge
+    deletes the branch again on merge), so **every mirror refresh deleted the branch of any run then in
+    flight**, orphaning its commits and leaving the worktree on an unborn HEAD. The mirror now keeps the
+    remote's refs under `refs/remotes/origin/*` and the node's own run branches under `refs/heads/*`,
+    which a fetch never touches. Existing mirrors migrate themselves in place on the next refresh; there
+    is nothing to do and nothing to re-clone.
+  - Run worktrees were **never removed**. Teardown only ran if you had configured a retention policy, and
+    even then it only knew about runs the current process had started, so anything from a previous
+    process was orphaned for good. One node reached 92 worktrees and 65 GB. There is now a reaper that
+    reconciles what is actually on disk, runs at startup and after each stage, and has sane defaults -
+    "no policy configured" no longer means "never collect anything". It never touches a run that is busy.
+  - A worktree left behind by an earlier run went on **claiming its branch name for ever**, so the next
+    run of the same issue failed outright with `fatal: '<branch>' is already used by worktree at ...`.
+    Stale claims are now cleared before a worktree is created, and a run is always based on the current
+    remote base rather than on whatever a previous run happened to leave behind. If work would be
+    discarded, its tip is first parked under `refs/dahrk/salvage/` rather than dropped.
+
+  Tune the reaper with `DAHRK_RETENTION_MAX_RUNS` / `DAHRK_RETENTION_MAX_AGE_MS`, or preview a sweep with
+  `DAHRK_REAPER_DRY_RUN=1`.
+
 ### Changed
 
 - **`dahrk start` now means "make this node run, and keep it running".** It installs the always-on
