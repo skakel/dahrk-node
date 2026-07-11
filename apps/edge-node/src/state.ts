@@ -19,6 +19,10 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { Runtime } from "@dahrk/contracts";
+
+const RUNTIMES: readonly Runtime[] = ["claude-code", "codex", "pi"];
+const isRuntime = (v: unknown): v is Runtime => (RUNTIMES as readonly unknown[]).includes(v);
 
 /** What `~/.dahrk/node.json` holds. Every field is optional: an older client wrote only `nodeId`, and
  *  the hub-assigned identity is only known once a `welcome` has landed. */
@@ -30,6 +34,10 @@ export interface NodeState {
   name?: string;
   /** The tenant the hub bound this node to at the last welcome (cached for `status`, as above). */
   tenantId?: string;
+  /** The runtime set this node advertised on its last boot. Persisted so the next boot can tell a
+   *  runtime that has DISAPPEARED (was advertised, is not detected now) from one that was never there,
+   *  and warn loudly about the former - the silent degradation DHK-390 was about. */
+  runtimes?: Runtime[];
   /** Whether the operator wants this node running: `dahrk start` writes "running", `dahrk stop` writes
    *  "stopped". It records INTENT, which the supervisor cannot tell us: a unit that is installed but not
    *  running is either crash-looping (broken, worth shouting about) or deliberately stopped (fine). Without
@@ -132,6 +140,12 @@ export function readState(file: string): NodeState {
       if (typeof value === "string" && value) state[key] = value;
     }
     if (isDesired(parsed["desired"])) state.desired = parsed["desired"];
+    // Keep only the recognised runtime ids, so a hand-edited or future-client value cannot smuggle a
+    // bogus runtime into the disappearance diff.
+    if (Array.isArray(parsed["runtimes"])) {
+      const runtimes = parsed["runtimes"].filter(isRuntime);
+      if (runtimes.length) state.runtimes = runtimes;
+    }
     return state;
   } catch {
     return {};

@@ -54,6 +54,14 @@ export interface EdgeOptions {
    *  = serve any repo, cloning on demand from the Job's gitUrl. Advertised to the hub for routing. */
   servesRepoIds?: string[];
   runtimes: Runtime[];
+  /** Re-probe the host's installed runtimes after boot. A node that came up with a transiently
+   *  degraded set (a probe that timed out during boot IO churn, DHK-390) self-heals: called on an
+   *  interval, and when the detected set differs from what is currently advertised the node re-sends
+   *  `hello` with the fresh set (the hub's `handleAdvertise` accepts re-advertisement). Omitted
+   *  (tests / embedders) = the boot-time `runtimes` are advertised for the life of the process. */
+  reprobeRuntimes?: () => Promise<Runtime[]>;
+  /** How often to re-probe runtimes (ms) when `reprobeRuntimes` is set. Default 60000. */
+  runtimeRecheckMs?: number;
   /** Where this node's git credentials come from; advertised to the hub. Default `ambient`. */
   credentialMode?: CredentialMode;
   /** True when the operator explicitly set the credential mode. Only then is it sent in the
@@ -108,6 +116,12 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   // The operator's local ceiling. The hub can ask for LESS than this; it can never ask for more. A node
   // whose operator set DAHRK_TELEMETRY=off reports nothing at all, whatever the hub says.
   const telemetryCeiling = ceilingFromEnv(process.env);
+
+  // The runtime set we currently advertise. Starts at the boot-time probe (`opts.runtimes`) but is
+  // mutable: `reprobeRuntimes` can correct a transiently-degraded boot without a restart (DHK-390),
+  // and every `hello` and heartbeat reads THIS rather than the frozen `opts.runtimes`.
+  let currentRuntimes = opts.runtimes;
+  const runtimesKey = (r: Runtime[]): string => [...r].sort().join(",");
 
   // Wire the git service's logger seam. It has always existed (`GitLogger`, with meaningful calls on
   // every clone, mirror refresh and worktree create) but no production call site ever passed one, so it
@@ -189,7 +203,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
               health: collectHealth({
                 counters,
                 clientVersion: opts.clientVersion ?? "0.0.0",
-                runtimes: opts.runtimes,
+                runtimes: currentRuntimes,
                 worktreesDir: gitService.worktreesDir,
               }),
             }
@@ -278,6 +292,52 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
 
   // A persisted UUID identifies the node; fall back to an ephemeral one if none was provided.
   const nodeId = opts.nodeId ?? randomUUID();
+
+  // The advertise/`hello` frame: who we are, and the runtimes we can serve. Sent on every (re)connect
+  // and again whenever a re-probe corrects the advertised set (DHK-390); the hub's `handleAdvertise`
+  // treats a later `hello` as a re-advertisement. A no-op while the socket is down (`send` guards it).
+  const sendHello = (): void => {
+    send({
+      type: "hello",
+      enrolToken: opts.enrolToken ?? "",
+      detectedRuntimes: currentRuntimes,
+      servesRepoIds: opts.servesRepoIds ?? [],
+      ...(opts.credentialModeExplicit && opts.credentialMode ? { credentialMode: opts.credentialMode } : {}),
+      nodeId,
+      ...(opts.name ? { name: opts.name } : {}),
+      os: osPlatform(),
+      arch: osArch(),
+      clientVersion: opts.clientVersion ?? "0.0.0",
+      // Advertise the resolved worktree base so the hub records each run's real worktree location in
+      // the projection instead of an advisory placeholder. Single-sourced from the git service so it
+      // always matches where worktrees actually land.
+      worktreesDir: gitService.worktreesDir,
+    });
+  };
+
+  // Self-heal a transiently-degraded boot: re-probe the host's runtimes on an interval and, when the
+  // set changes, re-advertise. Before this, a probe that missed a runtime at boot (a cold Node CLI
+  // timing out during the update-restart's IO churn) latched for the life of the process, so every
+  // stage needing that runtime failed fast at dispatch until a human restarted the node (DHK-390).
+  let reprobeTimer: ReturnType<typeof setInterval> | undefined;
+  if (opts.reprobeRuntimes) {
+    const reprobe = opts.reprobeRuntimes;
+    reprobeTimer = setInterval(() => {
+      void reprobe()
+        .then((detected) => {
+          if (runtimesKey(detected) === runtimesKey(currentRuntimes)) return;
+          const before = currentRuntimes;
+          currentRuntimes = detected;
+          log.warn(
+            { before, after: detected },
+            `EDGE_RUNTIMES_CHANGED:${before.join(",") || "none"} -> ${detected.join(",") || "none"}`,
+          );
+          sendHello(); // re-advertise the corrected set; a no-op if the socket is currently down
+        })
+        .catch((e: unknown) => log.warn({ err: e }, `EDGE_REPROBE_ERROR:${(e as Error).message}`));
+    }, opts.runtimeRecheckMs ?? 60000);
+    reprobeTimer.unref?.();
+  }
 
   // In-flight job/push ids, so a re-dispatched frame for a job that is STILL running is dropped rather
   // than starting a second runner on the same run worktree. The hub re-dispatches the SAME
@@ -469,22 +529,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       // bad token). `credentialMode` is sent only as an explicit operator override; otherwise the hub
       // derives it from the pool. `enrolToken` is required but tolerated-absent here so a
       // misconfigured node still surfaces the hub's ENROL_REQUIRED close rather than crashing locally.
-      send({
-        type: "hello",
-        enrolToken: opts.enrolToken ?? "",
-        detectedRuntimes: opts.runtimes,
-        servesRepoIds: opts.servesRepoIds ?? [],
-        ...(opts.credentialModeExplicit && opts.credentialMode ? { credentialMode: opts.credentialMode } : {}),
-        nodeId,
-        ...(opts.name ? { name: opts.name } : {}),
-        os: osPlatform(),
-        arch: osArch(),
-        clientVersion: opts.clientVersion ?? "0.0.0",
-        // Advertise the resolved worktree base so the hub records each run's real worktree location in
-        // the projection instead of an advisory placeholder. Single-sourced from the git service so it
-        // always matches where worktrees actually land.
-        worktreesDir: gitService.worktreesDir,
-      });
+      sendHello();
       // re-send the result of every finished-but-maybe-unacknowledged job. If the hub restarted
       // while a result was in flight (or just after), the new process forgot the awakeable mapping; the
       // bridge now resolves it idempotently, so this re-send is what un-wedges the run. A no-op when the
@@ -529,6 +574,8 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       heartbeat = undefined;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = undefined;
+      if (reprobeTimer) clearInterval(reprobeTimer);
+      reprobeTimer = undefined;
       ws?.close(1000, "shutting down");
     },
     { once: true },
