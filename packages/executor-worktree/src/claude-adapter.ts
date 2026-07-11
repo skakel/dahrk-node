@@ -281,7 +281,10 @@ export function createClaudeRunner(): Runner {
         maxTurns: MAX_TURNS,
         includePartialMessages: false,
       };
-      const exit = ctx.config.exit ?? "gate";
+      // Default to `either`, not `gate` (DHK-363): with `gate` the stage-complete tool is disabled,
+      // so an interactive stage can only end `ok` if the human happens to type "allow"/"approve" -
+      // a keyword nothing tells them about. A stage that omits `exit` must still be completable.
+      const exit = ctx.config.exit ?? "either";
       const wantsTool = exit === "tool" || exit === "either";
 
       const mailbox = new ManagedMailbox<SDKUserMessage>();

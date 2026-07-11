@@ -118,7 +118,10 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
       const emit = makeEmit("pi", onTrace);
       const s = await openSession(ctx);
       const state = newPiBufferState();
-      const exit = ctx.config.exit ?? "gate";
+      // Default to `either`, not `gate` (DHK-363): with `gate` the stage-complete tool is disabled,
+      // so an interactive stage can only end `ok` if the human happens to type "allow"/"approve" -
+      // a keyword nothing tells them about. A stage that omits `exit` must still be completable.
+      const exit = ctx.config.exit ?? "either";
       const wantsTool = exit === "tool" || exit === "either";
 
       let toolFired = false;
