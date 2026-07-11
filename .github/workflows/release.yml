@@ -63,6 +63,13 @@ jobs:
       - run: pnpm test
       - run: pnpm build
 
+      # Last gate before an immutable publish: install the packaged tarball into a clean tree (external
+      # deps resolved fresh from the registry, exactly as a user would) and run it. If the artifact
+      # cannot load — e.g. a dependency was published with uncompiled source — fail here, not in the
+      # field. This is the check that would have blocked the 0.1.5 release.
+      - name: Smoke-test the packaged client before publishing
+        run: bash scripts/smoke-pack.sh
+
       - name: Publish to npm
         working-directory: apps/edge-node
         # pnpm publish rewrites the workspace: protocol on the bundled internal deps and honours the

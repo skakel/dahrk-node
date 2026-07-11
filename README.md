@@ -191,7 +191,12 @@ pnpm test        # Node built-in test runner (no Docker, no network, no live mod
 ## Releasing
 
 The `dahrk-node` client (in `apps/edge-node`) is published to npm on a git tag. Releases follow
-[Keep a Changelog](https://keepachangelog.com/) and [semver](https://semver.org/):
+[Keep a Changelog](https://keepachangelog.com/) and [semver](https://semver.org/).
+
+**Guided path (recommended):** run `/release <version>` in Claude Code. It runs the preflight, audits
+the changelog against the PRs merged since the last tag, checks that every `@dahrk/*` dependency is
+published and ships compiled output, smoke-tests the packaged client, and only then runs `pnpm release`
+— pausing for approval before anything is published. The manual steps below are what it automates.
 
 1. (Optional) hand-write this release's notes under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md);
    otherwise leave it empty and the release command drafts them from the commit log. These notes are
@@ -210,8 +215,10 @@ the model). The AI draft needs credentials via the Anthropic SDK (`ANTHROPIC_API
 
 Merging the PR lets [`.github/workflows/tag-release.yml`](.github/workflows/tag-release.yml) push the
 `vX.Y.Z` tag, which triggers [`.github/workflows/release.yml`](.github/workflows/release.yml): it gates
-that the tag equals the package version, runs the CI checks, publishes to npm, bumps the Homebrew tap
-formula, and cuts a GitHub release from the changelog. See
+that the tag equals the package version, runs the CI checks, smoke-tests the packaged client
+(`scripts/smoke-pack.sh` — installs the tarball into a clean tree and runs it, so a broken artifact
+never publishes), publishes to npm, bumps the Homebrew tap formula, and cuts a GitHub release from the
+changelog. See
 [`packaging/homebrew/README.md`](packaging/homebrew/README.md) for the tap, and the workflow headers for
 the required secrets (`NPM_TOKEN`, `TAP_PUSH_TOKEN`, `RELEASE_PAT`, and optionally `ANTHROPIC_API_KEY`
 for drafting changelogs in CI).

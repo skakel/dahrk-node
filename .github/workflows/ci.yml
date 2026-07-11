@@ -8,14 +8,56 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      # Report both legs independently; a break on one Node version shouldn't hide the other.
+      fail-fast: false
+      matrix:
+        # 22 = the `engines` floor and the tsup target; 24 = a current LTS matching what the field
+        # runs. 0.1.5's crash surfaced on newer Node than the single version CI used to test.
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
+      # Install the packaged tarball into a clean tree and run it, so a load-time crash in the
+      # PUBLISHED graph (e.g. a dependency shipping uncompiled source) fails here, not in the field.
+      - name: Smoke-test the packaged client
+        run: bash scripts/smoke-pack.sh
+      # Reject internal tracker keys in the changelog before they can reach a release.
+      - name: Lint changelog for internal keys
+        run: node scripts/lint-changelog.mjs
+
+  changelog:
+    # A source change must carry a CHANGELOG note, so the release PR is only ever a version bump and no
+    # shipped feature goes undocumented. Override on a genuinely note-less PR with the 'no-changelog' label.
+    if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'no-changelog')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a changelog entry for source changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          CHANGED=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")
+          if ! echo "$CHANGED" | grep -qE '^(packages|apps)/[^/]+/src/'; then
+            echo "no source changes under packages/*/src or apps/*/src — changelog not required"
+            exit 0
+          fi
+          if echo "$CHANGED" | grep -qx 'CHANGELOG.md'; then
+            echo "source changed and CHANGELOG.md was updated"
+            exit 0
+          fi
+          echo "::error::source changed but CHANGELOG.md was not updated. Add a note under [Unreleased] referencing the PR (#N), or apply the 'no-changelog' label if this PR genuinely needs no note."
+          exit 1
