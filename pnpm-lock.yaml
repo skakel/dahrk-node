@@ -24,8 +24,8 @@ importers:
         specifier: 0.3.183
         version: 0.3.183(@anthropic-ai/sdk@0.110.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))(zod@3.25.76)
       '@dahrk/contracts':
-        specifier: ^0.1.1
-        version: 0.1.1
+        specifier: ^0.1.2
+        version: 0.1.2
       '@openai/codex-sdk':
         specifier: 0.141.0
         version: 0.141.0
@@ -52,8 +52,8 @@ importers:
   packages/edge:
     dependencies:
       '@dahrk/contracts':
-        specifier: ^0.1.1
-        version: 0.1.1
+        specifier: ^0.1.2
+        version: 0.1.2
       '@dahrk/executor-worktree':
         specifier: workspace:*
         version: link:../executor-worktree
@@ -74,8 +74,8 @@ importers:
         specifier: 0.3.183
         version: 0.3.183(@anthropic-ai/sdk@0.110.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))(zod@3.25.76)
       '@dahrk/contracts':
-        specifier: ^0.1.1
-        version: 0.1.1
+        specifier: ^0.1.2
+        version: 0.1.2
       '@openai/codex-sdk':
         specifier: 0.141.0
         version: 0.141.0
@@ -157,8 +157,8 @@ packages:
     resolution: {integrity: sha512-Nq8OhGWiZIZGV6hLHoyAKLLcJihP/xFeBMGJoUrxTX2psI8dCifzLhZISFb+VWS3wFMRDmCGw5R+dOySCqPLhw==}
     engines: {node: '>=6.9.0'}
 
-  '@dahrk/contracts@0.1.1':
-    resolution: {integrity: sha512-vlbqdlxa06qhcbcMVsuPjkwcKN65fPtCM8rUK2L4bNMWdUDhl8q8qsgs4Bz/5m2CEjcnAj22vnFufIa4cgFkPg==}
+  '@dahrk/contracts@0.1.2':
+    resolution: {integrity: sha512-R3xOmaevOihY7YXw6E4v3eMuVCATn8C9vFGQfyM/mTx3A+MXBqiGywsl6XGtg3qMrUUDhocDJ/VgHEBDc09XNQ==}
 
   '@esbuild/aix-ppc64@0.27.7':
     resolution: {integrity: sha512-EKX3Qwmhz1eMdEJokhALr0YiD0lhQNwDqkPYyPhiSwKrh7/4KRjQc04sZ8db+5DVVnZ1LmbNDI1uAMPEUBnQPg==}
@@ -1327,7 +1327,7 @@ snapshots:
 
   '@babel/runtime@7.29.7': {}
 
-  '@dahrk/contracts@0.1.1':
+  '@dahrk/contracts@0.1.2':
     dependencies:
       ajv: 8.20.0
       yaml: 2.9.0

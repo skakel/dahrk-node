@@ -6,6 +6,16 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-11
+
+### Fixed
+
+- Fix a startup crash introduced in 0.1.5: `dahrk start` aborted immediately with
+  `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` because a bundled dependency shipped uncompiled
+  TypeScript that current Node refuses to load from `node_modules`. The client now resolves the
+  compiled build, so `dahrk start` runs again. Upgrade with `dahrk update` (or
+  `npm install -g dahrk-node@latest`). (#27)
+
 ## [0.1.5] - 2026-07-11
 
 ### Added
@@ -116,7 +126,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/dahrkai/dahrk-node/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/dahrkai/dahrk-node/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/dahrkai/dahrk-node/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/dahrkai/dahrk-node/compare/v0.1.2...v0.1.3
