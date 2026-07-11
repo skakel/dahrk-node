@@ -30,9 +30,28 @@ export interface NodeState {
   name?: string;
   /** The tenant the hub bound this node to at the last welcome (cached for `status`, as above). */
   tenantId?: string;
+  /** Whether the operator wants this node running: `dahrk start` writes "running", `dahrk stop` writes
+   *  "stopped". It records INTENT, which the supervisor cannot tell us: a unit that is installed but not
+   *  running is either crash-looping (broken, worth shouting about) or deliberately stopped (fine). Without
+   *  this, `status` cannot tell those apart and its exit code would report a stopped node as unhealthy. */
+  desired?: DesiredState;
+  /** When the update check last ran (ISO-8601), and the newest version it saw. Cached so the check runs at
+   *  most daily rather than on every start (a crash-looping daemon would otherwise hammer the registry),
+   *  and so `dahrk status` can report an available update WITHOUT dialling anything - its whole contract is
+   *  that it works offline. */
+  updateCheckedAt?: string;
+  updateLatest?: string;
 }
 
-const STRING_FIELDS = ["nodeId", "enrolToken", "name", "tenantId"] as const;
+/** Does the operator want this node up? See `NodeState.desired`. */
+export type DesiredState = "running" | "stopped";
+
+const STRING_FIELDS = ["nodeId", "enrolToken", "name", "tenantId", "updateCheckedAt", "updateLatest"] as const;
+
+/** `desired` is the one field with a closed set of values, so it is validated rather than copied: an
+ *  unrecognised value (a hand-edited file, a future client) reads as absent, which falls back to the
+ *  safe default of "assume it should be running". */
+const isDesired = (v: unknown): v is DesiredState => v === "running" || v === "stopped";
 
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
@@ -53,6 +72,36 @@ export function stateFile(env: NodeJS.ProcessEnv): string {
   return join(stateDir(env), "node.json");
 }
 
+/** Where the node's stdout/stderr land when it runs under a supervisor. Both launchd and systemd are
+ *  pointed at these files (systemd via `StandardOutput=append:`), so `dahrk logs` is one code path on
+ *  every host rather than "tail a file on macOS, journalctl on Linux".
+ *
+ *  This lives here, next to `stateDir`, because it was previously derived in two places that disagreed:
+ *  `service.ts` honoured DAHRK_STATE_DIR while `status.ts` hardcoded `~/.dahrk/logs`, so a node with a
+ *  custom state dir was told to tail a file that would never exist. One definition, no drift. */
+export function logDir(env: NodeJS.ProcessEnv): string {
+  return join(stateDir(env), "logs");
+}
+
+/** The two log files, out first: `EDGE_CONNECTED` and the Job markers go to stdout, so a `logs` that
+ *  showed only stderr would look silent on a perfectly healthy node. */
+export function logFiles(env: NodeJS.ProcessEnv): { out: string; err: string } {
+  const dir = logDir(env);
+  return { out: join(dir, "node.out.log"), err: join(dir, "node.err.log") };
+}
+
+/** The pidfile the foreground worker holds for as long as it is running. It is what stops a second node
+ *  dialling the hub with the SAME persisted nodeId - see `lock.ts`. */
+export function lockFile(env: NodeJS.ProcessEnv): string {
+  return join(stateDir(env), "node.pid");
+}
+
+/** Record whether the operator wants this node up. `start` sets "running", `stop` sets "stopped"; `status`
+ *  reads it to tell a crash-loop from a deliberate stop. */
+export function setDesired(env: NodeJS.ProcessEnv, desired: DesiredState): void {
+  writeState(env, { desired });
+}
+
 /** Read a state file. A missing or corrupt file reads as empty state (the caller re-mints), so a
  *  half-written node.json can never wedge a boot. */
 export function readState(file: string): NodeState {
@@ -64,6 +113,7 @@ export function readState(file: string): NodeState {
       const value = parsed[key];
       if (typeof value === "string" && value) state[key] = value;
     }
+    if (isDesired(parsed["desired"])) state.desired = parsed["desired"];
     return state;
   } catch {
     return {};

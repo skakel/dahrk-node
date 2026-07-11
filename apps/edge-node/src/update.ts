@@ -176,9 +176,18 @@ export async function runUpdate(inputs: UpdateInputs, deps: Partial<UpdateDeps> 
   return code;
 }
 
-/** Fetch the latest published version from the npm registry's `latest` dist-tag. */
-async function fetchLatestVersion(): Promise<string> {
-  const res = await fetch(LATEST_URL, { headers: { accept: "application/json" } });
+/** Fetch the latest published version from the npm registry's `latest` dist-tag. Exported so the passive
+ *  update check (`update-check.ts`) asks the same question of the same source, rather than growing a second
+ *  notion of "latest" that could disagree with `dahrk update`.
+ *
+ *  `signal` bounds the wait. `dahrk update` is a foreground command the operator is watching, so it passes
+ *  none; the passive check runs on the path of `dahrk start` and must never make a start hang on a slow
+ *  registry, so it passes a short timeout. */
+export async function fetchLatestVersion(signal?: AbortSignal): Promise<string> {
+  const res = await fetch(LATEST_URL, {
+    headers: { accept: "application/json" },
+    ...(signal ? { signal } : {}),
+  });
   if (!res.ok) throw new Error(`registry responded ${res.status}`);
   const body = (await res.json()) as { version?: unknown };
   if (typeof body.version !== "string" || !body.version) throw new Error("registry returned no version");

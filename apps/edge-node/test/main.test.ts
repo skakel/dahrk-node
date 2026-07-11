@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildEdgeOptions, resolveNodeId, resolveRuntimes, DEFAULT_HUB_URL } from "../src/main.ts";
@@ -124,4 +124,40 @@ test("resolveNodeId: --ephemeral mints a throwaway id and never touches disk", (
 
 test("resolveNodeId: an explicit DAHRK_NODE_ID still wins under --ephemeral", () => {
   assert.equal(resolveNodeId({ DAHRK_NODE_ID: "node-fixed" }, { ephemeral: true }), "node-fixed");
+});
+
+/**
+ * The exit code of a refused start. This lives in main's glue rather than in a pure function, which is
+ * exactly why it broke once already: `start` returned 0 unconditionally after the foreground path and
+ * clobbered the failure. Exiting 0 tells a supervisor the worker finished cleanly, so it restarts it into
+ * the same refusal - a crash-loop that reports itself as healthy. Driven end-to-end because that is the
+ * only place the bug could exist.
+ */
+test("a start refused by the lock exits NON-ZERO, so a supervisor does not read it as a clean exit", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "dahrk-main-"));
+  try {
+    const state = join(home, ".dahrk");
+    mkdirSync(state, { recursive: true });
+    // `process.pid` is, definitionally, a live process: a node that holds the lock.
+    writeFileSync(join(state, "node.pid"), `${process.pid}\n`);
+
+    const run = spawnSync(
+      process.execPath,
+      ["--import", "tsx", join(import.meta.dirname, "../src/main.ts"), "start", "--foreground"],
+      {
+        encoding: "utf8",
+        // A hub that cannot be reached, so a bug that got PAST the lock fails loudly instead of dialling
+        // the real hub from a test.
+        env: { ...process.env, HOME: home, DAHRK_STATE_DIR: state, DAHRK_HUB_URL: "ws://127.0.0.1:1" },
+        timeout: 15_000,
+      },
+    );
+
+    assert.equal(run.status, 1, `expected a refusal, got ${run.status}: ${run.stdout}${run.stderr}`);
+    assert.match(run.stderr, /already running on this host \(pid \d+\)/);
+    assert.doesNotMatch(run.stdout, /EDGE_CONNECTED|EDGE_ERROR/, "it must refuse BEFORE it dials anything");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

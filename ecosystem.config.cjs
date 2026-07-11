@@ -22,7 +22,11 @@ module.exports = {
       name: 'dahrk-node',
       cwd: path.join(__dirname, 'apps/edge-node'),
       script: 'node_modules/.bin/tsx',
-      args: 'src/main.ts',
+      // --foreground is REQUIRED here. A bare `dahrk start` means "ensure the node is running as a
+      // service", which would have the node install a launchd/systemd unit behind pm2's back - two
+      // supervisors for one node, and pm2 supervising a process that immediately exits. pm2 IS the
+      // supervisor, so the process it starts must be the worker.
+      args: 'src/main.ts start --foreground',
       interpreter: 'none',
       autorestart: true,
       max_restarts: 10,

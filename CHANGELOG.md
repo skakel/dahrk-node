@@ -6,6 +6,47 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Changed
+
+- **`dahrk start` now means "make this node run, and keep it running".** It installs the always-on
+  service, starts it, and hands your terminal back, instead of blocking forever. Nodes are meant to be
+  always-on, so that is what the plain verb should do. The blocking worker is still there and is still a
+  first-class way to run a node - it is now `dahrk start --foreground` (or `DAHRK_FOREGROUND=1`), which is
+  what you want in a container, under pm2, in CI, or to watch a node work. `--ephemeral` implies it.
+
+  **If you run a node under pm2 or in a container, add `--foreground`** (the bundled `ecosystem.config.cjs`
+  already does). Everything else upgrades on its own: an installed service repairs its own unit the first
+  time it restarts.
+
+### Added
+
+- `dahrk stop`, `dahrk restart`, and `dahrk logs [-f] [-n <lines>]`. `stop` was previously
+  `unknown command: stop` - the only way to stop a node was `dahrk service uninstall`, which also removed
+  it. A stopped node stays stopped across reboots until the next `start`, and `dahrk status` now tells a
+  node you stopped **on purpose** from one that is **crash-looping**, exiting non-zero only for the latter
+  so it remains usable as a health check. (#38)
+- The node tells you when its client is out of date, rather than waiting to be asked - an always-on node
+  is started once and then runs for months, so it never otherwise finds out. `dahrk start` offers to
+  update (only at a terminal - a scripted start never blocks on a prompt), the running node logs
+  `UPDATE_AVAILABLE:<version>` once a day, and `dahrk status` reports it. Nothing ever updates itself; run
+  `dahrk update` when you want it. The check reads the registry at most once a day and fails silently when
+  it cannot (it can never delay or fail a start). Switch it off with `DAHRK_NO_UPDATE_CHECK=1`,
+  `NO_UPDATE_NOTIFIER`, or `CI`. (#38)
+
+### Fixed
+
+- Two nodes could run at once on the same machine - `dahrk service install` followed by `dahrk start` in a
+  terminal was enough. Because a node's id is persisted and re-presented on every dial, that is not two
+  nodes: it is one node dialling the hub twice and racing itself for the Jobs it is given. A node now takes
+  a lock (`~/.dahrk/node.pid`) and a second one refuses to start. A node killed outright releases it, so a
+  crash cannot lock the host out. (#38)
+- Linux nodes logged only to the journal, so there was no single answer to "where are the logs". The
+  systemd unit now writes the same `~/.dahrk/logs/node.{out,err}.log` that launchd always has, and
+  `dahrk logs` reads them on every platform. They are rotated past 10 MB, keeping one generation. (#38)
+- `dahrk status` pointed at a log path that ignored `DAHRK_STATE_DIR`, so a node with a custom state
+  directory was told to tail a file that would never exist. There is now one definition of the log
+  directory. (#38)
+
 ## [0.1.8] - 2026-07-11
 
 ### Added
