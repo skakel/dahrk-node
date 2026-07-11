@@ -66,7 +66,17 @@ const tag = `v${version}`
 step(DRY_RUN ? 'preflight (dry-run)' : 'preflight')
 git('fetch', 'origin', '--tags', '--quiet')
 if (!DRY_RUN) {
-  if (git('status', '--porcelain')) die('working tree is not clean — commit or stash first')
+  // Uncommitted changelog edits are allowed to ride in. The release audit writes the resolved notes
+  // into [Unreleased] just before this runs; `git switch -c` below carries them onto the release
+  // branch, so they land in the same commit as the version bump — one PR, not two. `-uno` ignores
+  // untracked files: `git commit -am` only stages tracked paths, so they cannot reach the commit.
+  const dirty = git('status', '--porcelain', '-uno')
+    .split('\n')
+    .filter(Boolean)
+    .filter((l) => !/\sCHANGELOG(\.internal)?\.md$/.test(l))
+  if (dirty.length) {
+    die(`working tree has changes outside the changelogs — commit or stash first:\n${dirty.join('\n')}`)
+  }
   const branch = git('rev-parse', '--abbrev-ref', 'HEAD')
   if (branch !== 'main') die(`must be on main (currently on ${branch})`)
   if (git('rev-parse', 'HEAD') !== git('rev-parse', 'origin/main')) {

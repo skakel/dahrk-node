@@ -193,10 +193,14 @@ pnpm test        # Node built-in test runner (no Docker, no network, no live mod
 The `dahrk-node` client (in `apps/edge-node`) is published to npm on a git tag. Releases follow
 [Keep a Changelog](https://keepachangelog.com/) and [semver](https://semver.org/).
 
-**Guided path (recommended):** run `/dahrk-release <version>` in Claude Code. It runs the preflight, audits
-the changelog against the PRs merged since the last tag, checks that every `@dahrk/*` dependency is
-published and ships compiled output, smoke-tests the packaged client, and only then runs `pnpm release`
-— pausing for approval before anything is published. The manual steps below are what it automates.
+**Guided path (recommended):** run `/dahrk-release <version>` in Claude Code. It runs the preflight,
+audits the changelog against the PRs merged since the last tag (backfilling any note that is missing),
+checks that every `@dahrk/*` dependency is published and ships compiled output, smoke-tests the packaged
+client, and then runs `pnpm release` — all without stopping to ask. It halts only on a blocker: a failed
+preflight, a dependency that is unpublished or ships `src`, or a failed smoke test.
+
+You get **one** PR. Review it, merge it, and the merge publishes: nothing else is needed from you. The
+command never merges on your behalf. The manual steps below are what it automates.
 
 1. (Optional) hand-write this release's notes under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md);
    otherwise leave it empty and the release command drafts them from the commit log. These notes are
@@ -210,7 +214,12 @@ published and ships compiled output, smoke-tests the packaged client, and only t
 `pnpm release` ([`scripts/release.mjs`](scripts/release.mjs)) bumps the version in both `package.json`
 files, rewrites the changelog (moving `[Unreleased]` into a `[x.y.z]` section and repointing the
 compare links), and opens a `Release x.y.z` PR. When `[Unreleased]` is empty it drafts the section from
-the commits since the last tag using Claude; hand-written entries are always used verbatim. Flags:
+the commits since the last tag using Claude; hand-written entries are always used verbatim.
+
+It requires a clean tree **except** for uncommitted edits to the two changelogs, which it carries onto
+the release branch and commits alongside the version bump. That is deliberate: it means notes written
+in step 1 land in the same PR as the bump, so a release is never two PRs. Untracked files are ignored
+outright (the release commit only stages tracked paths, so they can never reach it). Flags:
 `--dry-run` (preview, write nothing), `--ai-polish` (refine even hand-written entries), `--no-ai` (skip
 the model). The AI draft needs credentials via the Anthropic SDK (`ANTHROPIC_API_KEY`, or an
 `ant auth login` profile); `--no-ai` runs without any.
