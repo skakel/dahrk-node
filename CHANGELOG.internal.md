@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-11
+
 - Make a release one PR instead of two, and drop the approval gates. `scripts/release.mjs` now accepts
   uncommitted edits confined to the two changelogs and carries them onto the release branch, so notes
   backfilled by the audit land in the same commit as the version bump; previously they had to be
