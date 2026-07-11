@@ -15,7 +15,15 @@ test("`start` subcommand parses token/name/hub-url/ephemeral", () => {
   const p = parseCli(["start", "--token", "t", "--name", "my-mac", "--hub-url", "ws://h:1", "--ephemeral"]);
   assert.equal(p.kind, "start");
   if (p.kind === "start") {
-    assert.deepEqual(p.flags, { token: "t", name: "my-mac", hubUrl: "ws://h:1", ephemeral: true });
+    assert.deepEqual(p.flags, {
+      token: "t",
+      name: "my-mac",
+      hubUrl: "ws://h:1",
+      ephemeral: true,
+      // An ephemeral node persists no id, so there is nothing coherent for a supervisor to restart on
+      // boot: it is a foreground node whether or not you said so.
+      foreground: true,
+    });
   }
 });
 
@@ -147,4 +155,54 @@ test("usage text names the bin and the commands", () => {
   assert.match(top, /service/);
   assert.match(usage("dahrk-node", "service"), /install\|uninstall/);
   assert.match(usage("dahrk-node", "service"), /launchd/);
+});
+
+// --- The daemon verbs. `stop` used to be `unknown command: stop`, which is where this all started.
+
+test("stop / restart / logs are real commands now", () => {
+  assert.equal(parseCli(["stop"]).kind, "stop");
+  assert.equal(parseCli(["restart"]).kind, "restart");
+  assert.equal(parseCli(["logs"]).kind, "logs");
+});
+
+test("--foreground opts out of the daemon and is the flag the installed unit passes", () => {
+  const p = parseCli(["start", "--foreground"]);
+  assert.equal(p.kind, "start");
+  if (p.kind === "start") {
+    assert.equal(p.flags.foreground, true);
+    assert.equal(p.flags.ephemeral, false);
+  }
+  const plain = parseCli(["start"]);
+  if (plain.kind === "start") assert.equal(plain.flags.foreground, false, "the default is now the daemon");
+});
+
+test("--ephemeral implies --foreground: a node with no persistent id has nothing to daemonise", () => {
+  const p = parseCli(["start", "--ephemeral"]);
+  if (p.kind === "start") assert.equal(p.flags.foreground, true);
+});
+
+test("logs: -f follows, -n sets the history, and a nonsense -n is a usage error not a NaN", () => {
+  const followed = parseCli(["logs", "-f"]);
+  assert.equal(followed.kind, "logs");
+  if (followed.kind === "logs") assert.deepEqual(followed.flags, { lines: 200, follow: true });
+
+  const counted = parseCli(["logs", "-n", "50"]);
+  if (counted.kind === "logs") assert.deepEqual(counted.flags, { lines: 50, follow: false });
+
+  const bad = parseCli(["logs", "-n", "lots"]);
+  assert.equal(bad.kind, "error");
+  if (bad.kind === "error") assert.match(bad.message, /--lines must be a non-negative whole number/);
+});
+
+test("help names the daemon verbs, and says how to opt out of the daemon", () => {
+  const top = usage("dahrk");
+  for (const cmd of ["start", "stop", "restart", "logs", "status"]) {
+    assert.match(top, new RegExp(`^\\s+${cmd}\\s+\\S`, "m"), `\`${cmd}\` must be discoverable`);
+  }
+  assert.match(top, /--foreground/, "opting out must not be folklore");
+
+  // The one place someone will look when they do not want a launch agent on their machine.
+  const start = usage("dahrk", "start");
+  assert.match(start, /--foreground/);
+  assert.match(start, /DAHRK_FOREGROUND=1/);
 });

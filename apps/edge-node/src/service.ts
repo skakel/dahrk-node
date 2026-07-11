@@ -23,9 +23,10 @@
  * IO shells that write the file, run the loader, and print the result.
  */
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform as osPlatform, userInfo } from "node:os";
 import { join } from "node:path";
+import { logDir as resolveLogDir } from "./state.js";
 
 /** The unit file carries the enrolment token in its environment block, so it is owner-only. */
 export const UNIT_FILE_MODE = 0o600;
@@ -76,7 +77,7 @@ export interface PlanInputs {
   logDir: string;
 }
 
-/** A rendered service registration: where the file goes, what it contains, the commands to load and to
+/** A rendered service registration: where the file goes, what it contains, the commands to load / stop /
  *  unload it, and a one-line hint for where its logs land. */
 export interface ServicePlan {
   manager: "launchd" | "systemd";
@@ -84,16 +85,34 @@ export interface ServicePlan {
   filePath: string;
   content: string;
   installCommands: ServiceCommand[];
+  /** Stop the node NOW and keep it stopped across a reboot, without deregistering it - `dahrk stop`.
+   *  Both managers need more than their bare "stop" verb to make it stick: a launchd agent is re-loaded at
+   *  the next login unless unloaded with `-w`, and a systemd unit that is merely `stop`ped comes back at
+   *  the next boot because it is still enabled. Otherwise `dahrk stop` would silently un-stop itself. */
+  stopCommands: ServiceCommand[];
   uninstallCommands: ServiceCommand[];
   logHint: string;
 }
 
+/** The argv the supervisor runs. `--foreground` is the load-bearing part: `dahrk start` on its own now
+ *  means "ensure the node is running as a service", which is precisely what the supervisor is already
+ *  doing - so a unit that invoked bare `start` would have the daemon see itself running, exit 0, and get
+ *  restarted into the same no-op forever. The supervised process must run the WORKER, and says so. */
+export function serviceArgv(inputs: PlanInputs): string[] {
+  return [inputs.nodeBin, inputs.scriptPath, "start", "--foreground"];
+}
+
 /** The environment the service exports: the token, any explicit hub-url / name overrides, and the
  *  operator's PATH (so the node finds git + the runtime CLIs under a supervisor's minimal PATH). Kept
- *  out of argv so the token never leaks through `ps`. */
+ *  out of argv so the token never leaks through `ps`.
+ *
+ *  `DAHRK_SUPERVISED=1` is belt-and-braces with the `--foreground` argv above: either one alone is enough
+ *  to keep a supervised process out of daemon mode, and having both means a hand-edited unit that drops
+ *  one still cannot produce the restart loop. */
 function serviceEnv(inputs: PlanInputs): Record<string, string> {
   return {
     DAHRK_ENROL_TOKEN: inputs.token,
+    DAHRK_SUPERVISED: "1",
     ...(inputs.hubUrl ? { DAHRK_HUB_URL: inputs.hubUrl } : {}),
     ...(inputs.name ? { DAHRK_NODE_NAME: inputs.name } : {}),
     ...(inputs.pathEnv ? { PATH: inputs.pathEnv } : {}),
@@ -113,7 +132,7 @@ function xmlEscape(s: string): string {
 /** Render the launchd LaunchAgent plist. RunAtLoad starts it now and on login; KeepAlive restarts it if
  *  it exits; ThrottleInterval slows a crash-loop (e.g. a bad token that exits 78) to one try / 10s. */
 export function renderLaunchdPlist(inputs: PlanInputs): string {
-  const argv = [inputs.nodeBin, inputs.scriptPath, "start"];
+  const argv = serviceArgv(inputs);
   const env = serviceEnv(inputs);
   const progArgs = argv.map((a) => `    <string>${xmlEscape(a)}</string>`).join("\n");
   const envEntries = Object.entries(env)
@@ -160,13 +179,17 @@ function systemdEnvValue(v: string): string {
  *  exits 78 (EX_CONFIG), which RestartPreventExitStatus pins as "stop, don't crash-loop" so a misconfig
  *  is visible rather than hammering. network-online ordering avoids a boot-race on the first dial. */
 export function renderSystemdUnit(inputs: PlanInputs): string {
-  const exec = [inputs.nodeBin, inputs.scriptPath, "start"]
+  const exec = serviceArgv(inputs)
     .map((a) => (/\s/.test(a) ? `"${a}"` : a))
     .join(" ");
   const env = serviceEnv(inputs);
   const envLines = Object.entries(env)
     .map(([k, v]) => `Environment=${k}=${systemdEnvValue(v)}`)
     .join("\n");
+  // Log to the SAME files launchd writes, rather than leaving it to the journal. That makes `dahrk logs`
+  // one code path on every host instead of "tail a file here, journalctl there", and it keeps working on
+  // hosts where the journal is unavailable or the user has no journal access. `append:` needs systemd 240+
+  // (2018) and, importantly, needs the directory to already exist - `runServiceInstall` mkdirs it.
   return `[Unit]
 Description=Dahrk node (self-managed edge node)
 Documentation=https://dahrk.ai/docs
@@ -178,6 +201,8 @@ Type=simple
 ExecStart=${exec}
 ${envLines}
 WorkingDirectory=${inputs.homeDir}
+StandardOutput=append:${join(inputs.logDir, "node.out.log")}
+StandardError=append:${join(inputs.logDir, "node.err.log")}
 Restart=on-failure
 RestartSec=3
 RestartPreventExitStatus=78
@@ -197,13 +222,15 @@ export function buildPlan(inputs: PlanInputs): ServicePlan {
       label: LAUNCHD_LABEL,
       filePath,
       content: renderLaunchdPlist(inputs),
-      // Unload first so a re-install picks up the rewritten plist; a not-loaded unload is a no-op.
+      // Unload first so a re-install picks up the rewritten plist; a not-loaded unload is a no-op. The
+      // `-w` on load also clears the "disabled" flag a previous `dahrk stop` set, so start-after-stop works.
       installCommands: [
         { argv: ["launchctl", "unload", filePath], ignoreFailure: true },
         { argv: ["launchctl", "load", "-w", filePath] },
       ],
+      stopCommands: [{ argv: ["launchctl", "unload", "-w", filePath], ignoreFailure: true }],
       uninstallCommands: [{ argv: ["launchctl", "unload", "-w", filePath], ignoreFailure: true }],
-      logHint: `tail -f ${join(inputs.logDir, "node.err.log")}`,
+      logHint: "dahrk logs -f",
     };
   }
   const filePath = join(inputs.homeDir, ".config", "systemd", "user", SYSTEMD_UNIT);
@@ -220,12 +247,28 @@ export function buildPlan(inputs: PlanInputs): ServicePlan {
       { argv: ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT] },
       { argv: ["loginctl", "enable-linger", user], ignoreFailure: true },
     ],
+    // `disable`, not `stop`: a stopped-but-enabled unit comes straight back at the next boot, which is not
+    // what anyone means by `dahrk stop`. `dahrk start` re-enables it (`enable --now` above).
+    stopCommands: [
+      { argv: ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT], ignoreFailure: true },
+    ],
     uninstallCommands: [
       { argv: ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT], ignoreFailure: true },
       { argv: ["systemctl", "--user", "daemon-reload"], ignoreFailure: true },
     ],
-    logHint: `journalctl --user -u ${SYSTEMD_UNIT} -f`,
+    logHint: "dahrk logs -f",
   };
+}
+
+/** Is the unit on disk the one we would write today? Drives the self-heal in `dahrk start`: when it is
+ *  not, the unit is stale (an upgraded client that now needs `--foreground`, a Node path moved by a
+ *  `brew upgrade`, a rotated token) and `start` rewrites and reloads it.
+ *
+ *  This is only safe because the render is DETERMINISTIC - same inputs, byte-identical content. If it were
+ *  not, "differs -> rewrite -> reload" would be an infinite restart loop rather than a repair. There is a
+ *  test pinning exactly that. */
+export function unitIsCurrent(plan: ServicePlan, onDisk: string | undefined): boolean {
+  return onDisk === plan.content;
 }
 
 /** Where the unit lives for a manager, without rendering it (`status` needs the path, not the content). */
@@ -291,10 +334,15 @@ export interface ServiceDeps {
   pathEnv: string | undefined;
   mkdirp: (dir: string) => void;
   writeFile: (path: string, content: string) => void;
+  /** Read the unit currently on disk, or undefined when there is none. Drives the self-heal: `start`
+   *  compares it against what it would write today and rewrites only when they differ. */
+  readFile: (path: string) => string | undefined;
   removeFile: (path: string) => void;
   fileExists: (path: string) => boolean;
   /** Run a loader command; returns its exit code (0 = success). */
   run: (argv: string[]) => number;
+  /** Run a probe and capture its stdout (parsed, not shown) - `statusCommand`'s counterpart. */
+  capture: (argv: string[]) => { code: number; stdout: string };
   out: (line: string) => void;
 }
 
@@ -358,7 +406,9 @@ export async function runServiceInstall(
   });
 
   try {
-    if (manager === "launchd") d.mkdirp(d.logDir);
+    // Both managers now log to files in here, and systemd's `append:` FAILS to start the unit if the
+    // directory does not already exist - so this is unconditional, not launchd-only.
+    d.mkdirp(d.logDir);
     d.mkdirp(dirOf(plan.filePath));
     d.writeFile(plan.filePath, plan.content);
   } catch (e) {
@@ -378,6 +428,142 @@ export async function runServiceInstall(
   d.out("Installed. The node will start on boot and restart on failure.");
   d.out(`  logs:      ${plan.logHint}`);
   d.out("  uninstall: dahrk service uninstall");
+  return 0;
+}
+
+/** Does this host actually have a usable user-level supervisor? A Linux container almost always has no
+ *  systemd user session, so `systemctl --user` fails and daemonising is impossible - we must notice that
+ *  and run the worker inline rather than "install" a service that can never start.
+ *
+ *  `show -p Version` is the probe rather than the more obvious `is-system-running`, because the latter
+ *  exits non-zero on a perfectly healthy but `degraded` system - which would send a working host down the
+ *  foreground path for no reason. `show` exits 0 whenever there is a user manager to talk to at all. */
+export function availabilityCommand(manager: "launchd" | "systemd"): string[] | undefined {
+  return manager === "systemd" ? ["systemctl", "--user", "show", "-p", "Version"] : undefined;
+}
+
+/** What `dahrk start` decided to do. `foreground` is not a failure: it is every case where daemonising is
+ *  impossible or unwise (no supervisor, no user session), where running the worker inline is the honest
+ *  thing to do rather than pretending to install a service. */
+export type StartOutcome =
+  | { kind: "running"; code: 0 }
+  | { kind: "foreground"; reason: string }
+  | { kind: "error"; code: number };
+
+/**
+ * `dahrk start` in daemon mode: make the node be running, and return. Idempotent.
+ *
+ * It also SELF-HEALS a stale unit: it re-renders what the unit should be and, when that differs from what
+ * is on disk, rewrites and reloads it. That covers a client upgrade (units used to invoke bare `start`,
+ * which the new `start` would treat as "ensure running" - a restart loop), a Node path moved by a
+ * `brew upgrade`, and a rotated token. It is only sound because the render is deterministic; see
+ * `unitIsCurrent`.
+ */
+export async function runNodeStart(
+  inputs: ServiceInstallInputs,
+  deps: Partial<ServiceDeps> = {},
+): Promise<StartOutcome> {
+  const d = { ...defaultDeps(), ...deps };
+
+  const manager = detectManager(d.platform);
+  if (manager === "unsupported") {
+    return { kind: "foreground", reason: "no supported supervisor on this platform (launchd / systemd)" };
+  }
+  const probeCmd = availabilityCommand(manager);
+  if (probeCmd && d.capture(probeCmd).code !== 0) {
+    return { kind: "foreground", reason: "no systemd user session on this host (a container, typically)" };
+  }
+
+  const filePath = unitPath(manager, d.homeDir);
+  const unitExists = d.fileExists(filePath);
+
+  // No token anywhere and no unit to fall back on: there is nothing to enrol with. Say so, exactly once,
+  // with where to get one.
+  if (!inputs.token && !unitExists) {
+    d.out("No enrolment token: pass --token <token> or set DAHRK_ENROL_TOKEN.");
+    d.out("Get one at https://app.dahrk.ai.");
+    return { kind: "error", code: 2 };
+  }
+
+  // The plan's COMMANDS and filePath do not depend on the token - only its rendered content does. So when
+  // there is no token we can still load the existing unit (which carries its own token in its env block);
+  // we simply must not re-render it. The placeholder never reaches disk on that path.
+  const plan = buildPlan({
+    manager,
+    nodeBin: d.nodeBin,
+    scriptPath: d.scriptPath,
+    token: inputs.token ?? "-",
+    ...(inputs.name ? { name: inputs.name } : {}),
+    ...(inputs.hubUrl ? { hubUrl: inputs.hubUrl } : {}),
+    ...(d.pathEnv ? { pathEnv: d.pathEnv } : {}),
+    homeDir: d.homeDir,
+    logDir: d.logDir,
+  });
+  const canRender = inputs.token !== undefined;
+  const current = canRender && unitExists && unitIsCurrent(plan, d.readFile(filePath));
+
+  // Already up, on the unit we would write anyway: do nothing. `start` must be a cheap no-op when the node
+  // is healthy, not a restart in disguise.
+  const probe = unitExists ? d.capture(statusCommand(manager)) : { code: 1, stdout: "" };
+  const status = parseServiceStatus(manager, unitExists, probe);
+  if (current && status.running) {
+    d.out(`Node is already running${status.pid ? ` (pid ${status.pid})` : ""}.`);
+    d.out(`  logs: ${plan.logHint}`);
+    return { kind: "running", code: 0 };
+  }
+
+  if (canRender && !current) {
+    try {
+      // systemd's `append:` will not start a unit whose log directory is missing.
+      d.mkdirp(d.logDir);
+      d.mkdirp(dirOf(plan.filePath));
+      d.writeFile(plan.filePath, plan.content);
+    } catch (e) {
+      d.out(`Could not write the service file at ${plan.filePath}: ${(e as Error).message}`);
+      return { kind: "error", code: 1 };
+    }
+    d.out(unitExists ? `Updated ${plan.manager} service: ${plan.filePath}` : `Installed ${plan.manager} service: ${plan.filePath}`);
+  }
+
+  const code = runCommands(plan.installCommands, d);
+  if (code !== 0) {
+    d.out(`The service file is in place but starting it failed (exit ${code}).`);
+    return { kind: "error", code };
+  }
+  d.out("Node is running. It will start on boot and restart on failure.");
+  d.out(`  logs:   ${plan.logHint}`);
+  d.out("  stop:   dahrk stop");
+  return { kind: "running", code: 0 };
+}
+
+/**
+ * `dahrk stop`: stop the node now and keep it stopped, without deregistering it - so `dahrk start` brings
+ * it back. Returns the process exit code (0 = stopped / nothing to stop, 1 = unsupported host).
+ */
+export async function runNodeStop(deps: Partial<ServiceDeps> = {}): Promise<number> {
+  const d = { ...defaultDeps(), ...deps };
+
+  const manager = detectManager(d.platform);
+  if (manager === "unsupported") return printUnsupported(d.out);
+
+  // Removal / stopping never needs a real token; the placeholder keeps the builder's shape.
+  const plan = buildPlan({
+    manager,
+    nodeBin: d.nodeBin,
+    scriptPath: d.scriptPath,
+    token: "-",
+    homeDir: d.homeDir,
+    logDir: d.logDir,
+  });
+
+  if (!d.fileExists(plan.filePath)) {
+    d.out("No service installed, so there is nothing to stop.");
+    d.out("If you are running a node in a terminal (`dahrk start --foreground`), stop it with Ctrl-C.");
+    return 0;
+  }
+
+  runCommands(plan.stopCommands, d);
+  d.out("Node stopped. It will stay stopped across reboots until you run `dahrk start`.");
   return 0;
 }
 
@@ -473,7 +659,7 @@ const defaultDeps = (): ServiceDeps => ({
   // `brew upgrade node` deletes out from under the unit. See `stableNodeBin`.
   nodeBin: stableNodeBin(process.execPath, realpathOrUndefined),
   scriptPath: resolveScriptPath(),
-  logDir: join(process.env.DAHRK_STATE_DIR ?? join(homedir(), ".dahrk"), "logs"),
+  logDir: resolveLogDir(process.env),
   // Snapshot the operator's PATH at install time so the daemon finds git + the runtime CLIs (Homebrew /
   // npm-global bins) that a supervisor's minimal PATH would otherwise hide.
   pathEnv: process.env.PATH,
@@ -485,6 +671,13 @@ const defaultDeps = (): ServiceDeps => ({
     writeFileSync(path, content, { mode: UNIT_FILE_MODE });
     chmodSync(path, UNIT_FILE_MODE);
   },
+  readFile: (path) => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {
+      return undefined;
+    }
+  },
   removeFile: (path) => rmSync(path, { force: true }),
   fileExists: (path) => existsSync(path),
   run: (argv) => {
@@ -495,6 +688,21 @@ const defaultDeps = (): ServiceDeps => ({
     } catch (e) {
       const status = (e as { status?: unknown }).status;
       return typeof status === "number" ? status : 1;
+    }
+  },
+  capture: (argv) => {
+    const [cmd, ...args] = argv;
+    try {
+      // Parsed, not shown - so capture rather than inherit. stderr is dropped: `launchctl list` on an
+      // unknown label writes there, and the exit code already tells us what we need.
+      const stdout = execFileSync(cmd as string, args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return { code: 0, stdout };
+    } catch (e) {
+      const status = (e as { status?: unknown }).status;
+      return { code: typeof status === "number" ? status : 1, stdout: "" };
     }
   },
   out: (line) => void process.stdout.write(`${line}\n`),
