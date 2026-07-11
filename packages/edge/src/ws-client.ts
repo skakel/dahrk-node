@@ -76,9 +76,14 @@ const log = (line: string): void => void process.stdout.write(`${line}\n`);
 
 export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   const rules: PolicyRule[] = opts.denyTool ? [denyToolRule(opts.denyTool)] : [];
+  // Late-bound: the git service needs to know which runs are live (so clearing a stale branch claim can
+  // never stomp one), but the stage runner that tracks that is constructed below, with the git service
+  // as a dependency. Before it exists no run can be mid-stage, so `false` is the correct default.
+  let stageRunnerRef: { isBusy(runId: string): boolean } | undefined;
   const gitService = createGitService({
     worktreesDir: opts.worktreesDir,
     mirrorsDir: opts.mirrorsDir,
+    isBusy: (runId) => stageRunnerRef?.isBusy(runId) ?? false,
   });
 
   let ws: WebSocket | undefined;
@@ -172,6 +177,21 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     ...(opts.retention ? { retention: opts.retention } : {}),
   };
   const stageRunner = createStageRunner(stageDeps);
+  stageRunnerRef = stageRunner; // closes the late binding above
+
+  // Reclaim leaked worktrees at boot, BEFORE the first job arrives (DHK-371). This is the only pass that
+  // can collect worktrees created by a previous process: the runner's in-memory maps start empty, so
+  // without it every worktree from a prior lifetime is orphaned for ever, holding both disk and its
+  // branch name (which then wedges the next run of that issue). Best-effort and non-blocking to the
+  // connect: a tidy-up must never stop the node coming up.
+  void stageRunner
+    .reapWorktrees()
+    .then((r) => {
+      if (r.reaped.length) log(`EDGE_REAPED:${r.reaped.length} worktrees (scanned ${r.scanned}, skipped ${r.skipped})`);
+      for (const e of r.errors) log(`EDGE_REAP_ERROR:${e}`);
+    })
+    .catch((e: unknown) => log(`EDGE_REAP_ERROR:${(e as Error).message}`));
+
   // A persisted UUID identifies the node; fall back to an ephemeral one if none was provided.
   const nodeId = opts.nodeId ?? randomUUID();
 

@@ -575,3 +575,54 @@ test("runPush mode:backup fails truthfully when the run has no live worktree", a
   assert.match(res.summary, /no live worktree/);
   assert.equal(calls.length, 0, "neither backupPush nor createWorktree was called");
 });
+
+test("DHK-371: a job that throws before `finish` must not leave the run marked busy for ever", async () => {
+  // The leak: `inFlight` was incremented at job start but only decremented inside `finish`, which a throw
+  // before it (e.g. `createWorktree` failing on a stale branch claim) skipped entirely. The run then stayed
+  // "busy" for the life of the process, so every reaper/retention pass keyed on `isBusy` skipped it -
+  // precisely the runs that most needed collecting, and precisely the ones whose worktree was wedging the
+  // next run of the same issue.
+  const root = mkdtempSync(join(tmpdir(), "dahrk-busy-"));
+  const repo = join(root, "repo");
+  execFileSync("mkdir", ["-p", repo]);
+  initRepo(repo);
+
+  const gitService = createGitService({ worktreesDir: join(root, "wt"), mirrorsDir: join(root, "mir") });
+  const exploding = {
+    ...gitService,
+    createWorktree: async () => {
+      throw new Error("fatal: 'skakel/issue-DHK-1' is already used by worktree at /somewhere/stale");
+    },
+  };
+
+  const runner = createStageRunner({
+    gitService: exploding as never,
+    makeRunner: createMockRunner,
+    rules: [],
+    sendProgress: () => undefined,
+  });
+
+  const job: JobRequest = {
+    tenantId: "t_default",
+    runId: "run-explode",
+    stageId: "build",
+    jobId: "job-explode",
+    awakeableId: "awk-explode",
+    executorType: "worktree",
+    agentConfig: { runtime: "claude-code", interaction: "batch", tools: ["shell"] },
+    workspaceRef: { repoId: "repo", gitUrl: repo, repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
+    timeout: 60,
+  };
+
+  try {
+    assert.equal(runner.isBusy("run-explode"), false, "precondition: not busy before the job");
+    await assert.rejects(() => runner.runJob(job), /already used by worktree/);
+    assert.equal(
+      runner.isBusy("run-explode"),
+      false,
+      "the in-flight marker is released even though the job threw before `finish`",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

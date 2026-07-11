@@ -647,11 +647,14 @@ test("an ambient (tokenless) clone runs git with GIT_TERMINAL_PROMPT=0 so auth f
   const shimDir = mkdtempSync(join(tmpdir(), "dahrk-shim-"));
   const captureFile = join(shimDir, "clone-terminal-prompt");
   const shim = join(shimDir, "git");
-  // For `clone`, record the flag (or the literal UNSET) then exec the real git; pass everything else
-  // straight through so the rest of createWorktree behaves exactly as normal.
+  // For `fetch`, record the flag (or the literal UNSET) then exec the real git; pass everything else
+  // straight through so the rest of createWorktree behaves exactly as normal. `fetch` (not `clone`) is
+  // the network op now that a mirror is built as `init --bare` + a tracking refspec + `fetch` rather
+  // than `clone --mirror` (DHK-371); the guarantee under test is unchanged - the tokenless network call
+  // must not be able to block on a credential prompt.
   writeFileSync(
     shim,
-    `#!/bin/sh\nif [ "$1" = "clone" ]; then printf '%s' "\${GIT_TERMINAL_PROMPT-UNSET}" > "${captureFile}"; fi\nexec "${realGit}" "$@"\n`,
+    `#!/bin/sh\nif [ "$1" = "fetch" ]; then printf '%s' "\${GIT_TERMINAL_PROMPT-UNSET}" > "${captureFile}"; fi\nexec "${realGit}" "$@"\n`,
     { mode: 0o755 },
   );
   const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
@@ -674,7 +677,7 @@ test("an ambient (tokenless) clone runs git with GIT_TERMINAL_PROMPT=0 so auth f
     assert.equal(
       readFileSync(captureFile, "utf-8"),
       "0",
-      "the tokenless clone must run git with GIT_TERMINAL_PROMPT=0",
+      "the tokenless mirror fetch must run git with GIT_TERMINAL_PROMPT=0",
     );
   } finally {
     if (savedPath === undefined) delete process.env.PATH;
@@ -717,5 +720,254 @@ test("a second run reuses the mirror and picks up new commits via remote update 
     rmSync(src, { recursive: true, force: true });
     rmSync(worktreesDir, { recursive: true, force: true });
     rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
+// --- DHK-371: the mirror must never destroy a run's branch, and a stale claim must never block a run ---
+
+/** Read a mirror's registered worktrees as `path -> branch` (branch as git reports it, even when the
+ *  ref itself is gone: that dangling claim is exactly what used to block `worktree add`). */
+function mirrorWorktrees(mirror: string): Array<{ path: string; branch: string }> {
+  const out = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: mirror, encoding: "utf-8" });
+  const rows: Array<{ path: string; branch: string }> = [];
+  let path = "";
+  for (const line of out.split("\n")) {
+    if (line.startsWith("worktree ")) path = line.slice(9).trim();
+    else if (line.startsWith("branch ")) rows.push({ path, branch: line.slice(7).trim().replace(/^refs\/heads\//, "") });
+  }
+  return rows;
+}
+const resolves = (repo: string, ref: string): boolean => {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "-q", ref], { cwd: repo, stdio: ["pipe", "pipe", "pipe"] });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("D1: a mirror refresh does NOT delete the branch of a run whose work is not yet pushed", async () => {
+  // The defect: a `--mirror` clone force-syncs local refs to match origin on every fetch. Run branches
+  // live only locally until deliver pushes them, so the next refresh DELETED them mid-run, orphaning the
+  // commits and leaving the worktree on an unborn HEAD. This is the headline regression.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-d1",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-d1-a",
+      branch: "skakel/issue-DHK-1",
+    });
+    // The agent works and the run commits, but deliver has not pushed: the branch exists ONLY locally.
+    writeFileSync(join(ref.worktreePath, "work.txt"), "unpushed work\n");
+    execFileSync("git", ["add", "-A"], { cwd: ref.worktreePath });
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "wip"], {
+      cwd: ref.worktreePath,
+    });
+    const tip = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ref.worktreePath, encoding: "utf-8" }).trim();
+
+    // Another run touches the same repo, which refreshes the mirror. On the old code this fetch deleted
+    // `skakel/issue-DHK-1` outright.
+    await svc.createWorktree({
+      repoId: "repo-d1",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-d1-b",
+      branch: "skakel/issue-DHK-2",
+    });
+
+    const mirror = join(mirrorsDir, "repo-d1");
+    assert.ok(
+      resolves(mirror, "refs/heads/skakel/issue-DHK-1"),
+      "the unpushed run branch must survive a mirror refresh",
+    );
+    assert.equal(
+      execFileSync("git", ["rev-parse", "refs/heads/skakel/issue-DHK-1"], { cwd: mirror, encoding: "utf-8" }).trim(),
+      tip,
+      "and must still point at the run's commit",
+    );
+    assert.ok(resolves(ref.worktreePath, "HEAD"), "so the run's worktree HEAD still resolves (not unborn)");
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("D1 migration: a legacy `clone --mirror` mirror is converted in place, keeping unpushed run branches", async () => {
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const mirror = join(mirrorsDir, "repo-legacy");
+  try {
+    // Hand-build the legacy layout the old code produced, with an unpushed run branch in it.
+    execFileSync("git", ["clone", "--mirror", remote, mirror]);
+    const base = execFileSync("git", ["rev-parse", "main"], { cwd: mirror, encoding: "utf-8" }).trim();
+    execFileSync("git", ["branch", "skakel/issue-DHK-9", base], { cwd: mirror });
+    assert.equal(
+      execFileSync("git", ["config", "--get", "remote.origin.mirror"], { cwd: mirror, encoding: "utf-8" }).trim(),
+      "true",
+      "precondition: the legacy mirror is armed",
+    );
+
+    // Freeze the legacy shadow `refs/heads/main` at the OLD tip, then move the real remote on. Under the
+    // old layout the mirror resolved its base from this local head, so a run could be branched off a
+    // stale base. The migrated layout must resolve the base from `refs/remotes/origin/*` instead, making
+    // this stale head inert. (It is retained rather than deleted: it is the bare repo's own HEAD target,
+    // and dropping it would leave the mirror's HEAD dangling. Inert is enough.)
+    advanceRemoteMain(remote, "moved.txt", "base moved\n", "base advanced after the legacy mirror froze");
+
+    const svc = createGitService({ worktreesDir, mirrorsDir });
+    const fresh = await svc.createWorktree({
+      repoId: "repo-legacy",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-legacy",
+      branch: "skakel/issue-DHK-10",
+    });
+
+    assert.ok(
+      existsSync(join(fresh.worktreePath, "moved.txt")),
+      "the run is based on the CURRENT remote base, not the frozen local `main` shadow head",
+    );
+    assert.equal(
+      execFileSync("git", ["config", "--get-all", "remote.origin.fetch"], { cwd: mirror, encoding: "utf-8" }).trim(),
+      "+refs/heads/*:refs/remotes/origin/*",
+      "the refspec is migrated to the tracking layout",
+    );
+    assert.throws(
+      () => execFileSync("git", ["config", "--get", "remote.origin.mirror"], { cwd: mirror, stdio: ["pipe", "pipe", "pipe"] }),
+      "remote.origin.mirror is unset (it also makes any push a destructive mirror push)",
+    );
+    assert.ok(resolves(mirror, "refs/remotes/origin/main"), "origin/main is now a remote-tracking ref");
+    assert.ok(resolves(mirror, "refs/heads/skakel/issue-DHK-9"), "the unpushed run branch survived migration");
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("D3: a stale worktree's dangling branch claim does not block a new run of the same issue", async () => {
+  // This is the failure that wedged every run: `fatal: '<branch>' is already used by worktree at ...`.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const mirror = join(mirrorsDir, "repo-d3");
+  try {
+    const first = await svc.createWorktree({
+      repoId: "repo-d3",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-d3-old",
+      branch: "skakel/issue-DHK-3",
+    });
+    // Reproduce the corpse the old code left behind: the branch ref deleted out from under a worktree
+    // that is never torn down, so it goes on claiming the name with a dangling symref.
+    execFileSync("git", ["update-ref", "-d", "refs/heads/skakel/issue-DHK-3"], { cwd: mirror });
+    assert.ok(
+      mirrorWorktrees(mirror).some((w) => w.branch === "skakel/issue-DHK-3"),
+      "precondition: the stale worktree still claims the branch",
+    );
+    assert.ok(existsSync(first.worktreePath));
+
+    // A NEW run of the same issue. On the old code this threw.
+    const second = await svc.createWorktree({
+      repoId: "repo-d3",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-d3-new",
+      branch: "skakel/issue-DHK-3",
+    });
+    assert.ok(resolves(second.worktreePath, "HEAD"), "the new worktree has a resolvable HEAD");
+    assert.ok(!existsSync(first.worktreePath), "and the stale worktree was cleared, not left to leak");
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("D3: a new run branches off the CURRENT base, never off a stale local ref, and parks the orphaned tip", async () => {
+  // The quiet hazard: the aborted `add -b` left the branch ref re-created at the old run's commit, so the
+  // next attempt took the `--force` path and silently based the run on stale work instead of the base.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const mirror = join(mirrorsDir, "repo-d3b");
+  try {
+    const old = await svc.createWorktree({
+      repoId: "repo-d3b",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-d3b-old",
+      branch: "skakel/issue-DHK-4",
+    });
+    writeFileSync(join(old.worktreePath, "stale.txt"), "stale run work\n");
+    execFileSync("git", ["add", "-A"], { cwd: old.worktreePath });
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "stale"], {
+      cwd: old.worktreePath,
+    });
+    const staleTip = execFileSync("git", ["rev-parse", "HEAD"], { cwd: old.worktreePath, encoding: "utf-8" }).trim();
+
+    // The base moves on (a parallel run landed), and the stale local branch ref is left behind.
+    advanceRemoteMain(remote, "base.txt", "moved\n", "base advanced");
+
+    const fresh = await svc.createWorktree({
+      repoId: "repo-d3b",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-d3b-new",
+      branch: "skakel/issue-DHK-4",
+    });
+    assert.ok(
+      existsSync(join(fresh.worktreePath, "base.txt")),
+      "the new run is based on the CURRENT base (it sees the advanced commit)",
+    );
+    assert.ok(
+      !existsSync(join(fresh.worktreePath, "stale.txt")),
+      "and NOT on the stale run's commit",
+    );
+    // The discarded tip must be recoverable, never silently destroyed.
+    const salvaged = execFileSync("git", ["for-each-ref", "--format=%(objectname)", "refs/dahrk/salvage/"], {
+      cwd: mirror,
+      encoding: "utf-8",
+    }).trim();
+    assert.equal(salvaged, staleTip, "the orphaned tip is parked under refs/dahrk/salvage/");
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("a live run's branch claim is NOT stomped: a busy holder fails the new run truthfully", async () => {
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const busy = new Set<string>();
+  const svc = createGitService({ worktreesDir, mirrorsDir, isBusy: (id) => busy.has(id) });
+  try {
+    await svc.createWorktree({
+      repoId: "repo-busy",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-busy-live",
+      branch: "skakel/issue-DHK-5",
+    });
+    busy.add("run-busy-live"); // that run is mid-stage
+
+    await assert.rejects(
+      () =>
+        svc.createWorktree({
+          repoId: "repo-busy",
+          gitUrl: remote,
+          baseBranch: "main",
+          runId: "run-busy-second",
+          branch: "skakel/issue-DHK-5",
+        }),
+      /in-flight run run-busy-live/,
+      "two live runs on one issue is a routing bug: fail truthfully rather than stomp the live worktree",
+    );
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
   }
 });

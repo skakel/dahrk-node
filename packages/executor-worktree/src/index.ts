@@ -21,7 +21,16 @@ import { createCodexRunner } from "./codex-adapter.js";
 import { createPiRunner } from "./pi-adapter.js";
 
 /** GitService - worktree lifecycle and base-branch resolution (M3). */
-export { createGitService, sanitizeBranchName, parseOwnerRepo } from "./git-service.js";
+export {
+  createGitService,
+  sanitizeBranchName,
+  parseOwnerRepo,
+  resolveWorktreesDir,
+  resolveMirrorsDir,
+} from "./git-service.js";
+/** Restart-safe collection of run worktrees (DHK-371). See `worktree-reaper.ts`. */
+export { createWorktreeReaper } from "./worktree-reaper.js";
+export type { ReapPolicy, ReapReport, ReapedWorktree, ReapReason } from "./worktree-reaper.js";
 export type {
   GitService,
   GitServiceOptions,

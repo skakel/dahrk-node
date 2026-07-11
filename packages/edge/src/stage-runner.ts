@@ -30,10 +30,13 @@ import type { PolicyOutcome } from "@dahrk/contracts";
 import { attachedDocBasename } from "@dahrk/contracts";
 import {
   createTraceWriter,
+  createWorktreeReaper,
   ManagedMailbox,
   overlayComponents,
+  resolveMirrorsDir,
   type GitService,
   type PackCache,
+  type ReapReport,
 } from "@dahrk/executor-worktree";
 import { buildRules } from "./builtins.js";
 import { evaluatePolicies, type PolicyRule } from "./policy.js";
@@ -118,6 +121,16 @@ export interface RetentionPolicy {
 
 export interface StageRunner {
   runJob(job: JobRequest): Promise<JobResult>;
+  /**
+   * Collect worktrees no longer needed by any run: broken ones (their branch ref was deleted under them,
+   * so they are unusable AND go on claiming their branch name), idle ones, and anything over the count
+   * cap. Restart-safe: reconciles on-disk and git-registered state, not process-local memory. Called at
+   * boot (which is what reclaims a leaked disk) and after each stage. Never touches a busy run.
+   */
+  reapWorktrees(): Promise<ReapReport>;
+  /** True while a run is executing a stage on this node. Consulted by the git service before evicting a
+   *  stale worktree that still claims a branch, so a live run is never stomped. */
+  isBusy(runId: string): boolean;
   /** Commit the run's worktree changes and push its branch (the `open-pr` action's git side). Uses
    *  the run's sticky worktree so the just-run stages' diff is present. No inference. */
   runPush(job: PushJob): Promise<PushResult>;
@@ -377,6 +390,17 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
   const lastUsed = new Map<string, number>();
   /** Count of in-flight jobs per run, so retention never tears down a busy worktree. */
   const inFlight = new Map<string, number>();
+
+  /** True while a run is executing a stage on THIS node. The reaper and the stale-claim eviction in
+   *  `createWorktree` both consult it, so a live run is never collected or stomped. */
+  const isBusy = (runId: string): boolean => (inFlight.get(runId) ?? 0) > 0;
+  const reaperDryRun = process.env.DAHRK_REAPER_DRY_RUN === "1";
+  const reaper = createWorktreeReaper({
+    worktreesDir: deps.gitService.worktreesDir,
+    mirrorsDir: resolveMirrorsDir(),
+    isBusy,
+    logger: { info: (m) => console.log(`REAPER ${m}`), warn: (m) => console.warn(`REAPER ${m}`) },
+  });
   /** Runs whose workspace is a telemetry-only scratch dir, not a git worktree, so teardown
    *  removes the directory directly rather than calling `git worktree remove` (which would fail). */
   const scratchOnly = new Set<string>();
@@ -401,10 +425,28 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
     runToolCalls.delete(runId);
   };
 
-  /** Apply retention: never the run we just used, never a run with an in-flight job. Age
-   *  first, then trim to maxRuns by least-recently-used. Best-effort. */
+  /**
+   * Collect worktrees that are no longer needed. Two layers, deliberately:
+   *
+   *  1. The REAPER, which reconciles what is on disk and what git has registered. It is the load-bearing
+   *     one, because it is restart-safe: the in-memory maps below are empty after a process restart, so
+   *     anything a previous process created was previously orphaned for ever (that is how one node
+   *     reached 92 worktrees and 65 GB, DHK-371). It also runs with real DEFAULTS - "no retention policy
+   *     configured" used to mean "never collect anything", which is not a safe default for a disk.
+   *  2. The original in-memory LRU, kept for the telemetry-only scratch runs the reaper does not own.
+   *
+   * Never collects the run we just used, nor any run with an in-flight job. Best-effort throughout:
+   * a failure to tidy up must never fail a stage.
+   */
   const applyRetention = async (keepRunId: string): Promise<void> => {
     const policy = deps.retention;
+    await reaper
+      .reap({
+        ...(policy?.maxRuns !== undefined ? { maxRuns: policy.maxRuns } : {}),
+        ...(policy?.maxAgeMs !== undefined ? { maxIdleMs: policy.maxAgeMs } : {}),
+        ...(reaperDryRun ? { dryRun: true } : {}),
+      })
+      .catch(() => undefined);
     if (!policy) return;
     const prunable = (id: string): boolean => id !== keepRunId && (inFlight.get(id) ?? 0) === 0;
     const now = Date.now();
@@ -427,6 +469,12 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
   };
 
   return {
+    isBusy,
+
+    async reapWorktrees() {
+      return reaper.reap(reaperDryRun ? { dryRun: true } : {});
+    },
+
     async runJob(job) {
       const { stageId, jobId, runId, agentConfig } = job;
       const attempt = attemptOf(jobId);
@@ -453,384 +501,399 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
       }
 
       inFlight.set(runId, (inFlight.get(runId) ?? 0) + 1);
-      lastUsed.set(runId, Date.now());
-
-      // Workspace once per run (sticky owner; reused on re-dispatch and across stages).
-      // - Customer-repo run: build a git worktree, cloning on demand from the Job's gitUrl - no
-      //   pre-cloned local repo needed.
-      // - Telemetry-only run: no `workspaceRef`, so synthesise a scratch-only workspace under
-      //   `<scratchRoot>/<runId>` with NO git clone. The empty repo fields mark it repo-free; every
-      //   downstream reader uses the resolved `ref`, not `job.workspaceRef`.
-      let ref = worktrees.get(runId);
-      if (!ref) {
-        if (job.workspaceRef) {
-          ref = await deps.gitService.createWorktree({
-            repoId: job.workspaceRef.repoId,
-            gitUrl: job.workspaceRef.gitUrl,
-            baseBranch: job.workspaceRef.baseBranch,
-            runId,
-            repo: job.workspaceRef.repo,
-            // Stable per-issue branch (continuation); absent = legacy dahrk/<runId>.
-            ...(job.workspaceRef.branch ? { branch: job.workspaceRef.branch } : {}),
-            // Brokered git credential for this job; absent on ambient nodes (host creds used).
-            ...(job.workspaceRef.credentialToken
-              ? { credentialToken: job.workspaceRef.credentialToken }
-              : {}),
-          });
-        } else {
-          const base = deps.scratchRoot ?? join(tmpdir(), "dahrk", "scratch");
-          const worktreePath = join(base, runId);
-          const scratchPath = join(worktreePath, ".skakel", "scratch");
-          mkdirSync(scratchPath, { recursive: true });
-          ref = { repoId: "", gitUrl: "", repo: "", baseBranch: "", worktreePath, scratchPath };
-          scratchOnly.add(runId);
-        }
-        worktrees.set(runId, ref);
-      }
-      writeScratchState(ref, job, attempt, "in-flight");
-      writeIssueContext(ref, job.issueContext);
-      writeGuidance(ref, job.guidance);
-      writeAttachedDocuments(ref, job.attachedDocuments);
-      // Pre-create the parent of a declared output artifact so the agent's relative write succeeds
-      // even if it does not mkdir first.
-      if (job.agentConfig.emitArtifact) {
-        const artifactDir = resolveWorktreeRelativePath(ref, job.agentConfig.emitArtifact);
-        const slash = job.agentConfig.emitArtifact.lastIndexOf("/");
-        if (artifactDir && slash > 0) {
-          try {
-            mkdirSync(join(ref.worktreePath, job.agentConfig.emitArtifact.slice(0, slash)), { recursive: true });
-          } catch {
-            /* best-effort; the agent can still create the directory itself */
-          }
-        }
-      }
-
-      // Per-stage MCP gateway proxy: holds this job's brokered MCP creds and injects them on
-      // outbound calls so the agent never sees them. Started below (Claude only) and stopped in
-      // `finish`, so minted tokens are discarded with the stage. Declared here so `finish` closes over it.
-      let gateway: McpGateway | undefined;
-
-      const meta: TraceMeta = {
-        tenantId: job.tenantId,
-        runId,
-        stageId,
-        jobId,
-        attempt,
-        runtime: agentConfig.runtime,
-        model: agentConfig.model,
-        sessionId: job.sessionId,
-        configDigest: digest(agentConfig),
-        startedAt: nowIso(),
-      };
-      const writer = createTraceWriter(ref.scratchPath, meta);
-      // Stream every written event to the hub as it is appended (the live, full-fidelity
-      // corpus). The event carries its writer-assigned seq, so the hub persists the
-      // identical record and can detect gaps. Best-effort; a missing sink is local-only.
-      const streamEvent = (e: TraceEvent): void =>
-        deps.trace?.event({ runId, stageId, attempt, tenantId: job.tenantId, event: e });
-      streamEvent(
-        writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "attempt-start" }),
-      );
-
-      // At stage exit: upload heavy spilled blobs + the finalised trace.jsonl archive to
-      // object storage (via hub-minted presigned URLs), then send the authoritative meta.
-      const shipFinalTrace = async (finalMeta: TraceMeta): Promise<void> => {
-        const sink = deps.trace;
-        if (!sink) return;
-        const base = { tenantId: job.tenantId, runId, stageId, attempt };
-        try {
-          for (const name of readdirSync(join(writer.dir, "blobs"))) {
-            const bytes = readFileSync(join(writer.dir, "blobs", name));
-            const { url } = await sink.requestBlobUrl({
-              ...base, sha256: name, size: bytes.length, contentType: "application/octet-stream", slot: "blob",
-            });
-            if (url) await putBytes(url, bytes, "application/octet-stream");
-          }
-        } catch {
-          /* best-effort; the streamed events are already persisted */
-        }
-        let archiveKey: string | undefined;
-        try {
-          const bytes = readFileSync(join(writer.dir, "trace.jsonl"));
-          const sha = createHash("sha256").update(bytes).digest("hex");
-          const { key, url } = await sink.requestBlobUrl({
-            ...base, sha256: sha, size: bytes.length, contentType: "application/x-ndjson", slot: "archive",
-          });
-          if (url) await putBytes(url, bytes, "application/x-ndjson");
-          archiveKey = key;
-        } catch {
-          /* best-effort */
-        }
-        sink.finalised({ ...base, meta: finalMeta, eventCount: writer.count(), ...(archiveKey ? { archiveKey } : {}) });
-      };
-
-      const finish = async (
-        status: JobStatus,
-        summary: string,
-        sessionId?: string,
-        costUsd?: number,
-        handedBackDoc?: { path: string; content: string },
-      ): Promise<JobResult> => {
-        active.delete(jobId);
-        turnQueues.delete(jobId);
-        await gateway?.stop().catch(() => undefined); // discard brokered MCP creds with the stage
-        gateway = undefined;
-        streamEvent(
-          writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "stage-exit", status }),
-        );
-        const endedAt = nowIso();
-        writer.finalise({ status, endedAt, ...(sessionId ? { sessionId } : {}) });
-        writeScratchState(ref!, job, attempt, status);
-        const finalMeta: TraceMeta = {
-          ...meta, status, endedAt,
-          ...(sessionId ? { sessionId } : {}),
-          ...(costUsd !== undefined ? { costUsd } : {}),
-        };
-        await shipFinalTrace(finalMeta).catch(() => undefined);
-        lastUsed.set(runId, Date.now());
-        inFlight.set(runId, Math.max(0, (inFlight.get(runId) ?? 1) - 1));
-        await applyRetention(runId).catch(() => undefined);
-        // When the stage intends a document (declared an `emitArtifact` path, or handed one back via
-        // `dahrk_stage_complete`) and succeeded, resolve it from whichever channel produced content
-        // so the engine can publish it (e.g. the `attach-document` action). Read-only; a miss returns
-        // undefined and the action surfaces the absence. Ordinary code/build stages are not scanned.
-        const wantsArtifact = agentConfig.emitArtifact !== undefined || handedBackDoc !== undefined;
-        const resolved =
-          status === "ok" && wantsArtifact
-            ? resolveStageArtifact(ref!, agentConfig.emitArtifact, handedBackDoc)
-            : undefined;
-        if (status === "ok" && wantsArtifact) {
-          const detail = resolved
-            ? `source=${resolved.source} path=${resolved.artifact.path} bytes=${resolved.artifact.content.length}`
-            : "no document resolved (declared path, tool handoff, and scratch/changed-file scans all empty)";
-          streamEvent(
-            writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "artifact", detail }),
-          );
-        }
-        return {
-          jobId,
-          status,
-          summary,
-          ...(sessionId ? { sessionId } : {}),
-          ...(costUsd !== undefined ? { costUsd } : {}),
-          ...(resolved ? { artifact: resolved.artifact } : {}),
-        };
-      };
-
-      // Component provisioning: overlay the run's pinned skills/commands/agents into the
-      // worktree `.claude/` before the runner starts, normalised per runtime (Claude writes files
-      // with repo-local precedence; Codex warns and skips). Idempotent, so re-dispatch on the sticky
-      // worktree is safe. Fail closed: a missing pinned component is a correctness problem, not
-      // cosmetic, so a materialise/overlay error fails the stage rather than running without it.
-      if (deps.packCache && job.provision && job.provision.length > 0) {
-        try {
-          const overlay = await overlayComponents({
-            worktreePath: ref.worktreePath,
-            runtime: agentConfig.runtime,
-            components: job.provision,
-            cache: deps.packCache,
-          });
-          const detail = `provision: ${overlay.written.length} written, ${overlay.skippedRepoLocal.length} repo-local, ${overlay.warnings.length} warning(s)`;
-          streamEvent(
-            writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "provision", detail }),
-          );
-          // Surface the summary (and any Codex warnings) to the hub so the overlay is observable.
-          const noteText = overlay.warnings.length > 0 ? `${detail}; ${overlay.warnings.join("; ")}` : detail;
-          deps.sendProgress({ jobId, kind: "observation", ts: nowIso(), text: noteText });
-        } catch (e) {
-          const msg = `component provisioning failed: ${(e as Error).message}`;
-          writer.append({ seq: 0, ts: nowIso(), type: "error", runtime: agentConfig.runtime, kind: "provision-failed", message: msg });
-          deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: msg });
-          return finish("fail", `${stageId}: ${msg}`, job.sessionId);
-        }
-      }
-
-      // Compose this Job's policies (workflow+stage builtins the engine threaded) with the
-      // edge's demo rules. The run-scoped counter is shared across the run's stages.
-      let counter = runToolCalls.get(runId);
-      if (!counter) {
-        counter = { count: 0 };
-        runToolCalls.set(runId, counter);
-      }
-      const jobRules = buildRules(job.policies ?? [], {
-        worktreePath: ref.worktreePath,
-        repoName: job.workspaceRef?.repo ?? "",
-        runToolCalls: counter,
-      });
-      const rules = [...jobRules, ...deps.rules];
-
-      // Policy at stage entry.
-      const entry = evaluatePolicies({ kind: "stage-entry", stageId }, rules);
-      if (entry.verdict === "deny") {
-        writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "policy-deny", detail: entry.reason });
-        return finish("fail", `${stageId}: denied at stage entry (${entry.policy})`, job.sessionId);
-      }
-
-      // Run the stage, intercepting tool actions for policy and streaming progress.
-      let denied = false;
-      const authorisedActions: string[] = [];
-      const runtime = agentConfig.runtime;
-      const actionKey = (tool: string, input: unknown): string => {
-        try {
-          return `${tool}\0${JSON.stringify(input)}`;
-        } catch {
-          return `${tool}\0`;
-        }
-      };
-      const policyReason = (verdict: PolicyOutcome): string => verdict.reason ?? `tool action denied by ${verdict.policy}`;
-      const recordDeny = (verdict: PolicyOutcome, toolUseId?: string): void => {
-        denied = true;
-        const reason = policyReason(verdict);
-        if (toolUseId) {
-          streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "observation", runtime, toolUseId, isError: true, output: { error: reason } }));
-        }
-        streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "state", runtime, event: "policy-deny", detail: reason }));
-        deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: reason });
-      };
-      const authorizeToolUse = (tool: string, input: unknown): PolicyOutcome => {
-        const verdict = evaluatePolicies({ kind: "action", stageId, tool, input }, rules);
-        if (verdict.verdict === "deny") {
-          recordDeny(verdict);
-        } else {
-          authorisedActions.push(actionKey(tool, input));
-        }
-        return verdict;
-      };
-      const onTrace = (event: TraceEvent): void => {
-        if (event.type === "action") {
-          const key = actionKey(event.tool, event.input);
-          const authorised = authorisedActions.indexOf(key);
-          if (authorised >= 0) {
-            authorisedActions.splice(authorised, 1);
-          } else {
-            const verdict = evaluatePolicies(
-              { kind: "action", stageId, tool: event.tool, input: event.input },
-              rules,
-            );
-            if (verdict.verdict === "deny") {
-              streamEvent(writer.append(event));
-              recordDeny(verdict, event.toolUseId);
-              return;
-            }
-          }
-        }
-        streamEvent(writer.append(event));
-        if (event.type !== "state") deps.sendProgress({ jobId, kind: event.type, ts: event.ts, ...previewOf(event) });
-      };
-
-      // Start the per-stage MCP gateway when the stage declares brokered MCP servers. Claude only:
-      // the Codex SDK has no MCP support, so a proxy for it would be dead weight (the codex adapter
-      // logs and ignores declared servers).
-      const mcpServers = agentConfig.mcpServers;
-      if (mcpServers && mcpServers.length > 0 && runtime === "claude-code") {
-        gateway = await startMcpGateway({ servers: mcpServers, creds: job.brokeredCreds ?? {} });
-      }
-
-      const runner = deps.makeRunner(runtime);
-      active.set(jobId, runner);
-      const ctx: PolicyAwareRunnerContext = {
-        config: agentConfig,
-        workspace: ref,
-        sessionId: job.sessionId,
-        ...(job.issueContext !== undefined ? { issueContext: job.issueContext } : {}),
-        ...(job.guidance !== undefined ? { guidance: job.guidance } : {}),
-        ...(job.gateFeedback !== undefined ? { gateFeedback: job.gateFeedback } : {}),
-        ...(job.attachedDocuments !== undefined ? { attachedDocuments: job.attachedDocuments } : {}),
-        ...(gateway ? { mcpProxyBaseUrl: gateway.baseUrl } : {}),
-        // brokered inference env for a managed node (no operator login). The runtime adapter
-        // (Pi) / container executor apply it as the inference process env, so the raw key is
-        // never surfaced to the agent's own tool calls. Absent on ambient nodes; inert for the Claude/
-        // Codex adapters, which use ambient inference.
-        ...(job.runtimeEnv ? { runtimeEnv: job.runtimeEnv } : {}),
-        // The adapter persists each runtime-native record under the attempt's raw/ sidecar
-        // and stamps the rawRef onto the emitted event.
-        writeRaw: writer.writeRaw,
-        authorizeToolUse,
-        // Wire the interactive AskUserQuestion elicitation seam (DHK-344): the adapter calls this when
-        // the agent asks a structured question, and the edge relays it to the hub as an `elicit` frame.
-        ...(deps.sendElicit
-          ? {
-              emitElicit: (question: ElicitQuestion) =>
-                deps.sendElicit!({
-                  jobId,
-                  prompt: question.prompt,
-                  options: question.options,
-                  ...(question.multiSelect ? { multiSelect: true } : {}),
-                }),
-            }
-          : {}),
-      };
-      // Interactive stages run a multi-turn conversation fed by relayed human turns (M5b);
-      // batch stages run to a terminal result. Both emit through the same onTrace.
-      const interactive = agentConfig.interaction === "interactive";
-      let result: Omit<JobResult, "jobId" | "summary"> & { summary?: string };
-      // Wall-clock kill (the contract `JobRequest.timeout` promises "on expiry the executor kills the
-      // runner; the engine marks the stage timeout"). Enforce it here so it covers batch AND interactive
-      // for both adapters: at the deadline we abort the runner via cancel() and force status `timeout`.
-      // This bounds real stage runtime below the hub's dispatch deadline (stage timeout + relay margin),
-      // so a stage is never re-dispatched while still legitimately executing - the safety prerequisite
-      // the re-dispatch leans on. (The edge de-dup in ws-client is the second guard.)
-      let timedOut = false;
-      const killMs = Math.max(0, Math.floor((job.timeout ?? 0) * 1000));
-      const killTimer =
-        killMs > 0
-          ? setTimeout(() => {
-              timedOut = true;
-              void runner.cancel();
-            }, killMs)
-          : undefined;
-      // NB: do NOT unref() this timer. It is the active mechanism of the timeout kill; an unref'd
-      // timer does not keep the event loop alive, so an otherwise-idle loop could drain before it
-      // fires and the kill would never happen. It is always cleared in the `finally` below, so it
-      // can never outlive the job.
+      // Wrapped so EVERY exit path releases the marker. Previously the decrement sat inside `finish`,
+      // which a throw before it (e.g. `createWorktree` failing) skipped entirely, leaving the run
+      // marked busy for ever and hiding it from every reaper pass keyed on `isBusy` (DHK-371).
       try {
-        if (interactive) {
-          const mailbox = new ManagedMailbox<HumanTurn>();
-          turnQueues.set(jobId, mailbox);
-          result = await runner.runInteractive(ctx, mailbox, onTrace);
-        } else {
-          result = await runner.runBatch(ctx, onTrace);
-        }
-      } finally {
-        if (killTimer) clearTimeout(killTimer);
-      }
-      // A policy deny blocks the individual *action* (already recorded as a policy-deny trace
-      // event and streamed as a progress error); the deny-only guards are guardrails the agent
-      // is expected to route around, not stage killers. A single guard-blocked action must NOT
-      // poison the *stage* verdict: a stage the runner finished cleanly stays `ok` even if one of
-      // its tool actions was denied. (Previously any deny forced the whole stage to `fail`, so a
-      // recovered-from `rm -rf` on a throwaway scratch dir turned a correctly-completed build into
-      // a false-negative.) The deny still surfaces in the trace and in the summary note below.
-      let status: JobStatus = timedOut ? "timeout" : result.status;
+        lastUsed.set(runId, Date.now());
 
-      // R4 stage-exit hooks run in the worktree only if the stage otherwise succeeded.
-      if (status === "ok" && job.hooks && job.hooks.length > 0) {
-        for (const cmd of job.hooks) {
-          try {
-            execFileSync("sh", ["-c", cmd], { cwd: ref.worktreePath, stdio: ["pipe", "pipe", "pipe"] });
-          } catch (e) {
-            status = "fail";
-            writer.append({ seq: 0, ts: nowIso(), type: "error", runtime, kind: "hook-failed", message: `hook "${cmd}" failed: ${(e as Error).message}` });
-            break;
+        // Workspace once per run (sticky owner; reused on re-dispatch and across stages).
+        // - Customer-repo run: build a git worktree, cloning on demand from the Job's gitUrl - no
+        //   pre-cloned local repo needed.
+        // - Telemetry-only run: no `workspaceRef`, so synthesise a scratch-only workspace under
+        //   `<scratchRoot>/<runId>` with NO git clone. The empty repo fields mark it repo-free; every
+        //   downstream reader uses the resolved `ref`, not `job.workspaceRef`.
+        let ref = worktrees.get(runId);
+        if (!ref) {
+          if (job.workspaceRef) {
+            ref = await deps.gitService.createWorktree({
+              repoId: job.workspaceRef.repoId,
+              gitUrl: job.workspaceRef.gitUrl,
+              baseBranch: job.workspaceRef.baseBranch,
+              runId,
+              repo: job.workspaceRef.repo,
+              // Stable per-issue branch (continuation); absent = legacy dahrk/<runId>.
+              ...(job.workspaceRef.branch ? { branch: job.workspaceRef.branch } : {}),
+              // Re-enter from work a prior backup push preserved, rather than starting over from the base
+              // (DHK-264). Carried on the contract but never plumbed through to the git service until now.
+              ...((job.workspaceRef as { seedRef?: string }).seedRef
+                ? { seedRef: (job.workspaceRef as { seedRef?: string }).seedRef }
+                : {}),
+              // Brokered git credential for this job; absent on ambient nodes (host creds used).
+              ...(job.workspaceRef.credentialToken
+                ? { credentialToken: job.workspaceRef.credentialToken }
+                : {}),
+            });
+          } else {
+            const base = deps.scratchRoot ?? join(tmpdir(), "dahrk", "scratch");
+            const worktreePath = join(base, runId);
+            const scratchPath = join(worktreePath, ".skakel", "scratch");
+            mkdirSync(scratchPath, { recursive: true });
+            ref = { repoId: "", gitUrl: "", repo: "", baseBranch: "", worktreePath, scratchPath };
+            scratchOnly.add(runId);
+          }
+          worktrees.set(runId, ref);
+        }
+        writeScratchState(ref, job, attempt, "in-flight");
+        writeIssueContext(ref, job.issueContext);
+        writeGuidance(ref, job.guidance);
+        writeAttachedDocuments(ref, job.attachedDocuments);
+        // Pre-create the parent of a declared output artifact so the agent's relative write succeeds
+        // even if it does not mkdir first.
+        if (job.agentConfig.emitArtifact) {
+          const artifactDir = resolveWorktreeRelativePath(ref, job.agentConfig.emitArtifact);
+          const slash = job.agentConfig.emitArtifact.lastIndexOf("/");
+          if (artifactDir && slash > 0) {
+            try {
+              mkdirSync(join(ref.worktreePath, job.agentConfig.emitArtifact.slice(0, slash)), { recursive: true });
+            } catch {
+              /* best-effort; the agent can still create the directory itself */
+            }
           }
         }
-      }
 
-      // Interactive stages return their own handoff summary; a batch stage gets the
-      // engine-owned summarisation turn (only after success, never failing the stage).
-      let summary = result.summary ?? `${stageId}: ${status}`;
-      if (!interactive && status === "ok") {
-        try {
-          summary = await runner.summarise(ctx);
-        } catch {
-          /* keep the fallback summary; a summarise failure must not fail an ok stage */
+        // Per-stage MCP gateway proxy: holds this job's brokered MCP creds and injects them on
+        // outbound calls so the agent never sees them. Started below (Claude only) and stopped in
+        // `finish`, so minted tokens are discarded with the stage. Declared here so `finish` closes over it.
+        let gateway: McpGateway | undefined;
+
+        const meta: TraceMeta = {
+          tenantId: job.tenantId,
+          runId,
+          stageId,
+          jobId,
+          attempt,
+          runtime: agentConfig.runtime,
+          model: agentConfig.model,
+          sessionId: job.sessionId,
+          configDigest: digest(agentConfig),
+          startedAt: nowIso(),
+        };
+        const writer = createTraceWriter(ref.scratchPath, meta);
+        // Stream every written event to the hub as it is appended (the live, full-fidelity
+        // corpus). The event carries its writer-assigned seq, so the hub persists the
+        // identical record and can detect gaps. Best-effort; a missing sink is local-only.
+        const streamEvent = (e: TraceEvent): void =>
+          deps.trace?.event({ runId, stageId, attempt, tenantId: job.tenantId, event: e });
+        streamEvent(
+          writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "attempt-start" }),
+        );
+
+        // At stage exit: upload heavy spilled blobs + the finalised trace.jsonl archive to
+        // object storage (via hub-minted presigned URLs), then send the authoritative meta.
+        const shipFinalTrace = async (finalMeta: TraceMeta): Promise<void> => {
+          const sink = deps.trace;
+          if (!sink) return;
+          const base = { tenantId: job.tenantId, runId, stageId, attempt };
+          try {
+            for (const name of readdirSync(join(writer.dir, "blobs"))) {
+              const bytes = readFileSync(join(writer.dir, "blobs", name));
+              const { url } = await sink.requestBlobUrl({
+                ...base, sha256: name, size: bytes.length, contentType: "application/octet-stream", slot: "blob",
+              });
+              if (url) await putBytes(url, bytes, "application/octet-stream");
+            }
+          } catch {
+            /* best-effort; the streamed events are already persisted */
+          }
+          let archiveKey: string | undefined;
+          try {
+            const bytes = readFileSync(join(writer.dir, "trace.jsonl"));
+            const sha = createHash("sha256").update(bytes).digest("hex");
+            const { key, url } = await sink.requestBlobUrl({
+              ...base, sha256: sha, size: bytes.length, contentType: "application/x-ndjson", slot: "archive",
+            });
+            if (url) await putBytes(url, bytes, "application/x-ndjson");
+            archiveKey = key;
+          } catch {
+            /* best-effort */
+          }
+          sink.finalised({ ...base, meta: finalMeta, eventCount: writer.count(), ...(archiveKey ? { archiveKey } : {}) });
+        };
+
+        const finish = async (
+          status: JobStatus,
+          summary: string,
+          sessionId?: string,
+          costUsd?: number,
+          handedBackDoc?: { path: string; content: string },
+        ): Promise<JobResult> => {
+          active.delete(jobId);
+          turnQueues.delete(jobId);
+          await gateway?.stop().catch(() => undefined); // discard brokered MCP creds with the stage
+          gateway = undefined;
+          streamEvent(
+            writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "stage-exit", status }),
+          );
+          const endedAt = nowIso();
+          writer.finalise({ status, endedAt, ...(sessionId ? { sessionId } : {}) });
+          writeScratchState(ref!, job, attempt, status);
+          const finalMeta: TraceMeta = {
+            ...meta, status, endedAt,
+            ...(sessionId ? { sessionId } : {}),
+            ...(costUsd !== undefined ? { costUsd } : {}),
+          };
+          await shipFinalTrace(finalMeta).catch(() => undefined);
+          lastUsed.set(runId, Date.now());
+          // NB the `inFlight` decrement is NOT here: `finish` is not reached when the job throws before it
+          // (e.g. `createWorktree` failing on a stale branch claim), which left the run marked busy for ever
+          // and made it invisible to every reaper pass keyed on `isBusy` - exactly the runs that most needed
+          // collecting. It now lives in the `finally` of `runJob`, which every exit path goes through.
+          await applyRetention(runId).catch(() => undefined);
+          // When the stage intends a document (declared an `emitArtifact` path, or handed one back via
+          // `dahrk_stage_complete`) and succeeded, resolve it from whichever channel produced content
+          // so the engine can publish it (e.g. the `attach-document` action). Read-only; a miss returns
+          // undefined and the action surfaces the absence. Ordinary code/build stages are not scanned.
+          const wantsArtifact = agentConfig.emitArtifact !== undefined || handedBackDoc !== undefined;
+          const resolved =
+            status === "ok" && wantsArtifact
+              ? resolveStageArtifact(ref!, agentConfig.emitArtifact, handedBackDoc)
+              : undefined;
+          if (status === "ok" && wantsArtifact) {
+            const detail = resolved
+              ? `source=${resolved.source} path=${resolved.artifact.path} bytes=${resolved.artifact.content.length}`
+              : "no document resolved (declared path, tool handoff, and scratch/changed-file scans all empty)";
+            streamEvent(
+              writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "artifact", detail }),
+            );
+          }
+          return {
+            jobId,
+            status,
+            summary,
+            ...(sessionId ? { sessionId } : {}),
+            ...(costUsd !== undefined ? { costUsd } : {}),
+            ...(resolved ? { artifact: resolved.artifact } : {}),
+          };
+        };
+
+        // Component provisioning: overlay the run's pinned skills/commands/agents into the
+        // worktree `.claude/` before the runner starts, normalised per runtime (Claude writes files
+        // with repo-local precedence; Codex warns and skips). Idempotent, so re-dispatch on the sticky
+        // worktree is safe. Fail closed: a missing pinned component is a correctness problem, not
+        // cosmetic, so a materialise/overlay error fails the stage rather than running without it.
+        if (deps.packCache && job.provision && job.provision.length > 0) {
+          try {
+            const overlay = await overlayComponents({
+              worktreePath: ref.worktreePath,
+              runtime: agentConfig.runtime,
+              components: job.provision,
+              cache: deps.packCache,
+            });
+            const detail = `provision: ${overlay.written.length} written, ${overlay.skippedRepoLocal.length} repo-local, ${overlay.warnings.length} warning(s)`;
+            streamEvent(
+              writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "provision", detail }),
+            );
+            // Surface the summary (and any Codex warnings) to the hub so the overlay is observable.
+            const noteText = overlay.warnings.length > 0 ? `${detail}; ${overlay.warnings.join("; ")}` : detail;
+            deps.sendProgress({ jobId, kind: "observation", ts: nowIso(), text: noteText });
+          } catch (e) {
+            const msg = `component provisioning failed: ${(e as Error).message}`;
+            writer.append({ seq: 0, ts: nowIso(), type: "error", runtime: agentConfig.runtime, kind: "provision-failed", message: msg });
+            deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: msg });
+            return finish("fail", `${stageId}: ${msg}`, job.sessionId);
+          }
         }
-      }
-      // Keep the guardrail hit visible even when the stage still succeeded, so a reviewer can
-      // see that an action was blocked without the deny silently flipping the verdict to fail.
-      if (denied) summary += "\n\n(note: one or more tool actions were blocked by a deny-only policy guard.)";
 
-      return finish(status, summary, result.sessionId ?? job.sessionId, result.costUsd, result.artifact);
+        // Compose this Job's policies (workflow+stage builtins the engine threaded) with the
+        // edge's demo rules. The run-scoped counter is shared across the run's stages.
+        let counter = runToolCalls.get(runId);
+        if (!counter) {
+          counter = { count: 0 };
+          runToolCalls.set(runId, counter);
+        }
+        const jobRules = buildRules(job.policies ?? [], {
+          worktreePath: ref.worktreePath,
+          repoName: job.workspaceRef?.repo ?? "",
+          runToolCalls: counter,
+        });
+        const rules = [...jobRules, ...deps.rules];
+
+        // Policy at stage entry.
+        const entry = evaluatePolicies({ kind: "stage-entry", stageId }, rules);
+        if (entry.verdict === "deny") {
+          writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "policy-deny", detail: entry.reason });
+          return finish("fail", `${stageId}: denied at stage entry (${entry.policy})`, job.sessionId);
+        }
+
+        // Run the stage, intercepting tool actions for policy and streaming progress.
+        let denied = false;
+        const authorisedActions: string[] = [];
+        const runtime = agentConfig.runtime;
+        const actionKey = (tool: string, input: unknown): string => {
+          try {
+            return `${tool}\0${JSON.stringify(input)}`;
+          } catch {
+            return `${tool}\0`;
+          }
+        };
+        const policyReason = (verdict: PolicyOutcome): string => verdict.reason ?? `tool action denied by ${verdict.policy}`;
+        const recordDeny = (verdict: PolicyOutcome, toolUseId?: string): void => {
+          denied = true;
+          const reason = policyReason(verdict);
+          if (toolUseId) {
+            streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "observation", runtime, toolUseId, isError: true, output: { error: reason } }));
+          }
+          streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "state", runtime, event: "policy-deny", detail: reason }));
+          deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: reason });
+        };
+        const authorizeToolUse = (tool: string, input: unknown): PolicyOutcome => {
+          const verdict = evaluatePolicies({ kind: "action", stageId, tool, input }, rules);
+          if (verdict.verdict === "deny") {
+            recordDeny(verdict);
+          } else {
+            authorisedActions.push(actionKey(tool, input));
+          }
+          return verdict;
+        };
+        const onTrace = (event: TraceEvent): void => {
+          if (event.type === "action") {
+            const key = actionKey(event.tool, event.input);
+            const authorised = authorisedActions.indexOf(key);
+            if (authorised >= 0) {
+              authorisedActions.splice(authorised, 1);
+            } else {
+              const verdict = evaluatePolicies(
+                { kind: "action", stageId, tool: event.tool, input: event.input },
+                rules,
+              );
+              if (verdict.verdict === "deny") {
+                streamEvent(writer.append(event));
+                recordDeny(verdict, event.toolUseId);
+                return;
+              }
+            }
+          }
+          streamEvent(writer.append(event));
+          if (event.type !== "state") deps.sendProgress({ jobId, kind: event.type, ts: event.ts, ...previewOf(event) });
+        };
+
+        // Start the per-stage MCP gateway when the stage declares brokered MCP servers. Claude only:
+        // the Codex SDK has no MCP support, so a proxy for it would be dead weight (the codex adapter
+        // logs and ignores declared servers).
+        const mcpServers = agentConfig.mcpServers;
+        if (mcpServers && mcpServers.length > 0 && runtime === "claude-code") {
+          gateway = await startMcpGateway({ servers: mcpServers, creds: job.brokeredCreds ?? {} });
+        }
+
+        const runner = deps.makeRunner(runtime);
+        active.set(jobId, runner);
+        const ctx: PolicyAwareRunnerContext = {
+          config: agentConfig,
+          workspace: ref,
+          sessionId: job.sessionId,
+          ...(job.issueContext !== undefined ? { issueContext: job.issueContext } : {}),
+          ...(job.guidance !== undefined ? { guidance: job.guidance } : {}),
+          ...(job.gateFeedback !== undefined ? { gateFeedback: job.gateFeedback } : {}),
+          ...(job.attachedDocuments !== undefined ? { attachedDocuments: job.attachedDocuments } : {}),
+          ...(gateway ? { mcpProxyBaseUrl: gateway.baseUrl } : {}),
+          // brokered inference env for a managed node (no operator login). The runtime adapter
+          // (Pi) / container executor apply it as the inference process env, so the raw key is
+          // never surfaced to the agent's own tool calls. Absent on ambient nodes; inert for the Claude/
+          // Codex adapters, which use ambient inference.
+          ...(job.runtimeEnv ? { runtimeEnv: job.runtimeEnv } : {}),
+          // The adapter persists each runtime-native record under the attempt's raw/ sidecar
+          // and stamps the rawRef onto the emitted event.
+          writeRaw: writer.writeRaw,
+          authorizeToolUse,
+          // Wire the interactive AskUserQuestion elicitation seam (DHK-344): the adapter calls this when
+          // the agent asks a structured question, and the edge relays it to the hub as an `elicit` frame.
+          ...(deps.sendElicit
+            ? {
+                emitElicit: (question: ElicitQuestion) =>
+                  deps.sendElicit!({
+                    jobId,
+                    prompt: question.prompt,
+                    options: question.options,
+                    ...(question.multiSelect ? { multiSelect: true } : {}),
+                  }),
+              }
+            : {}),
+        };
+        // Interactive stages run a multi-turn conversation fed by relayed human turns (M5b);
+        // batch stages run to a terminal result. Both emit through the same onTrace.
+        const interactive = agentConfig.interaction === "interactive";
+        let result: Omit<JobResult, "jobId" | "summary"> & { summary?: string };
+        // Wall-clock kill (the contract `JobRequest.timeout` promises "on expiry the executor kills the
+        // runner; the engine marks the stage timeout"). Enforce it here so it covers batch AND interactive
+        // for both adapters: at the deadline we abort the runner via cancel() and force status `timeout`.
+        // This bounds real stage runtime below the hub's dispatch deadline (stage timeout + relay margin),
+        // so a stage is never re-dispatched while still legitimately executing - the safety prerequisite
+        // the re-dispatch leans on. (The edge de-dup in ws-client is the second guard.)
+        let timedOut = false;
+        const killMs = Math.max(0, Math.floor((job.timeout ?? 0) * 1000));
+        const killTimer =
+          killMs > 0
+            ? setTimeout(() => {
+                timedOut = true;
+                void runner.cancel();
+              }, killMs)
+            : undefined;
+        // NB: do NOT unref() this timer. It is the active mechanism of the timeout kill; an unref'd
+        // timer does not keep the event loop alive, so an otherwise-idle loop could drain before it
+        // fires and the kill would never happen. It is always cleared in the `finally` below, so it
+        // can never outlive the job.
+        try {
+          if (interactive) {
+            const mailbox = new ManagedMailbox<HumanTurn>();
+            turnQueues.set(jobId, mailbox);
+            result = await runner.runInteractive(ctx, mailbox, onTrace);
+          } else {
+            result = await runner.runBatch(ctx, onTrace);
+          }
+        } finally {
+          if (killTimer) clearTimeout(killTimer);
+        }
+        // A policy deny blocks the individual *action* (already recorded as a policy-deny trace
+        // event and streamed as a progress error); the deny-only guards are guardrails the agent
+        // is expected to route around, not stage killers. A single guard-blocked action must NOT
+        // poison the *stage* verdict: a stage the runner finished cleanly stays `ok` even if one of
+        // its tool actions was denied. (Previously any deny forced the whole stage to `fail`, so a
+        // recovered-from `rm -rf` on a throwaway scratch dir turned a correctly-completed build into
+        // a false-negative.) The deny still surfaces in the trace and in the summary note below.
+        let status: JobStatus = timedOut ? "timeout" : result.status;
+
+        // R4 stage-exit hooks run in the worktree only if the stage otherwise succeeded.
+        if (status === "ok" && job.hooks && job.hooks.length > 0) {
+          for (const cmd of job.hooks) {
+            try {
+              execFileSync("sh", ["-c", cmd], { cwd: ref.worktreePath, stdio: ["pipe", "pipe", "pipe"] });
+            } catch (e) {
+              status = "fail";
+              writer.append({ seq: 0, ts: nowIso(), type: "error", runtime, kind: "hook-failed", message: `hook "${cmd}" failed: ${(e as Error).message}` });
+              break;
+            }
+          }
+        }
+
+        // Interactive stages return their own handoff summary; a batch stage gets the
+        // engine-owned summarisation turn (only after success, never failing the stage).
+        let summary = result.summary ?? `${stageId}: ${status}`;
+        if (!interactive && status === "ok") {
+          try {
+            summary = await runner.summarise(ctx);
+          } catch {
+            /* keep the fallback summary; a summarise failure must not fail an ok stage */
+          }
+        }
+        // Keep the guardrail hit visible even when the stage still succeeded, so a reviewer can
+        // see that an action was blocked without the deny silently flipping the verdict to fail.
+        if (denied) summary += "\n\n(note: one or more tool actions were blocked by a deny-only policy guard.)";
+
+        return finish(status, summary, result.sessionId ?? job.sessionId, result.costUsd, result.artifact);
+      } finally {
+        inFlight.set(runId, Math.max(0, (inFlight.get(runId) ?? 1) - 1));
+      }
     },
 
     async runPush(job) {
