@@ -13,7 +13,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import type { WorkspaceRef } from "@dahrk/contracts";
 
 /** Minimal logger; defaults to a no-op so the library is quiet in tests. */
@@ -45,6 +45,12 @@ export interface WorktreeSpec {
    * branched from `baseBranch` under this name.
    */
   branch?: string;
+  /**
+   * Optional ref to seed the worktree from, taking precedence over both the remote branch and the base.
+   * Used to re-enter a run from work preserved by an earlier backup push (DHK-264), so a retry resumes
+   * from the committed WIP rather than starting over from the base. Ignored when it does not resolve.
+   */
+  seedRef?: string;
   /**
    * Short-lived git credential brokered by the hub for this job, used only to clone/fetch
    * over HTTPS. Delivered to git via a transient `GIT_ASKPASS` helper outside the worktree, never on
@@ -181,6 +187,13 @@ export interface GitServiceOptions {
   authorName?: string;
   /** Author/committer email for harness-made commits. Env: DAHRK_GIT_AUTHOR_EMAIL. */
   authorEmail?: string;
+  /**
+   * Whether a run is currently executing a stage on this node, keyed by runId. Consulted before evicting
+   * a worktree that still claims the branch a new run wants: a live holder is a routing bug and must
+   * surface as an error, not be stomped. Absent = nothing is busy (the safe default for a fresh process,
+   * where no run can be mid-stage anyway).
+   */
+  isBusy?: (runId: string) => boolean;
   logger?: GitLogger;
 }
 
@@ -209,12 +222,21 @@ export function resolveWorktreesDir(override?: string): string {
   return override ?? process.env.DAHRK_WORKTREES_DIR ?? process.env.SKAKEL_WORKTREES_DIR ?? join(homedir(), ".dahrk", "worktrees");
 }
 
+/**
+ * Resolve the absolute per-repo bare-mirror base. Exported for the same reason as
+ * {@link resolveWorktreesDir}: the reaper must reconcile against the SAME mirrors this service writes,
+ * and a second copy of this fallback chain would silently drift.
+ */
+export function resolveMirrorsDir(override?: string): string {
+  return override ?? process.env.DAHRK_MIRRORS_DIR ?? process.env.SKAKEL_MIRRORS_DIR ?? join(homedir(), ".dahrk", "mirrors");
+}
+
 export function createGitService(opts: GitServiceOptions = {}): GitService {
   const worktreesDir = resolveWorktreesDir(opts.worktreesDir);
-  const mirrorsDir =
-    opts.mirrorsDir ?? process.env.DAHRK_MIRRORS_DIR ?? process.env.SKAKEL_MIRRORS_DIR ?? join(homedir(), ".dahrk", "mirrors");
+  const mirrorsDir = resolveMirrorsDir(opts.mirrorsDir);
   const authorName = opts.authorName ?? process.env.DAHRK_GIT_AUTHOR_NAME ?? "Dahrk";
   const authorEmail = opts.authorEmail ?? process.env.DAHRK_GIT_AUTHOR_EMAIL ?? "noreply@dahrk.ai";
+  const isBusy = opts.isBusy;
   const log = opts.logger ?? noopLogger;
 
   const git = (cwd: string, args: string[], env?: NodeJS.ProcessEnv): string =>
@@ -341,12 +363,156 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
   const mirrorPathFor = (repoId: string): string => join(mirrorsDir, sanitizeBranchName(repoId));
 
   /**
-   * Ensure a bare mirror of the repo exists and is current: `clone --mirror` on first sight,
-   * `remote update --prune` after. The mirror's `refs/heads/*` track the remote, so the base branch
-   * resolves as a local ref for `worktree add`. Returns the mirror path plus whether the refresh
-   * actually landed: a fresh clone is current by construction, an existing mirror only if the
-   * `remote update` succeeded. A swallowed refresh failure means the cached base may be stale, which
-   * the caller must reconcile before branching a new run off it.
+   * The worktrees a mirror has registered, from `git worktree list --porcelain`. `branch` is the short
+   * name the worktree's admin HEAD symrefs, which git reports even when the ref itself no longer exists
+   * (the dangling-claim case that blocks `worktree add`), so this is what a collision check must consult.
+   */
+  const listWorktrees = (mirror: string): Array<{ path: string; branch: string }> => {
+    let out: string;
+    try {
+      out = git(mirror, ["worktree", "list", "--porcelain"]);
+    } catch {
+      return [];
+    }
+    const entries: Array<{ path: string; branch: string }> = [];
+    let path = "";
+    for (const line of out.split("\n")) {
+      if (line.startsWith("worktree ")) path = line.slice(9).trim();
+      else if (line.startsWith("branch ")) {
+        const branch = line.slice(7).trim().replace(/^refs\/heads\//, "");
+        if (path) entries.push({ path, branch });
+      } else if (line.trim() === "") path = "";
+    }
+    return entries;
+  };
+
+  /**
+   * Remove one worktree by path and prune the mirror's admin entry. Shared by `teardownWorktree` and
+   * the stale-claim clearing in `createWorktree`, so both drop the *registration* (not just the dir):
+   * a leftover admin entry keeps claiming its branch name for ever, which is what wedged every re-run
+   * of an issue (DHK-371). Safe when the directory is already gone.
+   */
+  const teardownWorktreePath = (mirror: string, worktreePath: string): void => {
+    try {
+      git(mirror, ["worktree", "remove", "--force", worktreePath]);
+    } catch (e) {
+      log.warn(`git worktree remove failed for ${worktreePath}: ${(e as Error).message}`);
+    }
+    rmSync(worktreePath, { recursive: true, force: true });
+    gitOk(mirror, ["worktree", "prune"]);
+  };
+
+  /** The tracking refspec every mirror must use. See `migrateMirrorConfig` for why. */
+  const TRACKING_REFSPEC = "+refs/heads/*:refs/remotes/origin/*";
+
+  /**
+   * Bring a mirror onto the tracking-refspec layout, idempotently (DHK-371).
+   *
+   * A `--mirror` clone sets `remote.origin.mirror=true` and the refspec `+refs/*:refs/*`, which makes
+   * every fetch force-sync LOCAL refs to match the remote exactly. Our run branches live in
+   * `refs/heads/*` and are deliberately absent from the remote until deliver pushes them (and GitHub
+   * deletes the head branch on merge, so they leave again). A `--mirror` fetch therefore DELETES the
+   * branch of any run in flight, orphaning its commits and leaving the worktree on an unborn HEAD.
+   *
+   * The fix is a namespace split: `refs/remotes/origin/*` is theirs (fetched and pruned), `refs/heads/*`
+   * is ours (run branches, never touched by a fetch). This migrates an existing legacy mirror in place
+   * on the next refresh: no re-clone, no operator step, and safe to run against an already-migrated one.
+   */
+  const migrateMirrorConfig = (mirror: string, repoId: string): void => {
+    const isMirror = gitOk(mirror, ["config", "--get", "remote.origin.mirror"]);
+    const refspecs = (() => {
+      try {
+        return git(mirror, ["config", "--get-all", "remote.origin.fetch"]).split("\n").map((s) => s.trim());
+      } catch {
+        return [];
+      }
+    })();
+    if (!isMirror && refspecs.length === 1 && refspecs[0] === TRACKING_REFSPEC) return; // already migrated
+
+    log.info(`mirror ${repoId}: migrating to the tracking-refspec layout (was mirror=${isMirror})`);
+    // `mirror=true` also makes any `git push origin` from here a MIRROR push, which would delete remote
+    // branches absent locally. Nothing pushes from the mirror today, but that is not a footgun to leave
+    // armed next to a `worktree add --force`. Unset it and any push refspec along with it.
+    for (const args of [
+      ["config", "--unset-all", "remote.origin.mirror"],
+      ["config", "--unset-all", "remote.origin.push"],
+    ]) {
+      gitOk(mirror, args); // exit 5 = "nothing to unset", which is success here
+    }
+    git(mirror, ["config", "--replace-all", "remote.origin.fetch", TRACKING_REFSPEC]);
+  };
+
+  /**
+   * Park the tip of a local branch we are about to `-B` (create-or-reset) away, but only when that tip
+   * holds commits the new start point does not already contain. This is the insurance on `-B`: an
+   * unpushed run branch can never be silently destroyed by the next run of the same issue. The parked
+   * ref lives outside `refs/heads/*` so it claims no branch name and no worktree, and is expired by the
+   * reaper. Best-effort throughout: salvage must never be the reason a run fails to start.
+   */
+  const salvageOrphanedTip = (mirror: string, branchName: string, start: string): void => {
+    try {
+      if (!gitOk(mirror, ["rev-parse", "--verify", "-q", `refs/heads/${branchName}`])) return;
+      // `merge-base --is-ancestor <tip> <start>` succeeds iff start already contains tip => nothing unique.
+      if (gitOk(mirror, ["merge-base", "--is-ancestor", `refs/heads/${branchName}`, start])) return;
+      const sha = git(mirror, ["rev-parse", `refs/heads/${branchName}`]).trim();
+      const ref = `refs/dahrk/salvage/${branchName}/${sha.slice(0, 12)}`;
+      git(mirror, ["update-ref", ref, sha]);
+      log.warn(`parked orphaned tip of ${branchName} (${sha.slice(0, 8)}) at ${ref} before reset`);
+    } catch (e) {
+      log.warn(`could not salvage tip of ${branchName}: ${(e as Error).message}`);
+    }
+  };
+
+  /**
+   * Garbage-collect the "shadow" local heads a legacy `--mirror` layout left in `refs/heads/*` (the
+   * remote's branches copied straight in, e.g. a now-frozen `main`). After migration those are stale
+   * duplicates of `refs/remotes/origin/*` and would shadow the real base.
+   *
+   * A shadow head is defined narrowly: a local head that MIRRORS A REMOTE BRANCH OF THE SAME NAME. It is
+   * tempting to instead delete any head already contained in some origin ref, but that is wrong and
+   * dangerous: a run branch that has been created but has not committed yet sits exactly at the base tip,
+   * so it is "contained" in `origin/main` and would be deleted out from under its live worktree - which
+   * is the very data loss this whole change exists to stop. An unpushed run branch has no same-named
+   * origin counterpart, so this rule always keeps it.
+   */
+  const gcShadowHeads = (mirror: string): void => {
+    let heads: string[];
+    try {
+      heads = git(mirror, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } catch {
+      return;
+    }
+    const held = new Set(listWorktrees(mirror).map((w) => w.branch));
+    const ownHead = (() => {
+      try {
+        return git(mirror, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+      } catch {
+        return "";
+      }
+    })();
+    for (const h of heads) {
+      if (h === ownHead || held.has(h)) continue;
+      // Only a head that duplicates a same-named remote branch is a shadow. Anything else is ours.
+      if (!gitOk(mirror, ["rev-parse", "--verify", "-q", `refs/remotes/origin/${h}`])) continue;
+      // And only when the remote copy is not BEHIND us, so a local head carrying commits the remote has
+      // not seen (a delivered branch we pushed but whose push has not landed) is never dropped.
+      if (!gitOk(mirror, ["merge-base", "--is-ancestor", `refs/heads/${h}`, `refs/remotes/origin/${h}`])) continue;
+      gitOk(mirror, ["branch", "-D", h]);
+    }
+  };
+
+  /**
+   * Ensure a bare mirror of the repo exists and is current. On first sight: `init --bare` + a tracking
+   * refspec + `fetch --prune`. Deliberately NOT `clone --mirror` (which arms the ref-destroying layout
+   * described in `migrateMirrorConfig`) and NOT `clone --bare` (which copies remote heads straight into
+   * `refs/heads/*`, reintroducing the same shadow-head footgun). Starting from an empty `refs/heads/*`
+   * means every local head is, by construction, ours.
+   *
+   * Returns the mirror path plus whether the refresh actually landed: a swallowed refresh failure means
+   * the cached base may be stale, which the caller must reconcile before branching a new run off it.
    */
   const ensureMirror = (
     repoId: string,
@@ -357,20 +523,25 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     if (existsSync(mirror) && gitOk(mirror, ["rev-parse", "--git-dir"])) {
       log.info(`refreshing mirror ${repoId}`);
       try {
-        git(mirror, ["remote", "update", "--prune"], netEnv(authEnv));
+        migrateMirrorConfig(mirror, repoId);
+        git(mirror, ["fetch", "--prune", "origin"], netEnv(authEnv));
+        gcShadowHeads(mirror);
         return { mirror, refreshed: true };
       } catch (e) {
         // A refresh failure (offline, transient) does not abort here: the cached mirror still serves
         // continuation (an existing per-issue branch is already folded in). But the base may now be
         // stale, so we flag it; branching a NEW run off the base re-checks freshness.
-        log.warn(`mirror remote update failed for ${repoId}: ${(e as Error).message}`);
+        log.warn(`mirror fetch failed for ${repoId}: ${(e as Error).message}`);
         return { mirror, refreshed: false };
       }
     }
-    mkdirSync(mirrorsDir, { recursive: true });
+    mkdirSync(mirror, { recursive: true });
     const cloneUrl = authEnv ? withTokenUser(gitUrl) : gitUrl;
     log.info(`cloning mirror ${repoId} from ${gitUrl}`);
-    gitBare(["clone", "--mirror", cloneUrl, mirror], netEnv(authEnv));
+    gitBare(["init", "--bare", "--quiet", mirror]);
+    git(mirror, ["remote", "add", "origin", cloneUrl]);
+    git(mirror, ["config", "--replace-all", "remote.origin.fetch", TRACKING_REFSPEC]);
+    git(mirror, ["fetch", "--prune", "origin"], netEnv(authEnv));
     return { mirror, refreshed: true };
   };
 
@@ -406,26 +577,56 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       try {
         const { mirror, refreshed } = ensureMirror(repoId, gitUrl, auth?.env);
 
-        // Add the per-run worktree off the mirror. Check out the branch if it already exists - either a
-        // re-clone of this run's branch, or the stable per-issue branch from a prior session (the mirror
-        // refresh above folded the remote branch in), so a re-summon continues from its commits.
-        // `--force` lets a new session's worktree check out a branch a not-yet-torn-down prior worktree
-        // still holds (sessions on one issue are sequential; see plan risk 6). Otherwise branch from base.
-        if (gitOk(mirror, ["rev-parse", "--verify", branchName])) {
-          git(mirror, ["worktree", "add", "--force", worktreePath, branchName]);
-        } else {
-          // A NEW run branches from the base, which MUST be current. Branching off a stale cached base
-          // silently produces work against an old tree a run re-implemented an already-merged
-          // fix because its mirror's `main` lagged the remote by six commits. If the refresh above did
-          // not land, fetch the base authoritatively now; if that also fails we throw rather than branch
-          // from a base we cannot confirm is fresh (truthful failure over a phantom-stale run).
-          if (!refreshed) {
-            log.info(`mirror refresh failed; fetching base ${baseBranch} before branching ${branchName}`);
-            git(mirror, ["fetch", "origin", `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`], netEnv(auth?.env));
+        // Clear any stale claim on this branch BEFORE adding. A worktree that was never torn down keeps
+        // claiming its branch for ever - even after the ref itself is gone - and git's `die_if_checked_out`
+        // then refuses the add ("'<branch>' is already used by worktree at ..."). That wedged every re-run
+        // of an issue (DHK-371). Prune first (drops entries whose dir has vanished), then evict whatever
+        // still holds the name. A holder belonging to a run that is genuinely in flight is NOT evicted:
+        // two live runs on one issue is a routing bug, and a truthful error beats stomping a live worktree.
+        gitOk(mirror, ["worktree", "prune"]);
+        for (const w of listWorktrees(mirror)) {
+          if (w.branch !== branchName || w.path === worktreePath) continue;
+          const holder = basename(w.path);
+          if (isBusy?.(holder)) {
+            throw new Error(`branch ${branchName} is held by in-flight run ${holder} (${w.path})`);
           }
-          log.info(`creating worktree at ${worktreePath} from ${baseBranch} on ${branchName}`);
-          git(mirror, ["worktree", "add", "-b", branchName, worktreePath, baseBranch]);
+          log.warn(`clearing stale worktree ${w.path} which still claims ${branchName}`);
+          teardownWorktreePath(mirror, w.path);
         }
+
+        // Pick the start point deterministically. A leftover LOCAL `refs/heads/<branch>` is never a start
+        // point: it may be a corpse from a killed run, or a ref the previously-failing `add -b` re-created
+        // moments before it aborted, and branching off it silently bases the run on a stale commit instead
+        // of the base. Continuation is expressed by the REMOTE branch (a prior session that delivered),
+        // which is exactly what `WorkspaceRef.branch` documents.
+        const remoteBranch = `refs/remotes/origin/${branchName}`;
+        const remoteBase = `refs/remotes/origin/${baseBranch}`;
+        if (!refreshed) {
+          // A NEW run branches from the base, which MUST be current. Branching off a stale cached base
+          // silently produces work against an old tree: a run once re-implemented an already-merged fix
+          // because its mirror lagged the remote. If the refresh did not land, fetch the base
+          // authoritatively now; if that also fails we throw rather than branch from a base we cannot
+          // confirm is fresh (truthful failure over a phantom-stale run).
+          log.info(`mirror refresh failed; fetching base ${baseBranch} before branching ${branchName}`);
+          git(mirror, ["fetch", "origin", `+refs/heads/${baseBranch}:${remoteBase}`], netEnv(auth?.env));
+        }
+        const seed = spec.seedRef && gitOk(mirror, ["rev-parse", "--verify", "-q", spec.seedRef])
+          ? spec.seedRef
+          : undefined;
+        const start = seed ?? (gitOk(mirror, ["rev-parse", "--verify", "-q", remoteBranch]) ? remoteBranch : remoteBase);
+        if (!gitOk(mirror, ["rev-parse", "--verify", "-q", start])) {
+          throw new Error(`start point '${start}' does not resolve in mirror ${repoId}`);
+        }
+
+        // Park any local tip we are about to discard, so `-B` can never silently destroy work. Only when
+        // the existing head is NOT already contained in the start point (i.e. it holds unique commits).
+        salvageOrphanedTip(mirror, branchName, start);
+
+        // `-B` is create-or-reset and is transactional with the checkout, so a branch ref left behind by a
+        // previously failed `add -b` is harmless. `--force` is the belt, not the mechanism: the stale
+        // claims were already cleared above, and this only covers a race.
+        log.info(`creating worktree at ${worktreePath} from ${start} on ${branchName}`);
+        git(mirror, ["worktree", "add", "--force", "-B", branchName, worktreePath, start]);
       } finally {
         auth?.cleanup();
       }
@@ -454,11 +655,13 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       // it (so continuation drops it), stages everything else, and commits only if the worktree is dirty.
       const { headSha: committedSha, dirty } = commitPending(worktreePath, opts.message);
       let headSha = committedSha;
-      // How far the branch is ahead of its base, for a human-readable "N commits" in Linear. The base
-      // may be a bare name (e.g. `main`) resolved via the mirror's tracking ref; best-effort, so a
-      // failure (base not present locally) yields 0 rather than aborting the push.
+      // How far the branch is ahead of its base, for a human-readable "N commits" in Linear. Freshest
+      // form first: `FETCH_HEAD` is the base we just fetched above, then the remote-tracking ref. A bare
+      // name (`main`) is LAST because it resolves to a local head, which under the old `--mirror` layout
+      // happened to track the remote but is now ours and could be stale or absent (DHK-371). Best-effort,
+      // so a failure (base not present under any name) yields 0 rather than aborting the push.
       let commitsAhead = 0;
-      for (const baseRef of [opts.base, `origin/${opts.base}`, `refs/heads/${opts.base}`]) {
+      for (const baseRef of ["FETCH_HEAD", `origin/${opts.base}`, opts.base, `refs/heads/${opts.base}`]) {
         if (!baseRef) continue;
         try {
           commitsAhead = Number.parseInt(git(worktreePath, ["rev-list", "--count", `${baseRef}..HEAD`]).trim(), 10) || 0;
@@ -657,20 +860,10 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     },
 
     async teardownWorktree(ref) {
-      if (!existsSync(ref.worktreePath)) return;
-      // Worktree bookkeeping lives in the mirror; run the remove/prune there.
-      const mirror = mirrorPathFor(ref.repoId);
-      try {
-        git(mirror, ["worktree", "remove", "--force", ref.worktreePath]);
-      } catch (e) {
-        log.warn(`git worktree remove failed for ${ref.worktreePath}: ${(e as Error).message}`);
-      }
-      rmSync(ref.worktreePath, { recursive: true, force: true });
-      try {
-        git(mirror, ["worktree", "prune"]);
-      } catch {
-        /* best-effort */
-      }
+      // No `existsSync` guard: a directory deleted by hand still leaves the mirror's admin entry, which
+      // goes on claiming its branch name for ever. The prune inside `teardownWorktreePath` is exactly
+      // what clears that, so this must run even when the dir is already gone (DHK-371).
+      teardownWorktreePath(mirrorPathFor(ref.repoId), ref.worktreePath);
     },
   };
 }
