@@ -19,6 +19,23 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+- Make a release one PR instead of two, and drop the approval gates. `scripts/release.mjs` now accepts
+  uncommitted edits confined to the two changelogs and carries them onto the release branch, so notes
+  backfilled by the audit land in the same commit as the version bump; previously they had to be
+  committed to `main` first, which forced a separate changelog PR (#33 before #34 in 0.1.7). It also
+  ignores untracked files, which cannot reach the release commit anyway (`git commit -am` stages only
+  tracked paths) but used to fail preflight. `/dahrk-release` now runs straight through to the PR and
+  asks nothing, halting only on a real blocker (failed preflight, a `@dahrk/*` dep that is unpublished
+  or ships `src`, a failed smoke). It never merges: the PR is the review surface and the merge is the
+  publish trigger.
+
+- Protect `main`. It had no protection at all, so nothing stopped a red PR being merged — and since the
+  merge is what tags and publishes, that meant a broken release could reach npm, which is unfixable
+  (a version can never be reused). `build (22)`, `build (24)` and `changelog` are now required checks,
+  with force-pushes and deletion blocked. Admins are not bound, so a solo maintainer can still merge
+  their own release PR without a second reviewer. Also created the `no-changelog` label that `ci.yml`
+  has always tested for but which did not exist, leaving the documented escape hatch unusable.
+
 ## [0.1.7] - 2026-07-11
 
 - Default an interactive stage's exit to `either` rather than `gate` in all three runtime adapters
