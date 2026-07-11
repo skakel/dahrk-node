@@ -31,12 +31,20 @@ import { randomUUID } from "node:crypto";
 import { homedir, platform as osPlatform } from "node:os";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { detectRuntimes, startEdgeNode, type EdgeOptions } from "@dahrk/edge";
+import {
+  createNodeLoggerFromEnv,
+  detectRuntimes,
+  ENROLMENT_REJECTED_EXIT_CODE,
+  startEdgeNode,
+  type EdgeOptions,
+} from "@dahrk/edge";
 import type { CredentialMode, Runtime } from "@dahrk/contracts";
 import { parseCli, usage, type RunFlags, type StartFlags } from "./cli.js";
+import { runDiagnose, defaultDiagnoseDeps, defaultBundlePath } from "./diagnose.js";
 import { runDoctor } from "./doctor.js";
 import { defaultLockDeps, acquireLock } from "./lock.js";
 import { defaultLogsDeps, rotateIfLarge, runLogs } from "./logs.js";
+import { installProcessSafetyNet, writeCrashRecord } from "./process-safety.js";
 import { runPreflight } from "./preflight.js";
 import { runNodeStart, runNodeStop, runServiceInstall, runServiceUninstall } from "./service.js";
 import { fetchLatestVersion, runUpdate } from "./update.js";
@@ -51,8 +59,11 @@ import {
 } from "./update-check.js";
 import { runStatus, type StatusDeps } from "./status.js";
 import {
+  crashDir,
+  jsonlLogFile,
   legacyStateDir,
   lockFile,
+  logDir,
   logFiles,
   persistEnrolment,
   readState,
@@ -274,6 +285,21 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
   rotateIfLarge(files.err);
 
   const nodeId = resolveNodeId(env, { ephemeral: flags.ephemeral });
+
+  // The node's own structured log. Everything below logs through this: stdout keeps the exact line-tagged
+  // markers it always printed (so the supervisor's node.out.log is unchanged), and the same records land in
+  // node.jsonl with levels, correlation ids and stacks - at `debug`, whatever stdout is set to, because you
+  // never learn you wanted debug until after the incident.
+  const logger = createNodeLoggerFromEnv(env, logDir(env), { nodeId, clientVersion: CLIENT_VERSION });
+
+  // The net under every best-effort `.catch()` seam in the node. Before this, one stray rejection from any
+  // background path killed the process and printed a single line with no stack.
+  installProcessSafetyNet({
+    logger,
+    crashDir: crashDir(env),
+    clientVersion: CLIENT_VERSION,
+    ...(env.DAHRK_CRASH_EXIT === "1" ? { exitOnCrash: true } : {}),
+  });
   const token = resolveEnrolToken(env, { ephemeral: flags.ephemeral });
   if (token) env.DAHRK_ENROL_TOKEN = token;
   const runtimes = await resolveRuntimes(env);
@@ -291,6 +317,7 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
   const persist = token !== undefined && !flags.ephemeral;
   await startEdgeNode({
     ...buildEdgeOptions(env, resolved),
+    logger,
     ...(persist
       ? {
           onEnrolled: (welcome) =>
@@ -501,7 +528,36 @@ async function main(): Promise<void> {
     }
     case "logs": {
       const env = applyEnvAliases(process.env);
-      process.exitCode = await runLogs(parsed.flags, defaultLogsDeps(logFiles(env)));
+      process.exitCode = await runLogs(parsed.flags, defaultLogsDeps(logFiles(env), jsonlLogFile(env)));
+      break;
+    }
+    case "diagnose": {
+      const env = applyEnvAliases(process.env);
+      // Run the doctor into a buffer rather than the terminal: its verdict belongs IN the bundle, so the
+      // bundle answers "was the host even sane?" without us having to ask for a second paste.
+      const doctorLines: string[] = [];
+      const doctor = async (): Promise<string[]> => {
+        await runDoctor(
+          {
+            ...(resolveEnrolToken(env) ? { token: resolveEnrolToken(env) as string } : {}),
+            hubUrl: env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL,
+          },
+          { out: (line: string) => void doctorLines.push(line) },
+        );
+        return doctorLines;
+      };
+      process.exitCode = await runDiagnose(
+        defaultDiagnoseDeps(
+          {
+            stateFile: stateFile(env),
+            jsonlFile: jsonlLogFile(env),
+            crashDir: crashDir(env),
+            outFile: parsed.flags.out ?? defaultBundlePath(process.cwd(), new Date()),
+          },
+          CLIENT_VERSION,
+          doctor,
+        ),
+      );
       break;
     }
   }
@@ -525,7 +581,29 @@ if (invokedAsEntrypoint) {
     // A fatal enrolment rejection (bad/missing token) rejects startEdgeNode before it ever connects.
     // The edge already set process.exitCode (78 = EX_CONFIG) so pm2 can stop rather than
     // crash-loop; surface the message and exit with that code instead of a generic unhandled-rejection 1.
+    const enrolmentRejected = process.exitCode === ENROLMENT_REJECTED_EXIT_CODE;
     console.error(err instanceof Error ? err.message : String(err));
+
+    // For a config error the message IS the answer and a stack is just noise. For anything else the
+    // stack is the whole point - and this handler used to throw it away, which is why a node that died
+    // on boot left nothing to read. Persist it either way: `dahrk diagnose` collects crash records, and
+    // a node that will not start is exactly when you need one.
+    if (!enrolmentRejected) {
+      if (err instanceof Error && err.stack) console.error(err.stack);
+      const env = applyEnvAliases(process.env);
+      writeCrashRecord(crashDir(env), {
+        at: new Date().toISOString(),
+        kind: "uncaughtException",
+        name: err instanceof Error ? err.name : typeof err,
+        message: err instanceof Error ? err.message : String(err),
+        ...(err instanceof Error && err.stack ? { stack: err.stack } : {}),
+        clientVersion: CLIENT_VERSION,
+        nodeVersion: process.version,
+        platform: process.platform,
+        arch: process.arch,
+        uptimeSec: Math.round(process.uptime()),
+      });
+    }
     process.exit(process.exitCode || 1);
   });
 }

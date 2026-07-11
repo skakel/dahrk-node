@@ -46,6 +46,35 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- **The node keeps a proper log now, and it is written at `debug` whether or not you asked for it.** It had
+  no logger at all before: bare lines on stdout, with no levels, no timestamps, and nothing kept. An
+  incident on a node left nothing behind to read.
+
+  There are now two logs. The transcript (`node.out.log` / `node.err.log`) is unchanged - the same lines,
+  as printed. Alongside it, `~/.dahrk/logs/node.jsonl` holds the structured record: level, timestamp,
+  correlation ids, and full error stacks, rotated at 10 MB across five generations.
+
+  The important part is that **the file is written at `debug` even when your terminal is not.**
+  `DAHRK_LOG_LEVEL` (default `info`) governs only what reaches stdout. Debug logging you have to switch on
+  *before* the incident is no use, because you find out you wanted it *afterwards* - so the node always
+  writes the detail, and the evidence for a failure is already on disk by the time you go looking. At
+  `debug` you also see every git operation: clone, mirror refresh, worktree create, fetch. (#40)
+- **`dahrk logs --run <runId>`**, plus `--level` and `--json`. Every line the node writes during a stage
+  carries the same identifiers the hub knows that run by, so a node's account of a run and the hub's are
+  finally the same story told from two ends. A bare `dahrk logs` still tails the transcript exactly as
+  before. (#40)
+- **`dahrk diagnose`** - a support bundle you can actually read. It collects this node's identity, version
+  and host, the `doctor` verdict, the tail of the structured log, and every crash record, and writes them
+  to **one local JSON file**. It uploads nothing, and there is no flag to make it. The enrolment token is
+  removed rather than redacted, and no source, prompts or issue content go in.
+
+  This is deliberate. Debugging a node running on someone else's machine means asking them for it, and the
+  point of the bundle is that saying yes is safe: they can open it, read every byte, and decide. (#40)
+- A crash now leaves something behind. Uncaught exceptions and unhandled rejections are logged with a full
+  stack and written to `~/.dahrk/logs/crashes/<timestamp>.json`, and the node carries on rather than dying
+  (set `DAHRK_CRASH_EXIT=1` if you would rather your supervisor restart it). The crash record is a separate
+  file from the log on purpose: the log rotates, and a crash-loop will happily push its own first cause out
+  of it. (#40)
 - `dahrk stop`, `dahrk restart`, and `dahrk logs [-f] [-n <lines>]`. `stop` was previously
   `unknown command: stop` - the only way to stop a node was `dahrk service uninstall`, which also removed
   it. A stopped node stays stopped across reboots until the next `start`, and `dahrk status` now tells a
@@ -61,6 +90,26 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Fixed
 
+- **Git was completely silent.** The worktree layer has always had a logging seam, with something useful to
+  say on every clone, mirror refresh and worktree create - but nothing was ever plugged into it, so it
+  discarded every line. On a real node, no git operation has ever been logged. They are now, at `debug`,
+  which is exactly what you want when a stage fails before the agent even starts. (#40)
+- Credentials could reach a log line. Now that the node logs git output and agent errors, the log itself
+  becomes somewhere a token could land - a git failure will happily echo the remote URL it failed on,
+  credentials and all. Everything written to a log is scrubbed first: values under sensitive keys,
+  credentials embedded in URLs (`https://user:secret@host`), and token-shaped strings anywhere in free text.
+  It errs on the side of dropping: a redacted value costs you a re-run, a leaked token rather more. (#40)
+- Failures on the node's best-effort paths vanished without trace. The worst of them: if shipping a stage's
+  final trace to the hub failed, the hub simply ended up with **no trace for that stage** - the whole record
+  of what the agent did - and nobody ever found out why. These paths are still best-effort and still never
+  fatal; they are just no longer silent. (#40)
+- A node piped into a command that exits first (`dahrk start | head`) would write spurious crash records.
+  Closing the pipe made the next write raise `EPIPE`, which surfaced as an uncaught exception, which the
+  crash handler then tried to log through the very output that had just gone away. A logger must never be
+  the cause of a crash. (#40)
+- The containerised Pi runtime could hang. Its error output was piped and then never read, so a container
+  with much to say would fill the pipe buffer and block on its next write - with the explanation for the
+  stall sitting unread in the pipe. (#40)
 - Two nodes could run at once on the same machine - `dahrk service install` followed by `dahrk start` in a
   terminal was enough. Because a node's id is persisted and re-presented on every dial, that is not two
   nodes: it is one node dialling the hub twice and racing itself for the Jobs it is given. A node now takes
