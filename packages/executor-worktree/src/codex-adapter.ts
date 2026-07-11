@@ -89,7 +89,10 @@ export function createCodexRunner(): Runner {
     async runInteractive(ctx, turns, onTrace) {
       const emit = makeEmit("codex", onTrace);
       const t = openThread(ctx);
-      const exit = ctx.config.exit ?? "gate";
+      // Default to `either`, not `gate` (DHK-363): with `gate` the stage-complete tool is disabled,
+      // so an interactive stage can only end `ok` if the human happens to type "allow"/"approve" -
+      // a keyword nothing tells them about. A stage that omits `exit` must still be completable.
+      const exit = ctx.config.exit ?? "either";
       if (exit === "tool" || exit === "either") {
         // Tool-exit needs an in-process MCP tool wired into the Codex thread, which is
         // unproven and not required by M4 acceptance (Codex acceptance is batch-only).
