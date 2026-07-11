@@ -125,6 +125,23 @@ test("a corrupt state file reads as empty rather than wedging the boot", () => {
   });
 });
 
+test("the advertised runtime set round-trips, so a boot can diff against the prior run (DHK-390)", () => {
+  withStateDir((env) => {
+    writeState(env, { runtimes: ["claude-code", "codex", "pi"] });
+    assert.deepEqual(readState(stateFile(env)).runtimes, ["claude-code", "codex", "pi"]);
+    // Persisting the token later must not drop the runtime set (writeState merges).
+    persistEnrolment(env, { token: "sket_abc", name: "n", tenantId: "t_default" });
+    assert.deepEqual(readState(stateFile(env)).runtimes, ["claude-code", "codex", "pi"]);
+  });
+});
+
+test("a bogus runtime id in node.json is dropped rather than smuggled into the diff", () => {
+  withStateDir((env, dir) => {
+    writeFileSync(join(dir, "node.json"), JSON.stringify({ runtimes: ["claude-code", "bogus", 7] }));
+    assert.deepEqual(readState(join(dir, "node.json")).runtimes, ["claude-code"]);
+  });
+});
+
 test("readState on a missing file is empty, and stateFile lands under the state dir", () => {
   withStateDir((env, dir) => {
     assert.equal(stateFile(env), join(dir, "node.json"));

@@ -317,6 +317,26 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
   const token = resolveEnrolToken(env, { ephemeral: flags.ephemeral });
   if (token) env.DAHRK_ENROL_TOKEN = token;
   const runtimes = await resolveRuntimes(env);
+  // Compare against the set advertised on the previous boot (persisted in node.json). A runtime that
+  // was there last run and is missing now is a degradation worth shouting about - the exact silent
+  // failure DHK-390 was about - as distinct from one that was simply never installed. Skipped for an
+  // ephemeral node (no disk), and harmless when nothing was persisted yet (an empty prior set).
+  if (!flags.ephemeral) {
+    const prior = readState(stateFile(env)).runtimes ?? [];
+    const missing = prior.filter((r) => !runtimes.includes(r));
+    if (missing.length > 0) {
+      logger.warn(
+        { prior, detected: runtimes, missing },
+        `RUNTIMES_DEGRADED:${missing.join(",")} advertised last run but not detected now - the node will ` +
+          "serve no Jobs for it until it is re-probed or restarted. Run `dahrk doctor` to check.",
+      );
+    }
+    // Persist the set this boot detected so the next boot can run the same diff.
+    writeState(env, { runtimes });
+  }
+  // The boot line the incident was missing: state plainly which runtimes were detected, so a degraded
+  // advertisement is visible in the log instead of only inferable from stages failing at dispatch.
+  logger.info({ runtimes }, `RUNTIMES_DETECTED:${runtimes.join(",") || "none"}`);
   if (runtimes.length === 0) {
     console.warn(
       "no agent runtimes detected on this host (claude/codex/pi not on PATH); the node will advertise " +
@@ -333,6 +353,11 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
     ...buildEdgeOptions(env, resolved),
     logger,
     shipper,
+    // Self-heal a transiently-degraded boot without a manual restart: the edge re-probes on this seam
+    // and re-advertises when the set changes. Reuses `resolveRuntimes`, so `DAHRK_RUNTIMES` still wins
+    // (a pinned override never re-probes to something else) and the mock runner path stays stable.
+    reprobeRuntimes: () => resolveRuntimes(env),
+    ...(env.DAHRK_RUNTIME_RECHECK_MS ? { runtimeRecheckMs: Number(env.DAHRK_RUNTIME_RECHECK_MS) } : {}),
     ...(persist
       ? {
           onEnrolled: (welcome) =>

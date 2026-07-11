@@ -6,6 +6,34 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A runtime that was briefly slow to answer is no longer written off as missing for the life of the
+  node.** At boot the node asks each agent CLI (`claude`, `codex`, `pi`) for its version to work out what
+  it can run. That question was asked once, with a three second budget, and *any* unhappy answer - an
+  error, a non-zero exit, a timeout - was read as "not installed". The answer was then frozen: it was what
+  the node advertised to the hub on every reconnect and every heartbeat until someone restarted it.
+
+  So a cold Node-based CLI on a busy host - a machine mid-IO-churn, which is exactly what a node looks
+  like in the seconds after `dahrk update` restarts it - could take longer than three seconds to reply
+  once, and be dropped. Not just for that probe: for good. Every stage that needed that runtime then
+  failed the moment it was dispatched, and nothing anywhere said why. The runtime was installed and
+  working the whole time.
+
+  A probe now retries before concluding a runtime is absent (two attempts, and the budget is up from
+  three seconds to five). A command that genuinely is not on `PATH` still gives up on the first attempt,
+  because no amount of waiting will find it - the retry costs latency only on a host where something is
+  actually struggling.
+
+  The node also re-probes after boot, roughly once a minute, and re-advertises when what it finds differs
+  from what it is advertising. A node that came up degraded now heals itself instead of waiting for a
+  human to notice and restart it. `DAHRK_RUNTIME_RECHECK_MS` tunes the interval. (#50)
+- **The boot log now says which runtimes it found.** A degraded advertisement used to be invisible: the
+  only symptom was stages failing at dispatch, and you had to already suspect detection to go looking.
+  The node now states the detected set at boot, and warns when a runtime it advertised on its previous
+  boot is not there any more - a disappearance is worth shouting about, as distinct from a runtime that
+  was simply never installed. (#50)
+
 ## [0.1.11] - 2026-07-11
 
 ### Fixed
