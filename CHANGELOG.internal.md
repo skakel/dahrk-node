@@ -19,6 +19,105 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-11
+
+### Observability, ring 0 of DHK-376 (#40)
+
+- The node had **no logging library at all** — ~18 raw `process.stdout.write` calls, no levels, no
+  timestamps, no correlation ids, no crash handlers. DHK-360 (half-open sockets), DHK-216 (reconnect
+  zombies) and DHK-109 (WS flaps) were all diagnosed the hard way because of it.
+- The worst finding: `GitService` has **always** had a `GitLogger` seam with meaningful calls on every
+  clone, mirror refresh and worktree create, but **no production call site ever passed one**, so it
+  resolved to `noopLogger`. Every git operation on every node ever run was silent. One-line fix.
+- `packages/edge/src/logger.ts` — pino, two sinks, no transports (worker threads would break under the
+  tsup bundle). stdout keeps the exact line-tagged markers byte-for-byte: `ws-client.test.ts` asserts
+  `line.startsWith("JOB_STARTED:")` and the harness greps them to time a kill, so the markers are a
+  contract, not laziness. The file sink (`~/.dahrk/logs/node.jsonl`) is always at `debug`.
+- `packages/edge/src/redact.ts` — adapted from cyrus's `sentryScrubber` (Apache-2.0, credited in NOTICE),
+  applied on pino's single `logMethod` choke point so no call site can forget it. Two additions over the
+  original: inline token redaction (it only matched a token as a whole *string*, so
+  `fatal: Authentication failed for 'https://ghp_x@github.com/o/r.git'` sailed through — and git errors
+  are exactly what we now log), and URL credentials (`https://user:secret@host`).
+- Correlation ids come from a per-job child logger bound from the same fields that build `TraceMeta`, so
+  `dahrk logs --run <id>` and the hub's `/api/runs/:runId` describe one run from both ends. Reconnects
+  log a `connectCount`.
+- `apps/edge-node/src/process-safety.ts` mirrors the hub's `installProcessSafetyNet`. Crash records live
+  in `logs/crashes/` separately from the log because the log rotates and a crash-loop pushes its own
+  first cause out of it.
+- Ring 0 is deliberately local-only: no telemetry SDK, no vendor key in an Apache-2.0 binary, no
+  log-shipping path. `dahrk diagnose` writes a bundle and has no upload flag.
+- Two bugs found while verifying: **EPIPE recursion** (`dahrk start | head` → closed stdout → EPIPE →
+  uncaughtException → crash handler logged it *through the same stdout sink* → EPIPE again, writing bogus
+  crash records; regression test added), and **Pi's container stderr was piped and never read** — an
+  unread pipe fills its ~64 KB buffer and blocks the writer, a latent hang rather than a lost message.
+- Follow-ups filed: **DHK-376** (the epic; ring 1 is fleet health over the WS `heartbeat` frame, today an
+  empty `{type:"heartbeat"}` and so a free backwards-compatible insertion point, plus a `node_health`
+  table and alerting). **DHK-374** (urgent) and **DHK-375**: the live privacy policy claims source code
+  "never leaves your machine", which `data-boundary.md` contradicts, and promises a retention mechanism
+  that is not built. Both gate any ring-1 telemetry disclosure.
+- Docs: `docs/logging.md` here; `dahrk-harness/docs/data-boundary.md` §5 updated to classify the
+  node-local log surface as non-crossing.
+
+### Worktree and mirror, DHK-371 (#39)
+
+- Every run was failing at stage start with `fatal: '<branch>' is already used by worktree at ...`. That
+  was the visible symptom of three interacting defects, one of which was silently destroying uncommitted
+  work.
+- **D1, the dangerous one.** `ensureMirror` cloned with `--mirror`, which sets `remote.origin.mirror=true`
+  and the refspec `+refs/*:refs/*`, so a fetch force-syncs *local* refs to match origin. Run branches live
+  only in `refs/heads/*` until `deliver` pushes them and the forge deletes them again on merge, so origin
+  has zero `skakel/issue-*` branches — and every mirror refresh deleted the branch of any run in flight.
+  Fixed with a namespace split (`init --bare` + `+refs/heads/*:refs/remotes/origin/*` + `fetch --prune`).
+  `git clone --bare` is deliberately not used: it copies remote heads straight into `refs/heads/*`,
+  reintroducing the same footgun. `migrateMirrorConfig` converts existing mirrors in place, lazily, on the
+  next refresh — no re-clone, no operator step, idempotent. It also unsets `remote.origin.mirror`, which
+  would otherwise make any `git push origin` from the mirror a destructive mirror push.
+- **D2, 65 GB.** `teardownWorktree` existed but its only caller returned early unless a retention policy
+  was configured, and even then consulted an *in-memory* map, so every worktree from a previous process was
+  orphaned for ever. One node reached 92 registered worktrees and 65 GB. There is no `run-finished` frame
+  in `HubToEdge` (only `job`, `welcome`, `push`, `cancel`, `blob-put-url`), so the edge cannot be *told* a
+  run is over and teardown cannot be signal-driven. New `worktree-reaper.ts` reconciles on-disk ∪
+  git-registered state, never process-local memory, using `.skakel/scratch/state.json`'s mtime as a durable
+  per-run clock and an activity grace to guard a second node process (there is no IPC).
+- **D3.** Once D1 deleted the ref, `createWorktree` fell to `git worktree add -b` with no `--force`, and
+  `die_if_checked_out` aborted on the stale worktree's dangling symref — while *leaving the branch ref
+  re-created*, so the next attempt took the `--force` path and would base the run on the stale run's commit.
+  Creation now prunes and evicts stale claims first but fails fast if the holder is a genuinely in-flight
+  run (two live runs on one issue is a routing bug; a truthful error beats stomping a live worktree). Start
+  point resolves `seedRef` (DHK-264 re-entry) → `origin/<branch>` → `origin/<baseBranch>`; a leftover local
+  head is never a start point, which structurally kills the stale-base hazard. `--force -B` is transactional
+  with the checkout, and a local tip holding unique commits is parked at `refs/dahrk/salvage/<branch>/<sha>`
+  first.
+- An `inFlight` leak would have defeated the reaper: it was incremented at job start but decremented only
+  inside `finish`, which a throw before it (exactly the D3 failure) skipped, so the run stayed "busy" for
+  the life of the process and every reaper pass keyed on `isBusy` skipped precisely the runs that most
+  needed collecting. Moved to a `finally` around `runJob`.
+- Five git-service regressions and an `inFlight` leak test, each verified to fail on the old code, plus
+  five reaper tests including the restart-safety proof. Verified against the live `skakel-harness` mirror:
+  it migrated in place, the in-flight run's branch survived, and a subsequent `fetch --prune` — the exact
+  command that used to destroy every run branch — left it intact.
+
+### Daemon-first CLI (#38)
+
+- The upgrade hazard, and why it is handled: units written by 0.1.8 invoke **bare `dahrk start`**. Once
+  `start` means "ensure running", the daemon's own `start` sees the service running (it *is* the service),
+  exits 0, and `KeepAlive` restarts it into the same no-op every 10s — every service-installed node would
+  silently stop serving Jobs on upgrade. Two mechanisms cover it: new units are explicit (`--foreground` in
+  argv, `DAHRK_SUPERVISED=1` in the env block), and daemon-mode `start` **self-heals** by re-rendering the
+  unit and rewriting + reloading it when it differs from disk. The self-heal is only sound because the
+  render is deterministic — otherwise "differs → rewrite → reload" is an infinite restart loop, not a
+  repair. A test pins exactly that, with a fallback to the foreground worker when there is no cached token
+  to re-render with.
+- The single-instance lock (`~/.dahrk/node.pid`) exits **non-zero** on refusal. The first cut exited 0,
+  which a supervisor reads as a clean exit and restarts into the same refusal; there is now an end-to-end
+  regression test.
+- The update check fails open by construction: capped at one registry read a day, never prompts without a
+  TTY, and a registry that *hangs* is aborted at 1.5s (there is a test for it), so it can never delay or
+  fail a start.
+- Follow-up: `install.sh` lives in another repo. It should default to an always-on node (`dahrk start` now
+  does the install), opt out with `--no-service`, and print `dahrk status` / `logs -f` / `stop` as next
+  steps. It pipes into a shell, so its `start` is not a TTY and the update check will never prompt.
+
 ## [0.1.8] - 2026-07-11
 
 - Make a release one PR instead of two, and drop the approval gates. `scripts/release.mjs` now accepts

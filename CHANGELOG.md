@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-11
+
 ### Fixed
 
 - **A node no longer destroys the branch of a run that is still in flight, and no longer wedges every
@@ -24,7 +26,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
     reconciles what is actually on disk, runs at startup and after each stage, and has sane defaults -
     "no policy configured" no longer means "never collect anything". It never touches a run that is busy.
   - A worktree left behind by an earlier run went on **claiming its branch name for ever**, so the next
-    run of the same issue failed outright with `fatal: '<branch>' is already used by worktree at ...`.
+    run of the same issue failed outright with `fatal: '<branch>' is already used by worktree at...`.
     Stale claims are now cleared before a worktree is created, and a run is always based on the current
     remote base rather than on whatever a previous run happened to leave behind. If work would be
     discarded, its tip is first parked under `refs/dahrk/salvage/` rather than dropped.
@@ -42,7 +44,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
   **If you run a node under pm2 or in a container, add `--foreground`** (the bundled `ecosystem.config.cjs`
   already does). Everything else upgrades on its own: an installed service repairs its own unit the first
-  time it restarts.
+  time it restarts. (#38)
 
 ### Added
 
@@ -308,7 +310,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/dahrkai/dahrk-node/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/dahrkai/dahrk-node/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/dahrkai/dahrk-node/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/dahrkai/dahrk-node/compare/v0.1.5...v0.1.6
