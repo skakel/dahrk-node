@@ -27,16 +27,23 @@ If any fail, stop with the exact fix (e.g. "you have unmerged commits; land or s
 
 ## Phase 2 — Changelog audit (read-only, then a gated write)
 
+Two changelogs: `CHANGELOG.md` is **public** (ships in the GitHub release; no tracker keys) and
+`CHANGELOG.internal.md` is **internal** (never published; tracker keys welcome). See its header.
+
 1. List every PR merged since the last tag: `git log --oneline v<last>..origin/main`, and map commits
    to PRs (`gh pr view <n>`), noting each PR's title.
-2. Read the `[Unreleased]` section of `CHANGELOG.md`. Cross-check: **does every user-facing PR have an
-   entry?** Flag PRs with no note (this is how #22/#23/#24 shipped undocumented).
-3. Lint the section: no internal keys (`DHK-`/`SKA-`/`LABS-`/`TEST-`/`HAR-`/`SL-` followed by digits —
-   run `node scripts/lint-changelog.mjs`), every entry carries a `(#N)` PR ref, and each is under the
-   right `### Added` / `### Changed` / `### Fixed` heading.
-4. If anything is missing or wrong, **draft the corrected `[Unreleased]` section**, show it as a diff,
-   and get approval before writing it. Notes are public: write for people running the client, British
-   English, no em dashes, reference the PR as `(#N)`.
+2. Read the `[Unreleased]` section of **both** files. Cross-check: **does every PR have a note in the
+   right place?** A user-facing change belongs in `CHANGELOG.md`; an internal-only one (refactor,
+   tooling, deps) belongs in `CHANGELOG.internal.md`. Flag PRs with no note anywhere (this is how
+   #22/#23/#24 shipped undocumented).
+3. Lint the **public** section: no internal keys (`DHK-`/`SKA-`/`LABS-`/`TEST-`/`HAR-`/`SL-` followed
+   by digits — run `node scripts/lint-changelog.mjs`), every entry carries a `(#N)` PR ref, and each
+   is under the right `### Added` / `### Changed` / `### Fixed` heading. The internal file is exempt
+   from the key ban — that is the point of it.
+4. If anything is missing or wrong, **draft the corrected `[Unreleased]` sections**, show them as a
+   diff, and get approval before writing. Public notes: for people running the client, British English,
+   no em dashes, PR ref `(#N)`, no tracker keys. Internal notes: whatever helps contributors, tracker
+   keys fine.
 
 ## Phase 3 — Cross-repo dependency check (read-only)
 

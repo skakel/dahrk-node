@@ -193,7 +193,7 @@ pnpm test        # Node built-in test runner (no Docker, no network, no live mod
 The `dahrk-node` client (in `apps/edge-node`) is published to npm on a git tag. Releases follow
 [Keep a Changelog](https://keepachangelog.com/) and [semver](https://semver.org/).
 
-**Guided path (recommended):** run `/release <version>` in Claude Code. It runs the preflight, audits
+**Guided path (recommended):** run `/dahrk-release <version>` in Claude Code. It runs the preflight, audits
 the changelog against the PRs merged since the last tag, checks that every `@dahrk/*` dependency is
 published and ships compiled output, smoke-tests the packaged client, and only then runs `pnpm release`
 — pausing for approval before anything is published. The manual steps below are what it automates.
@@ -202,7 +202,9 @@ published and ships compiled output, smoke-tests the packaged client, and only t
    otherwise leave it empty and the release command drafts them from the commit log. These notes are
    public: write for people running the client, and reference the GitHub PR/issue as `(#123)` — never
    an internal tracker key. (`pnpm release` also strips internal keys, `run-…` IDs, and commit trailers
-   as a backstop, but keep the source clean.)
+   as a backstop, but keep the source clean.) Internal-only changes (refactors, tooling, tracker-key
+   context) go in [`CHANGELOG.internal.md`](CHANGELOG.internal.md) instead — a companion that is never
+   published; `pnpm release` rolls both files together. See that file's header for which goes where.
 2. Run `pnpm release <version>`, review/edit the changelog in the PR it opens, and merge.
 
 `pnpm release` ([`scripts/release.mjs`](scripts/release.mjs)) bumps the version in both `package.json`

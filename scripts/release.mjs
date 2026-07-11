@@ -22,6 +22,9 @@ const REPO = 'dahrkai/dahrk-node'
 const EDGE_PKG = join(ROOT, 'apps/edge-node/package.json')
 const ROOT_PKG = join(ROOT, 'package.json')
 const CHANGELOG = join(ROOT, 'CHANGELOG.md')
+// Internal-only companion (never published). Rolled alongside CHANGELOG.md but left verbatim — it may
+// carry tracker keys and internal notes. Optional: if absent, the internal roll is skipped.
+const CHANGELOG_INTERNAL = join(ROOT, 'CHANGELOG.internal.md')
 
 const args = process.argv.slice(2)
 const flags = new Set(args.filter((a) => a.startsWith('--')))
@@ -104,6 +107,7 @@ if (OUT) {
 
 // ---- compute file rewrites ----------------------------------------------------------------------
 const changelogNext = rewriteChangelog(version, section, prevVersion)
+const internalNext = rollInternalChangelog(version) // null when the file is absent
 const edgeNext = bumpPackage(EDGE_PKG, version)
 const rootNext = bumpPackage(ROOT_PKG, version)
 
@@ -112,6 +116,7 @@ if (DRY_RUN) {
   console.log(section)
   console.log('\n\x1b[33m--- [dry-run] versions ---\x1b[0m')
   console.log(`apps/edge-node/package.json + package.json  →  ${version}`)
+  if (internalNext !== null) console.log(`CHANGELOG.internal.md  →  rolled [Unreleased] into [${version}]`)
   console.log('\n\x1b[33m[dry-run] no files written, no branch/commit created.\x1b[0m')
   process.exit(0)
 }
@@ -121,6 +126,10 @@ step(`branch release/${version}`)
 git('switch', '-c', `release/${version}`)
 
 writeFileSync(CHANGELOG, changelogNext)
+if (internalNext !== null) {
+  writeFileSync(CHANGELOG_INTERNAL, internalNext)
+  step('rolled CHANGELOG.internal.md')
+}
 writeFileSync(EDGE_PKG, edgeNext)
 writeFileSync(ROOT_PKG, rootNext)
 step(`bumped apps/edge-node + root package.json → ${version}`)
@@ -176,6 +185,32 @@ function rewriteChangelog(version, section, prevVersion) {
   text = text.replace(/^(\[Unreleased\]:.*$)/m, `$1\n${newLink}`)
 
   return text
+}
+
+// Roll the internal changelog's [Unreleased] into a dated [version] section, verbatim (no sanitising —
+// internal notes may carry tracker keys). Returns the new text, or null if the file is absent (it is
+// optional). No compare-link footer to maintain; the [Unreleased] block runs to the next `## ` heading
+// or end of file.
+function rollInternalChangelog(version) {
+  let text
+  try {
+    text = readFileSync(CHANGELOG_INTERNAL, 'utf8')
+  } catch {
+    return null
+  }
+  const head = text.match(/^## \[Unreleased\][^\n]*\n/m)
+  if (!head) die('CHANGELOG.internal.md has no [Unreleased] section')
+  const bodyStart = head.index + head[0].length
+  // Next `## ` heading after [Unreleased], or end of file.
+  const rest = text.slice(bodyStart)
+  const nextHeading = rest.search(/^## /m)
+  const bodyEnd = nextHeading === -1 ? text.length : bodyStart + nextHeading
+  const body = text.slice(bodyStart, bodyEnd).trim()
+
+  const date = new Date().toISOString().slice(0, 10)
+  const rolled = body ? `${body}\n\n` : ''
+  const block = `## [Unreleased]\n\n## [${version}] - ${date}\n\n${rolled}`
+  return text.slice(0, head.index) + block + text.slice(bodyEnd)
 }
 
 // Bump `version` in a package.json, preserving 2-space indent + trailing newline.

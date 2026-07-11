@@ -55,9 +55,11 @@ jobs:
             echo "no source changes under packages/*/src or apps/*/src — changelog not required"
             exit 0
           fi
-          if echo "$CHANGED" | grep -qx 'CHANGELOG.md'; then
-            echo "source changed and CHANGELOG.md was updated"
+          # A note in either changelog satisfies the gate: user-visible -> CHANGELOG.md; internal-only
+          # (refactor/tooling) -> CHANGELOG.internal.md.
+          if echo "$CHANGED" | grep -qxE 'CHANGELOG(\.internal)?\.md'; then
+            echo "source changed and a changelog (public or internal) was updated"
             exit 0
           fi
-          echo "::error::source changed but CHANGELOG.md was not updated. Add a note under [Unreleased] referencing the PR (#N), or apply the 'no-changelog' label if this PR genuinely needs no note."
+          echo "::error::source changed but neither CHANGELOG.md nor CHANGELOG.internal.md was updated. Add a note under [Unreleased] (user-visible -> CHANGELOG.md with the PR ref (#N); internal-only -> CHANGELOG.internal.md), or apply the 'no-changelog' label if this PR genuinely needs no note."
           exit 1
