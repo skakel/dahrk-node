@@ -90,6 +90,24 @@ export function logFiles(env: NodeJS.ProcessEnv): { out: string; err: string } {
   return { out: join(dir, "node.out.log"), err: join(dir, "node.err.log") };
 }
 
+/** The structured log the node writes itself (`node.jsonl`), as opposed to `node.{out,err}.log`, which
+ *  are whatever the SUPERVISOR captured from our stdout/stderr.
+ *
+ *  Two files, two jobs. The `.log` pair is the human transcript - the line-tagged markers, as printed.
+ *  This one is the forensic record: one JSON object per line, with levels, timestamps, correlation ids
+ *  (runId/stageId/jobId) and error stacks, written at `debug` even when stdout is at `info`. It is what
+ *  `dahrk logs --run <id>` reads and what `dahrk diagnose` collects. It rotates itself (see the logger),
+ *  so unlike the `.log` pair it needs no boot-time `rotateIfLarge`. */
+export function jsonlLogFile(env: NodeJS.ProcessEnv): string {
+  return join(logDir(env), "node.jsonl");
+}
+
+/** Where crash records land. Separate from the log because the log rotates: a crash-loop can push its own
+ *  first cause out of the JSONL, and the first cause is the one worth having. */
+export function crashDir(env: NodeJS.ProcessEnv): string {
+  return join(logDir(env), "crashes");
+}
+
 /** The pidfile the foreground worker holds for as long as it is running. It is what stops a second node
  *  dialling the hub with the SAME persisted nodeId - see `lock.ts`. */
 export function lockFile(env: NodeJS.ProcessEnv): string {

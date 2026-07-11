@@ -154,13 +154,14 @@ starting; never commit the token.
 dahrk start [--token <t>] [--name <n>] [--hub-url <u>] [--foreground] [--ephemeral]  # run the node
 dahrk stop                                                           # stop it (stays stopped)
 dahrk restart [--token <t>] [--name <n>] [--hub-url <u>]             # stop, then start
-dahrk logs [-f] [-n <lines>]                                         # what has it been doing?
+dahrk logs [-f] [-n <lines>] [--level <l>] [--run <id>] [--json]     # what has it been doing?
+dahrk diagnose [--out <path>]                                        # a support bundle you can read
 dahrk status                                                         # enrolled? up? (local, dials nothing)
 dahrk run <workflow> [--repo <p>] [--hub-url <u>] [--token <t>]      # run a workflow (engine-backed)
 dahrk doctor [--token <t>] [--hub-url <u>]                           # preflight checks
 dahrk service install|uninstall [--token <t>] [--name <n>] [--hub-url <u>]  # the service, by hand
 dahrk update [--check]                                              # self-update to the latest client
-dahrk help [start|stop|restart|logs|status|run|service|doctor|update]  # usage
+dahrk help [start|stop|restart|logs|diagnose|status|run|service|doctor|update]  # usage
 dahrk version                                                        # print the client version
 ```
 
@@ -178,6 +179,19 @@ and links the full report at `app.dahrk.ai/r/<runId>`, streaming `[n/5] <stage>`
 It runs with no Linear, no OAuth, and no issue - just the machine and the engine - and exits non-zero
 when the floor is unsound (old Node, no git repo, git missing, worktree unwritable). A tool or hub it
 cannot reach is a finding, not a failure.
+
+`dahrk logs` shows what the node has been doing. On its own it tails the transcript the service
+captured. Pass `--level`, `--run` or `--json` and it reads `~/.dahrk/logs/node.jsonl` instead - the
+node's **structured** log, which carries levels, timestamps, correlation ids and full error stacks, and
+is written at `debug` even when your terminal is not. `--run <runId>` is the one to remember: node log
+lines carry the same run/stage/job ids the hub knows the run by, so `dahrk logs --run <id>` and the
+hub's view of that run describe the same thing from both ends.
+
+`dahrk diagnose` writes a support bundle: node identity, version, host, the `doctor` verdict, the tail
+of the structured log, and every crash record - in **one local JSON file you can open and read**. It
+uploads nothing (there is no `--upload` flag), the enrolment token is removed rather than redacted, and
+your source, prompts and issue content are not in it. It exists so that "can you send us your logs?"
+is a question you can safely say yes to. See [`docs/logging.md`](docs/logging.md).
 
 `dahrk update` upgrades the client in place to the latest published release. It reads this build's
 version, asks the npm registry for the newest one, and - if you are behind - detects how you installed
@@ -214,6 +228,9 @@ env var.
 | `DAHRK_NODE_ID` / `DAHRK_TENANT_ID` | Explicit identity overrides (managed profile). |
 | `DAHRK_WORKTREES_DIR` / `DAHRK_MIRRORS_DIR` / `DAHRK_STATE_DIR` | Local paths (default under `~/.dahrk`). |
 | `DAHRK_GIT_TOKEN` | Git credential for ambient-mode clone/push. |
+| `DAHRK_LOG_LEVEL` | Level for stdout (default `info`). The log **file** is written at `debug` regardless - see [`docs/logging.md`](docs/logging.md). |
+| `DAHRK_LOG_FILE_LEVEL` / `DAHRK_LOG_FILE` | Level for `node.jsonl` (default `debug`); set `DAHRK_LOG_FILE=0` to disable the file sink. |
+| `DAHRK_CRASH_EXIT` | Set `1` to exit on an uncaught exception rather than log it and carry on. |
 
 > The legacy `SKAKEL_*` names are still accepted as aliases for every `DAHRK_*` variable during the
 > rename transition. See [`.env.example`](.env.example).

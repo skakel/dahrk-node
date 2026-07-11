@@ -39,6 +39,7 @@ import {
   type ReapReport,
 } from "@dahrk/executor-worktree";
 import { buildRules } from "./builtins.js";
+import { createNodeLogger, type NodeLogger } from "./logger.js";
 import { evaluatePolicies, type PolicyRule } from "./policy.js";
 import { startMcpGateway, type McpGateway } from "./mcp-gateway.js";
 
@@ -81,6 +82,9 @@ export interface TraceSink {
 export interface StageRunnerDeps {
   gitService: GitService;
   makeRunner: (runtime: Runner["runtime"]) => Runner;
+  /** The node's logger. Absent (tests, embedders) = a silent logger, so the runner stays quiet by
+   *  default. Used to surface the best-effort paths below, which used to fail invisibly. */
+  logger?: NodeLogger;
   /** Optional self-hosted allowlist of registry repoIds this edge will serve. Empty/absent
    *  = serve any repo (clone on demand). A Job for a repoId outside a non-empty allowlist is
    *  rejected. This is a binding, not a definition: the repo itself comes from the Job's gitUrl. */
@@ -380,6 +384,8 @@ export function resolveStageArtifact(
 
 export function createStageRunner(deps: StageRunnerDeps): StageRunner {
   const worktrees = new Map<string, WorkspaceRef>();
+  /** Silent by default so an embedder (and every existing test) sees no new output. */
+  const log = deps.logger ?? createNodeLogger({ level: "silent" });
   /** In-flight runners by jobId, so a `cancel` frame can abort the right one. */
   const active = new Map<string, Runner>();
   /** Per-job turn mailboxes for in-flight interactive stages (fed by relayed turns; M5b). */
@@ -412,11 +418,17 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
       if (scratchOnly.has(runId)) {
         try {
           rmSync(ref.worktreePath, { recursive: true, force: true });
-        } catch {
-          /* best-effort; a leftover scratch dir loses nothing observable (traces are streamed). */
+        } catch (e) {
+          /* best-effort; a leftover scratch dir loses nothing observable (traces are streamed) - but a
+             disk that keeps failing to clear them eventually fills, so say so. */
+          log.warn({ err: e, runId, path: ref.worktreePath }, "teardown: could not remove scratch dir");
         }
       } else {
-        await deps.gitService.teardownWorktree(ref).catch(() => undefined);
+        await deps.gitService.teardownWorktree(ref).catch((e: unknown) => {
+          // A worktree that will not tear down holds both disk and its branch name, which then wedges
+          // the next run of the same issue. Silent failure here is how a node slowly gums up.
+          log.warn({ err: e, runId, path: ref.worktreePath }, "teardown: could not remove worktree");
+        });
       }
     }
     worktrees.delete(runId);
@@ -630,7 +642,9 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         ): Promise<JobResult> => {
           active.delete(jobId);
           turnQueues.delete(jobId);
-          await gateway?.stop().catch(() => undefined); // discard brokered MCP creds with the stage
+          // discard brokered MCP creds with the stage. A gateway that will not stop is holding a port
+          // and, worse, live brokered credentials - never let that pass unremarked.
+          await gateway?.stop().catch((e: unknown) => log.warn({ err: e, jobId }, "mcp gateway: stop failed"));
           gateway = undefined;
           streamEvent(
             writer.append({ seq: 0, ts: nowIso(), type: "state", runtime: agentConfig.runtime, event: "stage-exit", status }),
@@ -643,13 +657,19 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
             ...(sessionId ? { sessionId } : {}),
             ...(costUsd !== undefined ? { costUsd } : {}),
           };
-          await shipFinalTrace(finalMeta).catch(() => undefined);
+          // The single most important best-effort path on the node. If this fails the hub ends up with
+          // no finalised trace for the stage - the entire forensic record of what the agent did - and
+          // until now nobody found out. It stays non-fatal (the stage result still goes back), but it is
+          // logged at error: a run whose trace is missing hub-side has its explanation right here.
+          await shipFinalTrace(finalMeta).catch((e: unknown) =>
+            log.error({ err: e, runId, stageId: job.stageId, jobId, attempt }, "trace: failed to ship the final trace to the hub"),
+          );
           lastUsed.set(runId, Date.now());
           // NB the `inFlight` decrement is NOT here: `finish` is not reached when the job throws before it
           // (e.g. `createWorktree` failing on a stale branch claim), which left the run marked busy for ever
           // and made it invisible to every reaper pass keyed on `isBusy` - exactly the runs that most needed
           // collecting. It now lives in the `finally` of `runJob`, which every exit path goes through.
-          await applyRetention(runId).catch(() => undefined);
+          await applyRetention(runId).catch((e: unknown) => log.warn({ err: e, runId }, "retention: pass failed"));
           // When the stage intends a document (declared an `emitArtifact` path, or handed one back via
           // `dahrk_stage_complete`) and succeeded, resolve it from whichever channel produced content
           // so the engine can publish it (e.g. the `attach-document` action). Read-only; a miss returns

@@ -40,6 +40,15 @@ export interface ContainerPiSessionOpts {
   scratchDir?: string;
   /** Injected for tests: replaces `node:child_process.spawn`. Default: the real spawn. */
   spawn?: typeof nodeSpawn;
+  /**
+   * Where the container's stderr goes. Default: `process.stderr`, prefixed.
+   *
+   * This is not merely a logging nicety. `stdio[2]` is a pipe, and nothing used to read it: a
+   * container that wrote more than the ~64 KB pipe buffer would BLOCK on its next stderr write and
+   * the session would hang, with the explanation sitting unread in the pipe. Draining it is what
+   * makes that impossible - surfacing the message is the bonus.
+   */
+  onStderr?: (line: string) => void;
 }
 
 /**
@@ -47,7 +56,12 @@ export interface ContainerPiSessionOpts {
  * wraps it in a `PiRpcSession`. Pass to `createPiRunner({ createSession })` for isolation.
  */
 export function createContainerPiSession(opts: ContainerPiSessionOpts = {}): PiSessionFactory {
-  const { image = DEFAULT_IMAGE, scratchDir: optsScratchDir, spawn: spawnFn = nodeSpawn } = opts;
+  const {
+    image = DEFAULT_IMAGE,
+    scratchDir: optsScratchDir,
+    spawn: spawnFn = nodeSpawn,
+    onStderr = (line: string): void => void process.stderr.write(`pi-container: ${line}\n`),
+  } = opts;
 
   return async (ctx: RunnerContext): Promise<PiSessionLike> => {
     const containerName = `dahrk-pi-${Date.now()}-${++_seq}`;
@@ -65,6 +79,20 @@ export function createContainerPiSession(opts: ContainerPiSessionOpts = {}): PiS
       ["run", "-i", "--rm", "--name", containerName, ...mountArgs, ...envArgs, image, "pi", "--mode", "rpc"],
       { stdio: ["pipe", "pipe", "pipe"] },
     );
+
+    // Drain stderr line-by-line. Without this the pipe fills and the container blocks (see `onStderr`).
+    child.stderr?.setEncoding("utf8");
+    let stderrBuf = "";
+    child.stderr?.on("data", (chunk: string) => {
+      stderrBuf += chunk;
+      const lines = stderrBuf.split("\n");
+      stderrBuf = lines.pop() ?? ""; // keep the partial line for the next chunk
+      for (const line of lines) if (line.trim()) onStderr(line);
+    });
+    child.stderr?.on("end", () => {
+      if (stderrBuf.trim()) onStderr(stderrBuf);
+      stderrBuf = "";
+    });
 
     const killContainer = (): Promise<void> =>
       new Promise<void>((resolve) => {

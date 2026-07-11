@@ -4,7 +4,8 @@
  *   dahrk start  [--token <t>] [--name <n>] [--hub-url <u>] [--foreground] [--ephemeral]  run the node
  *   dahrk stop                                                           stop it (stays stopped)
  *   dahrk restart [--token <t>] [--name <n>] [--hub-url <u>]             stop, then start
- *   dahrk logs [-f] [-n <lines>]                                         what has it been doing?
+ *   dahrk logs [-f] [-n <lines>] [--level <l>] [--run <id>] [--json]     what has it been doing?
+ *   dahrk diagnose [--out <path>]                                        a support bundle you can read
  *   dahrk status                                                         enrolled? up? (local, dials nothing)
  *   dahrk run <workflow> [--repo <p>] [--hub-url <u>] [--token <t>]      run a workflow (engine-backed)
  *   dahrk doctor [--token <t>] [--hub-url <u>]                           preflight checks
@@ -28,6 +29,7 @@ export type Command =
   | "stop"
   | "restart"
   | "logs"
+  | "diagnose"
   | "run"
   | "service"
   | "doctor"
@@ -56,10 +58,32 @@ export interface StartFlags {
   foreground: boolean;
 }
 
-/** `dahrk logs` flags: how much history, and whether to keep following. */
+/** `dahrk logs` flags: how much history, whether to keep following, and (the structured mode) what to
+ *  narrow to.
+ *
+ *  Two modes, because there are two logs. Bare `dahrk logs` tails the plain transcript the supervisor
+ *  captured (`node.out.log` / `node.err.log`) - the markers, as printed. Passing any of `--run`,
+ *  `--level` or `--json` switches to reading `node.jsonl`, the node's own structured log, which is the
+ *  only one that carries levels, correlation ids and stacks. `--run` is the payoff: it is what makes a
+ *  node's log joinable to a hub run. */
 export interface LogsFlags {
   lines: number;
   follow: boolean;
+  /** Only records at this level or above. Implies the structured mode. */
+  level?: string;
+  /** Only records for this run id. Implies the structured mode. */
+  run?: string;
+  /** Emit the raw JSON records rather than a rendered line. Implies the structured mode. */
+  json: boolean;
+}
+
+/** Is this a structured query (read node.jsonl) or the plain transcript tail? */
+export const isStructuredLogs = (f: LogsFlags): boolean => f.level !== undefined || f.run !== undefined || f.json;
+
+/** `dahrk diagnose` flags. There is no `--upload`, by design; see `diagnose.ts`. */
+export interface DiagnoseFlags {
+  /** Write the bundle here instead of the default timestamped file in the current directory. */
+  out?: string;
 }
 
 /** Lines of history `dahrk logs` shows by default - enough to cover the last connect / welcome handshake
@@ -98,6 +122,7 @@ export type ParsedCli =
   | { kind: "stop" }
   | { kind: "restart"; flags: StartFlags }
   | { kind: "logs"; flags: LogsFlags }
+  | { kind: "diagnose"; flags: DiagnoseFlags }
   | { kind: "run"; flags: RunFlags }
   | { kind: "service"; flags: ServiceFlags }
   | { kind: "doctor"; flags: StartFlags }
@@ -112,6 +137,7 @@ const COMMANDS = new Set<Command>([
   "stop",
   "restart",
   "logs",
+  "diagnose",
   "run",
   "service",
   "doctor",
@@ -152,6 +178,8 @@ export function parseCli(argv: string[]): ParsedCli {
   if (command === "update") return parseUpdate(flagArgs);
   // `logs` is about a file, not a connection: how much of it, and whether to keep watching.
   if (command === "logs") return parseLogs(flagArgs);
+  // `diagnose` writes a file; the only choice is where.
+  if (command === "diagnose") return parseDiagnose(flagArgs);
 
   let values;
   try {
@@ -187,7 +215,10 @@ export function parseCli(argv: string[]): ParsedCli {
   return { kind: command, flags };
 }
 
-/** Parse the tail of `dahrk logs [-f] [-n N]`. No positionals: there is only one log to show. */
+/** The levels `--level` accepts, loudest last. A filter of `warn` means "warn, error and fatal". */
+export const LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal"] as const;
+
+/** Parse the tail of `dahrk logs [-f] [-n N] [--level L] [--run ID] [--json]`. No positionals. */
 function parseLogs(flagArgs: string[]): ParsedCli {
   let values;
   try {
@@ -196,6 +227,9 @@ function parseLogs(flagArgs: string[]): ParsedCli {
       options: {
         follow: { type: "boolean", short: "f", default: false },
         lines: { type: "string", short: "n" },
+        level: { type: "string" },
+        run: { type: "string" },
+        json: { type: "boolean", default: false },
         help: { type: "boolean", default: false },
       },
       allowPositionals: false,
@@ -209,7 +243,38 @@ function parseLogs(flagArgs: string[]): ParsedCli {
   if (!Number.isInteger(lines) || lines < 0) {
     return { kind: "error", message: `logs: --lines must be a non-negative whole number (got "${values.lines}")` };
   }
-  return { kind: "logs", flags: { lines, follow: values.follow ?? false } };
+  if (values.level !== undefined && !(LOG_LEVELS as readonly string[]).includes(values.level)) {
+    return { kind: "error", message: `logs: --level must be one of ${LOG_LEVELS.join(", ")} (got "${values.level}")` };
+  }
+  return {
+    kind: "logs",
+    flags: {
+      lines,
+      follow: values.follow ?? false,
+      ...(values.level ? { level: values.level } : {}),
+      ...(values.run ? { run: values.run } : {}),
+      json: values.json ?? false,
+    },
+  };
+}
+
+/** Parse the tail of `dahrk diagnose [--out <path>]`. */
+function parseDiagnose(flagArgs: string[]): ParsedCli {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args: flagArgs,
+      options: {
+        out: { type: "string" },
+        help: { type: "boolean", default: false },
+      },
+      allowPositionals: false,
+    }));
+  } catch (e) {
+    return { kind: "error", message: (e as Error).message };
+  }
+  if (values.help) return { kind: "help", command: "diagnose" };
+  return { kind: "diagnose", flags: { ...(values.out ? { out: values.out } : {}) } };
 }
 
 /** Parse the tail of `dahrk run <workflow> [flags]`: a single required workflow positional plus the
@@ -368,18 +433,44 @@ export function usage(bin: string, command?: Command): string {
   }
   if (command === "logs") {
     return [
-      `Usage: ${bin} logs [-f] [-n <lines>]`,
+      `Usage: ${bin} logs [-f] [-n <lines>] [--level <l>] [--run <id>] [--json]`,
       "",
       "Show what the node has been doing: its connect / welcome handshake, the Jobs it has run, and anything",
-      "it has crashed on. Reads ~/.dahrk/logs/node.out.log and node.err.log, which is where the service",
-      "writes on every platform.",
+      "it has crashed on.",
+      "",
+      "There are two logs, and this reads whichever you ask for. On its own it tails the transcript the",
+      "service captured (~/.dahrk/logs/node.out.log and node.err.log) - the same lines the node printed.",
+      "Pass --level, --run or --json and it reads node.jsonl instead: the node's own structured log, which",
+      "is the one carrying levels, timestamps, correlation ids and full error stacks. It is written at",
+      "debug even when the terminal is not, so the detail for an incident is already there afterwards.",
       "",
       "Options:",
       "  -f, --follow       Keep watching as new lines arrive (Ctrl-C to stop).",
       "  -n, --lines <n>    Lines of history to show first (default 200).",
+      "  --level <level>    Only this level and above: trace, debug, info, warn, error, fatal.",
+      "  --run <runId>      Only this run. The runId is the hub's - so `logs --run <id>` and the hub's",
+      "                     view of the same run describe the same thing from both ends.",
+      "  --json             Print the raw JSON records (for jq) rather than a rendered line.",
       "",
-      "A node run with --foreground logs to its terminal, not to these files, so there is nothing here to",
-      "show for one.",
+      "A node run with --foreground prints to its terminal, but it still writes node.jsonl - so --run and",
+      "--level work for it too.",
+    ].join("\n");
+  }
+  if (command === "diagnose") {
+    return [
+      `Usage: ${bin} diagnose [--out <path>]`,
+      "",
+      "Write a support bundle: everything needed to debug this node, in one file you can read.",
+      "",
+      "It collects this node's id, name, tenant, version and host; the doctor's verdict; the tail of the",
+      "structured log; and every crash record. Secrets are stripped and the enrolment token is not",
+      "included. Your source code, prompts and issue content are not included.",
+      "",
+      "Nothing is uploaded. There is no flag to upload it. The file is written locally so that you can open",
+      "it, read every line, and decide for yourself whether to send it on.",
+      "",
+      "Options:",
+      "  --out <path>       Write the bundle here (default: ./dahrk-diagnose-<timestamp>.json).",
     ].join("\n");
   }
   if (command === "run") {
@@ -458,7 +549,8 @@ export function usage(bin: string, command?: Command): string {
     "  start     Run the node, and keep it running (installs the service). --token to enrol, once.",
     "  stop      Stop the node. It stays stopped until the next `start`.",
     "  restart   Stop it and start it again.",
-    "  logs      Show what the node is doing (-f to follow).",
+    "  logs      Show what the node is doing (-f to follow, --run <id> to narrow to one run).",
+    "  diagnose  Write a support bundle you can read, and send on if you choose. Uploads nothing.",
     "  status    Is this node enrolled, and is it up? (local, dials nothing)",
     "  run       Run a workflow locally (engine-backed), e.g. `run preflight`.",
     "  doctor    Preflight checks: Node, runtimes, hub reachability, token validity.",

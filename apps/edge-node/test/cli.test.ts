@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseCli, usage } from "../src/cli.ts";
+import { isStructuredLogs, parseCli, usage } from "../src/cli.ts";
 
 test("bare flags default to `start` (back-compat with the flag-first invocation)", () => {
   const p = parseCli(["--token", "sket_abc"]);
@@ -184,14 +184,43 @@ test("--ephemeral implies --foreground: a node with no persistent id has nothing
 test("logs: -f follows, -n sets the history, and a nonsense -n is a usage error not a NaN", () => {
   const followed = parseCli(["logs", "-f"]);
   assert.equal(followed.kind, "logs");
-  if (followed.kind === "logs") assert.deepEqual(followed.flags, { lines: 200, follow: true });
+  if (followed.kind === "logs") assert.deepEqual(followed.flags, { lines: 200, follow: true, json: false });
 
   const counted = parseCli(["logs", "-n", "50"]);
-  if (counted.kind === "logs") assert.deepEqual(counted.flags, { lines: 50, follow: false });
+  if (counted.kind === "logs") assert.deepEqual(counted.flags, { lines: 50, follow: false, json: false });
 
   const bad = parseCli(["logs", "-n", "lots"]);
   assert.equal(bad.kind, "error");
   if (bad.kind === "error") assert.match(bad.message, /--lines must be a non-negative whole number/);
+});
+
+test("logs: --run / --level / --json select the structured log, and a bad level is a usage error", () => {
+  // These three flags are what switch `logs` from tailing the plain transcript to reading node.jsonl -
+  // the only log that has levels, correlation ids and stacks to filter on in the first place.
+  const byRun = parseCli(["logs", "--run", "run-7"]);
+  assert.equal(byRun.kind, "logs");
+  if (byRun.kind === "logs") {
+    assert.equal(byRun.flags.run, "run-7");
+    assert.ok(isStructuredLogs(byRun.flags));
+  }
+
+  const plain = parseCli(["logs"]);
+  if (plain.kind === "logs") assert.ok(!isStructuredLogs(plain.flags), "a bare `logs` still tails the transcript");
+
+  const bad = parseCli(["logs", "--level", "shouty"]);
+  assert.equal(bad.kind, "error");
+  if (bad.kind === "error") assert.match(bad.message, /--level must be one of/);
+});
+
+test("diagnose parses, and has no upload flag", () => {
+  const d = parseCli(["diagnose", "--out", "/tmp/b.json"]);
+  assert.equal(d.kind, "diagnose");
+  if (d.kind === "diagnose") assert.equal(d.flags.out, "/tmp/b.json");
+
+  // The absence of an upload path is a design commitment, not an omission: the bundle is written locally
+  // so the operator can read it and decide. Lock it, so nobody "helpfully" adds one later.
+  assert.equal(parseCli(["diagnose", "--upload"]).kind, "error");
+  assert.doesNotMatch(usage("dahrk", "diagnose"), /--upload/);
 });
 
 test("help names the daemon verbs, and says how to opt out of the daemon", () => {
