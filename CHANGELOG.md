@@ -6,6 +6,40 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **Your node now tells the hub how it is doing.** On each heartbeat it reports its uptime, which client
+  version it is, how many jobs it is holding, how many times it has reconnected, how many worktrees it has
+  on disk, how much free disk it has, which runtimes it found, and **counts** of failures by category.
+
+  That is the whole list, and it is worth being precise about what is *not* in it: no file paths, no
+  repository or branch names, no command lines, and no error messages. It is numbers, a version string and
+  category counts - and that is structural rather than a promise about our carefulness, because the type
+  cannot hold anything else. Note the deliberate asymmetry: we send the *count* of git failures and never
+  the message, because a count says your node cannot clone, while a message would say **which private
+  repository it cannot clone from**.
+
+  Without this we could not tell you your node was broken, only that it had pinged recently. A node
+  crash-looping, wedged on a stage, out of disk, or reconnecting every thirty seconds under a process that
+  looked fine was indistinguishable from one working perfectly. (#42)
+- **Your node's diagnostic logs are NOT sent, unless you say so.** Log lines carry free text: a failed git
+  operation quotes the remote it could not reach, the branch it was on, and the paths it was working with.
+  So log shipping is **off** for any node running on hardware you operate, and the hub refuses your log
+  records even if a client sends them anyway. You can enable it deliberately, and disable it again.
+
+  Nodes running on Dahrk-operated infrastructure do ship their logs, because we operate those machines and
+  need them to run the service. (#42)
+- **`DAHRK_TELEMETRY` is a ceiling the hub cannot raise.** `off` sends nothing at all about the node;
+  `health` permits the health report and refuses log shipping however nicely the hub asks. The hub may only
+  ever ask for *less* than you allow, never more.
+
+  This client is open source and you can read `log-shipper.ts` yourself, which is rather the point: a hub
+  that could override a local opt-out would be a claim anyone could catch us breaking. (#42)
+- An operator can turn a running node's log shipping up for a session while debugging it, **without
+  restarting it** - restarting a misbehaving node destroys the state you were trying to look at. It reverts
+  to the node's own default when it reconnects, so a debugging act cannot quietly become a standing
+  setting. (#42)
+
 ### Fixed
 
 - **`dahrk stop` no longer reports success while a node keeps running.** `stop` drives the service it

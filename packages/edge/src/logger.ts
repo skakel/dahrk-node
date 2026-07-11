@@ -59,6 +59,15 @@ export interface LoggerOptions {
   maxBytes?: number;
   /** How many rotated files to keep (node.jsonl.1 ... .N). Default 5. */
   maxFiles?: number;
+  /**
+   * A third sink, for shipping records to the hub (`log-shipper.ts`).
+   *
+   * Registered at `trace` so the SHIPPER decides what to ship, not the logger: the hub can raise a node's
+   * shipping level at runtime (the `policy` frame), and a logger-level filter here would silently cap it
+   * at whatever the node happened to boot with. The shipper's own `shouldShip` is the gate, and it is the
+   * one the operator can actually change.
+   */
+  ship?: { write(chunk: string): void };
 }
 
 const LEVELS: LogLevel[] = ["trace", "debug", "info", "warn", "error", "fatal", "silent"];
@@ -244,7 +253,11 @@ export function createNodeLogger(opts: LoggerOptions = {}): NodeLogger {
     }
   }
 
-  const base: pino.LevelWithSilent = streams.length === 0 ? "silent" : opts.dir ? lowest(level, fileLevel) : level;
+  // Registered at `trace`, so the shipper is never starved by a logger-level filter it cannot change.
+  if (opts.ship) streams.push({ level: "trace", stream: opts.ship });
+
+  const base: pino.LevelWithSilent =
+    streams.length === 0 ? "silent" : opts.ship ? "trace" : opts.dir ? lowest(level, fileLevel) : level;
 
   return pino(
     {
@@ -263,11 +276,17 @@ export function createNodeLogger(opts: LoggerOptions = {}): NodeLogger {
 }
 
 /** Convenience: build the logger from the environment, the way `main.ts` and the CLI want it. */
-export function createNodeLoggerFromEnv(env: NodeJS.ProcessEnv, dir: string, base?: Record<string, unknown>): NodeLogger {
+export function createNodeLoggerFromEnv(
+  env: NodeJS.ProcessEnv,
+  dir: string,
+  base?: Record<string, unknown>,
+  ship?: { write(chunk: string): void },
+): NodeLogger {
   const fileLevel = fileLevelFromEnv(env);
   return createNodeLogger({
     level: levelFromEnv(env),
     ...(fileLevel === "off" ? {} : { dir, fileLevel }),
     ...(base ? { base } : {}),
+    ...(ship ? { ship } : {}),
   });
 }

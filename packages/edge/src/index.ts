@@ -32,3 +32,6 @@ export type { HubProbeOptions, HubProbeResult } from "./hub-probe.js";
 export { createNodeLogger, createNodeLoggerFromEnv, levelFromEnv, fileLevelFromEnv } from "./logger.js";
 export type { LoggerOptions, LogLevel, NodeLogger } from "./logger.js";
 export { scrubString, scrubValue, REDACTED } from "./redact.js";
+export { collectHealth, diskFreeBytes, HealthCounters } from "./health.js";
+export { ceilingFromEnv, LogShipper, shipperStream } from "./log-shipper.js";
+export type { LogShipperOptions, ShipSend } from "./log-shipper.js";

@@ -32,9 +32,12 @@ import { homedir, platform as osPlatform } from "node:os";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  ceilingFromEnv,
   createNodeLoggerFromEnv,
   detectRuntimes,
   ENROLMENT_REJECTED_EXIT_CODE,
+  LogShipper,
+  shipperStream,
   startEdgeNode,
   type EdgeOptions,
 } from "@dahrk/edge";
@@ -296,7 +299,12 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
   // markers it always printed (so the supervisor's node.out.log is unchanged), and the same records land in
   // node.jsonl with levels, correlation ids and stacks - at `debug`, whatever stdout is set to, because you
   // never learn you wanted debug until after the incident.
-  const logger = createNodeLoggerFromEnv(env, logDir(env), { nodeId, clientVersion: CLIENT_VERSION });
+  // The shipper is built BEFORE the logger, because it has to BE one of the logger's streams. It ships
+  // nothing until the hub's `welcome` grants it permission - and never more than `DAHRK_TELEMETRY` allows,
+  // which is the operator's ceiling and outranks anything the hub asks for.
+  const shipper = new LogShipper({ ceiling: ceilingFromEnv(env) });
+
+  const logger = createNodeLoggerFromEnv(env, logDir(env), { nodeId, clientVersion: CLIENT_VERSION }, shipperStream(shipper));
 
   // The net under every best-effort `.catch()` seam in the node. Before this, one stray rejection from any
   // background path killed the process and printed a single line with no stack.
@@ -324,6 +332,7 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
   await startEdgeNode({
     ...buildEdgeOptions(env, resolved),
     logger,
+    shipper,
     ...(persist
       ? {
           onEnrolled: (welcome) =>

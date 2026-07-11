@@ -11,9 +11,11 @@
 import { randomUUID } from "node:crypto";
 import { arch as osArch, platform as osPlatform } from "node:os";
 import { WebSocket } from "ws";
-import type { CredentialMode, EdgeToHub, HubToEdge, Runtime } from "@dahrk/contracts";
+import type { CredentialMode, EdgeToHub, HubToEdge, NodeErrorClass, Runtime } from "@dahrk/contracts";
 import { decode, encode, isEnrolmentRejection } from "@dahrk/contracts";
 import { createGitService, makeRunner, type GitLogger } from "@dahrk/executor-worktree";
+import { collectHealth, HealthCounters } from "./health.js";
+import { ceilingFromEnv, LogShipper } from "./log-shipper.js";
 import { createNodeLogger, levelFromEnv, type NodeLogger } from "./logger.js";
 import { denyToolRule, type PolicyRule } from "./policy.js";
 import {
@@ -28,6 +30,23 @@ import {
  *  not a transient failure. Distinct so a supervisor stops the node (pm2 `stop_exit_codes: [78]`)
  *  instead of crash-looping; any other non-zero exit still means "restart me". */
 export const ENROLMENT_REJECTED_EXIT_CODE = 78;
+
+/**
+ * Bucket a stage failure into a class for the health report.
+ *
+ * This is a lossy mapping ON PURPOSE. The health report is metadata that leaves machines we do not own,
+ * so it may carry the fact that git operations are failing, but never the message that would name the
+ * repository they are failing against. Reading the message here to produce a bucket is fine - the message
+ * itself does not leave this function.
+ */
+function classifyError(e: unknown): NodeErrorClass {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (/\bgit\b|worktree|clone|fetch|branch|checkout|remote/i.test(msg)) return "git";
+  if (/policy|denied|not permitted|forbidden/i.test(msg)) return "policy";
+  if (/hub|websocket|socket|awakeable/i.test(msg)) return "hub";
+  if (/runtime|claude|codex|\bpi\b|model|sdk|api key/i.test(msg)) return "runtime";
+  return "internal";
+}
 
 export interface EdgeOptions {
   hubUrl: string;
@@ -74,11 +93,21 @@ export interface EdgeOptions {
   /** The node's logger. `main.ts` passes one wired to `~/.dahrk/logs/node.jsonl`; omitted (tests,
    *  embedders) we log to stdout only, which keeps the line-tagged markers intact with no file I/O. */
   logger?: NodeLogger;
+  /** The shipper that batches log records up to the hub when policy permits. `main.ts` builds it and
+   *  attaches it as a third pino stream; omitted (tests, embedders) nothing is ever shipped. */
+  shipper?: LogShipper;
 }
 
 export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   const log = opts.logger ?? createNodeLogger({ level: levelFromEnv(process.env) });
   const rules: PolicyRule[] = opts.denyTool ? [denyToolRule(opts.denyTool)] : [];
+
+  // Running tallies for the self-report: uptime, reconnects, in-flight jobs, failure counts by class.
+  const counters = new HealthCounters();
+  const shipper = opts.shipper;
+  // The operator's local ceiling. The hub can ask for LESS than this; it can never ask for more. A node
+  // whose operator set DAHRK_TELEMETRY=off reports nothing at all, whatever the hub says.
+  const telemetryCeiling = ceilingFromEnv(process.env);
 
   // Wire the git service's logger seam. It has always existed (`GitLogger`, with meaningful calls on
   // every clone, mirror refresh and worktree create) but no production call site ever passed one, so it
@@ -118,6 +147,16 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(encode(msg));
   };
 
+  // Give the shipper its transport, and start its flush timer. `send` returns false when the socket is
+  // down, which is the shipper's signal to KEEP the batch rather than lose it - bounded by its ring, so a
+  // node offline for an hour does not consume memory reporting on the fact.
+  shipper?.attach((records) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(encode({ type: "node-log", records }));
+    return true;
+  });
+  shipper?.start();
+
   // Consecutive missed pongs before we call the socket dead. Three beats is 15s at the 5000ms
   // default: long enough to ride out a slow hub, far short of the hub's 2100s stage backstop.
   const MISSED_PONGS_BEFORE_DEAD = 3;
@@ -139,7 +178,23 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         sock.terminate(); // -> `close` -> the existing 500ms reconnect
         return;
       }
-      send({ type: "heartbeat" });
+      // The self-report rides the frame that was already going. Health is metadata only - numbers, enums
+      // and a version string - which is what makes it safe to send from a machine we do not own. Suppressed
+      // entirely when the operator set DAHRK_TELEMETRY=off; an older hub simply ignores the extra field.
+      const health = shipper?.current().health ?? telemetryCeiling.health;
+      send(
+        health
+          ? {
+              type: "heartbeat",
+              health: collectHealth({
+                counters,
+                clientVersion: opts.clientVersion ?? "0.0.0",
+                runtimes: opts.runtimes,
+                worktreesDir: gitService.worktreesDir,
+              }),
+            }
+          : { type: "heartbeat" },
+      );
       if (sock.readyState === WebSocket.OPEN) sock.ping();
     }, intervalMs);
   };
@@ -208,6 +263,9 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   void stageRunner
     .reapWorktrees()
     .then((r) => {
+      // `scanned - reaped` is what is still on disk: the gauge that would have made the DHK-371 worktree
+      // leak visible from the hub instead of from a full disk.
+      counters.worktreeCount = Math.max(r.scanned - r.reaped.length, 0);
       if (r.reaped.length) {
         log.info(
           { reaped: r.reaped, scanned: r.scanned, skipped: r.skipped },
@@ -240,8 +298,19 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       if (opts.heartbeatMs === undefined && msg.heartbeatMs > 0 && ws) {
         startHeartbeat(ws, msg.heartbeatMs);
       }
+      // Apply the hub's telemetry policy exactly where `retention` and `heartbeatMs` are already applied.
+      // The shipper clamps it to the local ceiling, so an operator opt-out always survives contact with
+      // the hub. An older hub sends no `telemetry` at all, which correctly leaves the node on its own
+      // default (health on, logs off).
+      if (msg.telemetry && shipper) shipper.setPolicy(msg.telemetry);
       log.info(
-        { name: msg.name, tenantId: msg.tenantId, credentialMode: msg.credentialMode, heartbeatMs: msg.heartbeatMs },
+        {
+          name: msg.name,
+          tenantId: msg.tenantId,
+          credentialMode: msg.credentialMode,
+          heartbeatMs: msg.heartbeatMs,
+          ...(shipper ? { telemetry: shipper.current() } : {}),
+        },
         `EDGE_WELCOMED:${msg.name} tenant=${msg.tenantId} credentialMode=${msg.credentialMode}`,
       );
       // The token is now known-good: let the caller cache it. Never fatal - failing to persist only
@@ -263,6 +332,14 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         pendingBlob.delete(msg.reqId);
         resolve({ key: msg.key, ...(msg.url ? { url: msg.url } : {}) });
       }
+      return;
+    }
+    if (msg.type === "policy") {
+      // An operator turning this node's logs up (or down) WITHOUT restarting it - which matters because
+      // the moment you want a node's debug logs is the moment it is misbehaving, and bouncing it destroys
+      // the state you were trying to look at. Still clamped to the local ceiling by the shipper.
+      shipper?.setPolicy(msg.telemetry);
+      log.info({ telemetry: shipper?.current() ?? msg.telemetry }, `EDGE_POLICY:logs=${shipper?.current().logs ?? msg.telemetry.logs}`);
       return;
     }
     if (msg.type === "cancel") {
@@ -349,6 +426,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       return;
     }
     running.add(job.jobId);
+    counters.activeJobs = running.size;
     const startedAt = Date.now();
     jobLog.info({}, `JOB_STARTED:${job.stageId} ${job.jobId}`);
     try {
@@ -368,10 +446,14 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       };
       rememberResult(job.jobId, frame);
       send(frame);
+      // The COUNT goes in the health report; the message does not. A count says this node is failing to
+      // check out; the message would say which private repository it was failing to check out FROM.
+      counters.recordError(classifyError(e));
       // `err` carries the stack into the file sink - the old code dropped it and kept only `.message`.
       jobLog.error({ err: e, durationMs: Date.now() - startedAt }, `JOB_ERROR:${job.stageId} ${(e as Error).message}`);
     } finally {
       running.delete(job.jobId);
+      counters.activeJobs = running.size;
     }
   };
 
@@ -380,6 +462,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     ws = sock;
     sock.on("open", () => {
       connectCount++;
+      counters.connectCount = connectCount;
       log.info({ hubUrl: opts.hubUrl, nodeId, connectCount }, "EDGE_CONNECTED");
       // Two-way handshake: announce ourselves with the runtimes we detected, our persisted
       // id, and host info; the hub replies `welcome` with our tenant + policy (or closes the socket on a

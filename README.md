@@ -231,6 +231,7 @@ env var.
 | `DAHRK_LOG_LEVEL` | Level for stdout (default `info`). The log **file** is written at `debug` regardless - see [`docs/logging.md`](docs/logging.md). |
 | `DAHRK_LOG_FILE_LEVEL` / `DAHRK_LOG_FILE` | Level for `node.jsonl` (default `debug`); set `DAHRK_LOG_FILE=0` to disable the file sink. |
 | `DAHRK_CRASH_EXIT` | Set `1` to exit on an uncaught exception rather than log it and carry on. |
+| `DAHRK_TELEMETRY` | `off` = tell the hub nothing about this node. `health` = health metadata only, never logs. A **ceiling the hub cannot raise**: it may ask for less, never more. Self-managed nodes ship no logs by default anyway - see [`docs/logging.md`](docs/logging.md). |
 
 > The legacy `SKAKEL_*` names are still accepted as aliases for every `DAHRK_*` variable during the
 > rename transition. See [`.env.example`](.env.example).
