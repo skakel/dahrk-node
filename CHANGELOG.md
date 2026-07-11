@@ -6,13 +6,15 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-11
+
 ### Added
 
 - Interactive stages now surface an agent's structured multiple-choice question as a proper Linear
   choice prompt with selectable options, instead of the question silently resolving to "the user did
   not answer" and the agent falling back to a plain-text paragraph nobody could reply to. Your pick is
   fed straight back to the agent and the stage continues. Only one question is shown at a time; if the
-  agent asks several at once, the first is shown and the rest are noted. (DHK-344)
+  agent asks several at once, the first is shown and the rest are noted.
 
 ## [0.1.4] - 2026-07-10
 
@@ -114,7 +116,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/dahrkai/dahrk-node/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/dahrkai/dahrk-node/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/dahrkai/dahrk-node/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/dahrkai/dahrk-node/compare/v0.1.1...v0.1.2
