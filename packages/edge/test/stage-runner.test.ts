@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JobRequest, PushJob, Runner, RunnerContext, TraceEvent, TraceMeta } from "@dahrk/contracts";
+import type { JobProgress, JobRequest, PushJob, Runner, RunnerContext, TraceEvent, TraceMeta } from "@dahrk/contracts";
 import { createGitService, createMockRunner } from "@dahrk/executor-worktree";
 import { createStageRunner, resolveStageArtifact, type BlobPutRequestArgs, type TraceSink } from "../src/stage-runner.js";
 
@@ -622,6 +622,87 @@ test("DHK-371: a job that throws before `finish` must not leave the run marked b
       false,
       "the in-flight marker is released even though the job threw before `finish`",
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("action and observation progress frames carry a shared toolUseId through a parallel/deferred sequence", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dahrk-sr-corr-"));
+  const repo = join(root, "repo");
+  const worktrees = join(root, "wt");
+  execFileSync("mkdir", ["-p", repo]);
+  initRepo(repo);
+
+  // A runner mimicking parallel/deferred tools: two tool calls are issued before either result
+  // arrives, and the results return out of call order (B before A). Adjacency alone would mis-pair
+  // action A with observation B; only the toolUseId makes correlation robust (DHK-384). tu-A's output
+  // is > PREVIEW (500) chars to prove a result is no longer clipped mid-content.
+  const bigOutput = "x".repeat(2000);
+  const makeInterleavedRunner = (runtime: Runner["runtime"]): Runner => ({
+    runtime,
+    async runBatch(_ctx: RunnerContext, onTrace: (event: TraceEvent) => void) {
+      const ts = new Date().toISOString();
+      const events: TraceEvent[] = [
+        { seq: 0, runtime, type: "action", ts, tool: "ToolSearch", toolUseId: "tu-A", input: { q: "A" } },
+        { seq: 1, runtime, type: "action", ts, tool: "Read", toolUseId: "tu-B", input: { q: "B" } },
+        { seq: 2, runtime, type: "observation", ts, toolUseId: "tu-B", output: { ok: "B" } },
+        { seq: 3, runtime, type: "observation", ts, toolUseId: "tu-A", output: bigOutput },
+        { seq: 4, runtime, type: "response", ts, text: "done" },
+      ];
+      for (const event of events) onTrace(event);
+      return { status: "ok" };
+    },
+    async runInteractive() {
+      return { status: "ok", summary: "unused" };
+    },
+    async summarise() {
+      return "mock summary";
+    },
+    async cancel() {},
+  });
+
+  const captured: (JobProgress & { toolUseId?: string })[] = [];
+  const runner = createStageRunner({
+    gitService: createGitService({ worktreesDir: worktrees, mirrorsDir: join(root, "mir") }),
+    makeRunner: makeInterleavedRunner,
+    rules: [],
+    sendProgress: (p) => void captured.push(p),
+  });
+
+  const job: JobRequest = {
+    tenantId: "t_default",
+    runId: "run-corr-1",
+    stageId: "build",
+    jobId: "job-corr-1",
+    awakeableId: "awk-corr",
+    executorType: "worktree",
+    agentConfig: { runtime: "claude-code", interaction: "batch", tools: ["shell"] },
+    workspaceRef: { repoId: "repo", gitUrl: repo, repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
+    timeout: 60,
+  };
+
+  try {
+    const result = await runner.runJob(job);
+    assert.equal(result.status, "ok");
+
+    const actions = captured.filter((p) => p.kind === "action");
+    const observations = captured.filter((p) => p.kind === "observation");
+    assert.deepEqual(actions.map((p) => p.toolUseId), ["tu-A", "tu-B"], "every action frame carries its toolUseId");
+    assert.deepEqual(
+      observations.map((p) => p.toolUseId),
+      ["tu-B", "tu-A"],
+      "every observation frame carries its toolUseId, in emission order",
+    );
+
+    // Pair by id, not adjacency: tu-A's result arrives after tu-B's, yet still resolves to action A.
+    const actA = actions.find((p) => p.toolUseId === "tu-A");
+    const obsA = observations.find((p) => p.toolUseId === "tu-A");
+    assert.ok(actA && obsA, "both the action and observation for tu-A were emitted");
+    assert.equal(obsA!.toolUseId, actA!.toolUseId, "an action and its observation share a toolUseId");
+
+    // The 2000-char result survives whole (RESULT cap), not clipped to the 500-char PREVIEW.
+    assert.equal(obsA!.text, bigOutput, "the observation result is transmitted whole, not truncated at 500");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
