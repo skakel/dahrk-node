@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-11
+
 ### Added
 
 - `dahrk status`: is this node enrolled (and as whom), what runtimes can it serve, and is the
@@ -13,20 +15,20 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   offline - `doctor` remains the one that checks the hub is reachable and the token still valid. It
   calls out the state that was previously invisible: a service that is installed but *not running*
   (crash-looping or failing to load), and exits non-zero for it so it can be used as a health check.
+  (#36)
 
 ### Fixed
 
 - The service unit was world-readable (`0644`) and holds your enrolment token in its environment
   block. `dahrk service install` now writes it `0600`, and re-installing tightens the mode on a unit an
   older client left readable. If you installed the service before this release, re-run
-  `dahrk service install` to fix the file already on disk.
+  `dahrk service install` to fix the file already on disk. (#36)
 - The installed service pointed at a *versioned* Node path (e.g.
   `/opt/homebrew/Cellar/node/26.5.0/bin/node`, which is what `process.execPath` reports for a Homebrew
   Node). The next `brew upgrade node` deletes that directory, so the node would silently stop serving
   Jobs and crash-loop every 10 seconds forever. The unit now prefers a stable path that resolves to the
   same binary (`/opt/homebrew/opt/node/bin/node`), verified rather than assumed. Re-run
-  `dahrk service install` to repin an already-installed service.
-
+  `dahrk service install` to repin an already-installed service. (#36)
 - Enrolment did not survive a restart. `dahrk start --token <token>` enrolled and ran, but the token
   was never saved, so the moment you stopped the node a plain `dahrk start` died with
   `EDGE_REJECTED:4400 an enrolment token is required` - every reboot, service restart, and update
@@ -35,7 +37,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   one-time act and later runs re-attach as the same node with no token. `doctor`, `run`, and
   `service install` use the cached token too. Pass `--token` again to re-enrol with a rotated token,
   and `--ephemeral` still keeps everything off disk. Only a token the hub has actually welcomed is
-  cached, so a typo is never written.
+  cached, so a typo is never written. (#36)
 
 ## [0.1.7] - 2026-07-11
 
@@ -190,7 +192,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/dahrkai/dahrk-node/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/dahrkai/dahrk-node/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/dahrkai/dahrk-node/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/dahrkai/dahrk-node/compare/v0.1.4...v0.1.5
