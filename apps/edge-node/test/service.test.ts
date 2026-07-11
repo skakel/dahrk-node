@@ -9,6 +9,11 @@ import {
   runServiceUninstall,
   LAUNCHD_LABEL,
   SYSTEMD_UNIT,
+  UNIT_FILE_MODE,
+  stableNodeBin,
+  parseServiceStatus,
+  statusCommand,
+  unitPath,
   type PlanInputs,
   type ServiceDeps,
 } from "../src/service.ts";
@@ -186,4 +191,89 @@ test("uninstall: a missing service is a no-op success and removes nothing", asyn
   const code = await runServiceUninstall(deps);
   assert.equal(code, 0);
   assert.equal(removed.length, 0);
+});
+
+// --- The unit file is a secret, and must survive a Node upgrade -------------------------------
+
+test("stableNodeBin: a Homebrew Cellar path becomes the stable opt symlink that survives `brew upgrade`", () => {
+  // `brew upgrade node` deletes .../Cellar/node/26.5.0, so a unit pinned to it crash-loops forever.
+  const cellar = "/opt/homebrew/Cellar/node/26.5.0/bin/node";
+  const realpath = (p: string): string | undefined =>
+    p === "/opt/homebrew/opt/node/bin/node" || p === "/opt/homebrew/bin/node" ? cellar : undefined;
+  assert.equal(stableNodeBin(cellar, realpath), "/opt/homebrew/opt/node/bin/node");
+});
+
+test("stableNodeBin: a versioned formula (node@22) maps to its own opt symlink, not plain `node`", () => {
+  const cellar = "/opt/homebrew/Cellar/node@22/22.1.0/bin/node";
+  const realpath = (p: string): string | undefined =>
+    p === "/opt/homebrew/opt/node@22/bin/node" ? cellar : "/some/other/node";
+  assert.equal(stableNodeBin(cellar, realpath), "/opt/homebrew/opt/node@22/bin/node");
+});
+
+test("stableNodeBin: an alias that resolves elsewhere is never used (verified, not assumed)", () => {
+  // A stale/hand-made symlink pointing at a DIFFERENT node must not be substituted.
+  const cellar = "/opt/homebrew/Cellar/node/26.5.0/bin/node";
+  assert.equal(stableNodeBin(cellar, () => "/usr/local/bin/node"), cellar);
+});
+
+test("stableNodeBin: non-Homebrew layouts (system node, nvm) are returned unchanged", () => {
+  const nvm = "/Users/x/.nvm/versions/node/v22.1.0/bin/node";
+  assert.equal(stableNodeBin(nvm, () => nvm), nvm, "nvm has no stable alias to prefer");
+  assert.equal(stableNodeBin("/usr/bin/node", () => "/usr/bin/node"), "/usr/bin/node");
+});
+
+test("install: the unit carries the token, so it is written 0600 and never world-readable", async () => {
+  const written: Array<{ path: string; mode?: number }> = [];
+  const deps: Partial<ServiceDeps> = {
+    platform: "darwin",
+    homeDir: "/home/u",
+    nodeBin: "/usr/bin/node",
+    scriptPath: "/opt/dahrk/main.js",
+    logDir: "/home/u/.dahrk/logs",
+    mkdirp: () => {},
+    writeFile: (path) => void written.push({ path }),
+    run: () => 0,
+    out: () => {},
+  };
+  const code = await runServiceInstall({ token: "sket_abc" }, deps);
+  assert.equal(code, 0);
+  // The real `writeFile` dep is what enforces the mode; assert the constant it uses is owner-only, so a
+  // change to it fails here rather than silently widening a file that holds a live token.
+  assert.equal(UNIT_FILE_MODE, 0o600);
+  assert.equal(written[0]?.path, "/home/u/Library/LaunchAgents/ai.dahrk.node.plist");
+});
+
+// --- Reading the supervisor back, for `dahrk status` ------------------------------------------
+
+test("parseServiceStatus: launchd reports the pid when up, and not-running when the job has no PID", () => {
+  const up = { code: 0, stdout: '{\n\t"PID" = 79747;\n\t"Label" = "ai.dahrk.node";\n}' };
+  assert.deepEqual(parseServiceStatus("launchd", true, up), { installed: true, running: true, pid: 79747 });
+  const down = { code: 0, stdout: '{\n\t"LastExitStatus" = 78;\n}' };
+  assert.deepEqual(parseServiceStatus("launchd", true, down), { installed: true, running: false });
+});
+
+test("parseServiceStatus: systemd is running only when ActiveState=active", () => {
+  const up = { code: 0, stdout: "ActiveState=active\nMainPID=4242\n" };
+  assert.deepEqual(parseServiceStatus("systemd", true, up), { installed: true, running: true, pid: 4242 });
+  const failed = { code: 0, stdout: "ActiveState=failed\nMainPID=0\n" };
+  assert.deepEqual(parseServiceStatus("systemd", true, failed), { installed: true, running: false });
+});
+
+test("parseServiceStatus: a unit on disk the supervisor does not know is installed-but-down", () => {
+  // The state worth surfacing: the file is there, so it LOOKS installed, but nothing is keeping it up.
+  assert.deepEqual(parseServiceStatus("launchd", true, { code: 113, stdout: "" }), {
+    installed: true,
+    running: false,
+  });
+  assert.deepEqual(parseServiceStatus("launchd", false, { code: 113, stdout: "" }), {
+    installed: false,
+    running: false,
+  });
+});
+
+test("unitPath / statusCommand: the paths and probes match what install actually registered", () => {
+  assert.equal(unitPath("launchd", "/home/u"), "/home/u/Library/LaunchAgents/ai.dahrk.node.plist");
+  assert.equal(unitPath("systemd", "/home/u"), "/home/u/.config/systemd/user/dahrk-node.service");
+  assert.deepEqual(statusCommand("launchd"), ["launchctl", "list", LAUNCHD_LABEL]);
+  assert.deepEqual(statusCommand("systemd").slice(0, 3), ["systemctl", "--user", "show"]);
 });
