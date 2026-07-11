@@ -148,6 +148,12 @@ export interface StageRunner {
 
 const nowIso = (): string => new Date().toISOString();
 const PREVIEW = 500;
+/** Tool results (`observation` output) get a far larger cap than the noisy PREVIEW kinds: the hub folds
+ *  a result into its action's `result` field (DHK-385), so it is user-facing content that must survive
+ *  whole in practice, not be clipped mid-content at 500 chars (DHK-384). Bounded to keep pathological
+ *  outputs (a whole-repo grep, a large file read) off the control socket; the full-fidelity output is
+ *  still preserved in the trace archive via the `outputRef` spill. */
+const RESULT = 16_000;
 
 /**
  * Forward-compat shim over `@dahrk/contracts@0.1.0`, which predates DHK-264's backup-push fields. The
@@ -176,10 +182,17 @@ const putBytes = async (url: string, body: Buffer, contentType: string): Promise
  *  without reading this edge's trace files. Intermediate steps (thoughts, tool inputs/outputs,
  *  errors) are a bounded PREVIEW: they are noisy and only need to be glanceable. The final
  *  `response` and a gate `elicitation` prompt are the agent's user-facing output that a human reads
- *  in full, so they are sent whole and NOT clipped (matching the engine summary, posted unbounded). */
-function previewOf(event: TraceEvent): { text?: string; tool?: string } {
-  const clip = (v: unknown): string =>
-    (typeof v === "string" ? v : JSON.stringify(v) ?? "").slice(0, PREVIEW);
+ *  in full, so they are sent whole and NOT clipped (matching the engine summary, posted unbounded).
+ *
+ *  `action` and `observation` also carry their `toolUseId` (DHK-384), so the hub can pair a tool call
+ *  with its result by id rather than by adjacency, which breaks when parallel/deferred tools interleave
+ *  (e.g. `ToolSearch`). Observation output uses the larger RESULT cap so a folded result is not lost
+ *  mid-content. `toolUseId` is additive on the wire: `JobProgress` in the published `@dahrk/contracts`
+ *  predates the field, so it rides through the plain-JSON transport untyped until the contract is
+ *  republished (same forward-compat pattern as the PushMode shim above). */
+function previewOf(event: TraceEvent): { text?: string; tool?: string; toolUseId?: string } {
+  const clip = (v: unknown, max = PREVIEW): string =>
+    (typeof v === "string" ? v : JSON.stringify(v) ?? "").slice(0, max);
   switch (event.type) {
     case "response":
       return event.text !== undefined ? { text: event.text } : {};
@@ -188,9 +201,16 @@ function previewOf(event: TraceEvent): { text?: string; tool?: string } {
     case "thought":
       return event.text !== undefined ? { text: clip(event.text) } : {};
     case "action":
-      return { tool: event.tool, ...(event.input !== undefined ? { text: clip(event.input) } : {}) };
+      return {
+        tool: event.tool,
+        toolUseId: event.toolUseId,
+        ...(event.input !== undefined ? { text: clip(event.input) } : {}),
+      };
     case "observation":
-      return event.output !== undefined ? { text: clip(event.output) } : {};
+      return {
+        toolUseId: event.toolUseId,
+        ...(event.output !== undefined ? { text: clip(event.output, RESULT) } : {}),
+      };
     case "error":
       return { text: clip(event.message) };
     default:

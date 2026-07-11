@@ -40,6 +40,22 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   to the node's own default when it reconnects, so a debugging act cannot quietly become a standing
   setting. (#42)
 
+### Changed
+
+- **A tool's result is no longer clipped mid-sentence, and no longer lands against the wrong tool.**
+  Progress frames carried a tool call and its result as two adjacent items with nothing tying them
+  together, so the hub had to pair them by adjacency. That holds only while tools run strictly one at a
+  time: the moment a stage runs tools in parallel, or a tool's result comes back deferred, the frames
+  interleave and a result gets attributed to whichever call happened to precede it. You would read a
+  file's contents underneath a search you never ran.
+
+  Each `action` and `observation` now carries the tool-use id it belongs to, so a result is matched to
+  its call by identity rather than by luck of ordering. Result output also gets its own budget of 16,000
+  characters instead of sharing the 500-character preview budget used for noisy intermediate steps,
+  which was clipping real content a human was meant to read. Output beyond that ceiling is still
+  truncated on the wire, deliberately, to keep a whole-repo grep off the control socket - the full
+  output survives in the trace archive either way. (#44)
+
 ### Fixed
 
 - **`dahrk stop` no longer reports success while a node keeps running.** `stop` drives the service it
