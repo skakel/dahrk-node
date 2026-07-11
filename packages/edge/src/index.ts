@@ -13,7 +13,7 @@
  *
  * Built at M3 (mock Runner; +M4 real adapters, +M6 governance builtins).
  */
-export { startEdgeNode } from "./ws-client.js";
+export { startEdgeNode, ENROLMENT_REJECTED_EXIT_CODE } from "./ws-client.js";
 export type { EdgeOptions } from "./ws-client.js";
 export { createStageRunner } from "./stage-runner.js";
 export type {
@@ -29,3 +29,6 @@ export { detectRuntimes, probeRuntimeStatuses } from "./detect-runtimes.js";
 export type { RuntimeStatus } from "./detect-runtimes.js";
 export { probeHub } from "./hub-probe.js";
 export type { HubProbeOptions, HubProbeResult } from "./hub-probe.js";
+export { createNodeLogger, createNodeLoggerFromEnv, levelFromEnv, fileLevelFromEnv } from "./logger.js";
+export type { LoggerOptions, LogLevel, NodeLogger } from "./logger.js";
+export { scrubString, scrubValue, REDACTED } from "./redact.js";

@@ -13,7 +13,8 @@ import { arch as osArch, platform as osPlatform } from "node:os";
 import { WebSocket } from "ws";
 import type { CredentialMode, EdgeToHub, HubToEdge, Runtime } from "@dahrk/contracts";
 import { decode, encode, isEnrolmentRejection } from "@dahrk/contracts";
-import { createGitService, makeRunner } from "@dahrk/executor-worktree";
+import { createGitService, makeRunner, type GitLogger } from "@dahrk/executor-worktree";
+import { createNodeLogger, levelFromEnv, type NodeLogger } from "./logger.js";
 import { denyToolRule, type PolicyRule } from "./policy.js";
 import {
   createStageRunner,
@@ -70,12 +71,26 @@ export interface EdgeOptions {
   /** Abort to stop the node: closes the socket and suppresses the reconnect. For embedders that own
    *  the process lifecycle (and for tests); `main.ts` lets process exit do it. */
   signal?: AbortSignal;
+  /** The node's logger. `main.ts` passes one wired to `~/.dahrk/logs/node.jsonl`; omitted (tests,
+   *  embedders) we log to stdout only, which keeps the line-tagged markers intact with no file I/O. */
+  logger?: NodeLogger;
 }
 
-const log = (line: string): void => void process.stdout.write(`${line}\n`);
-
 export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
+  const log = opts.logger ?? createNodeLogger({ level: levelFromEnv(process.env) });
   const rules: PolicyRule[] = opts.denyTool ? [denyToolRule(opts.denyTool)] : [];
+
+  // Wire the git service's logger seam. It has always existed (`GitLogger`, with meaningful calls on
+  // every clone, mirror refresh and worktree create) but no production call site ever passed one, so it
+  // resolved to the no-op and every git operation on a real node was silent - which is exactly the
+  // information you want when a run fails to check out. Git detail is mapped to `debug`: it belongs in
+  // the forensic file always, but should not clutter stdout unless the operator asks for it.
+  const gitLog = log.child({ component: "git" });
+  const gitLogger: GitLogger = {
+    info: (msg) => gitLog.debug(msg),
+    warn: (msg) => gitLog.warn(msg),
+  };
+
   // Late-bound: the git service needs to know which runs are live (so clearing a stale branch claim can
   // never stomp one), but the stage runner that tracks that is constructed below, with the git service
   // as a dependency. Before it exists no run can be mid-stage, so `false` is the correct default.
@@ -84,6 +99,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     worktreesDir: opts.worktreesDir,
     mirrorsDir: opts.mirrorsDir,
     isBusy: (runId) => stageRunnerRef?.isBusy(runId) ?? false,
+    logger: gitLogger,
   });
 
   let ws: WebSocket | undefined;
@@ -91,6 +107,9 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let lastPongAt = 0;
   let shuttingDown = false;
+  /** How many times we have connected. A flapping node (DHK-109/DHK-216) is one whose count climbs
+   *  while its uptime does not; without it, a reconnect storm leaves no trace. */
+  let connectCount = 0;
   // Set once the startup promise is wired; called on a fatal hub rejection so a pre-connect failure
   // rejects `startEdgeNode` (main.ts then exits non-zero) and a post-connect one stops the poll.
   let onFatal: ((err: Error) => void) | undefined;
@@ -114,8 +133,9 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     if (heartbeat) clearInterval(heartbeat);
     lastPongAt = Date.now();
     heartbeat = setInterval(() => {
-      if (Date.now() - lastPongAt > MISSED_PONGS_BEFORE_DEAD * intervalMs) {
-        log(`EDGE_STALE:${Date.now() - lastPongAt}ms without a pong, terminating socket`);
+      const sincePongMs = Date.now() - lastPongAt;
+      if (sincePongMs > MISSED_PONGS_BEFORE_DEAD * intervalMs) {
+        log.warn({ sincePongMs, intervalMs }, `EDGE_STALE:${sincePongMs}ms without a pong, terminating socket`);
         sock.terminate(); // -> `close` -> the existing 500ms reconnect
         return;
       }
@@ -166,6 +186,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   const stageDeps: StageRunnerDeps = {
     gitService,
     makeRunner,
+    logger: log,
     ...(opts.servesRepoIds ? { servesRepoIds: opts.servesRepoIds } : {}),
     ...(opts.tenantId ? { tenantId: opts.tenantId } : {}),
     rules,
@@ -187,10 +208,15 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   void stageRunner
     .reapWorktrees()
     .then((r) => {
-      if (r.reaped.length) log(`EDGE_REAPED:${r.reaped.length} worktrees (scanned ${r.scanned}, skipped ${r.skipped})`);
-      for (const e of r.errors) log(`EDGE_REAP_ERROR:${e}`);
+      if (r.reaped.length) {
+        log.info(
+          { reaped: r.reaped, scanned: r.scanned, skipped: r.skipped },
+          `EDGE_REAPED:${r.reaped.length} worktrees (scanned ${r.scanned}, skipped ${r.skipped})`,
+        );
+      }
+      for (const e of r.errors) log.warn({ reapError: e }, `EDGE_REAP_ERROR:${e}`);
     })
-    .catch((e: unknown) => log(`EDGE_REAP_ERROR:${(e as Error).message}`));
+    .catch((e: unknown) => log.warn({ err: e }, `EDGE_REAP_ERROR:${(e as Error).message}`));
 
   // A persisted UUID identifies the node; fall back to an ephemeral one if none was provided.
   const nodeId = opts.nodeId ?? randomUUID();
@@ -214,7 +240,10 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       if (opts.heartbeatMs === undefined && msg.heartbeatMs > 0 && ws) {
         startHeartbeat(ws, msg.heartbeatMs);
       }
-      log(`EDGE_WELCOMED:${msg.name} tenant=${msg.tenantId} credentialMode=${msg.credentialMode}`);
+      log.info(
+        { name: msg.name, tenantId: msg.tenantId, credentialMode: msg.credentialMode, heartbeatMs: msg.heartbeatMs },
+        `EDGE_WELCOMED:${msg.name} tenant=${msg.tenantId} credentialMode=${msg.credentialMode}`,
+      );
       // The token is now known-good: let the caller cache it. Never fatal - failing to persist only
       // means the next boot needs `--token` again, which must not take down a healthy node.
       try {
@@ -224,7 +253,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
           credentialMode: msg.credentialMode,
         });
       } catch (e) {
-        log(`EDGE_ENROL_PERSIST_FAILED ${(e as Error).message}`);
+        log.warn({ err: e }, `EDGE_ENROL_PERSIST_FAILED ${(e as Error).message}`);
       }
       return;
     }
@@ -237,7 +266,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       return;
     }
     if (msg.type === "cancel") {
-      log(`JOB_CANCEL:${msg.jobId}`);
+      log.info({ jobId: msg.jobId }, `JOB_CANCEL:${msg.jobId}`);
       stageRunner.cancel(msg.jobId);
       return;
     }
@@ -247,25 +276,28 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       if (msg.end === "cancel") stageRunner.cancel(msg.jobId);
       else if (msg.end === "complete") stageRunner.endTurns(msg.jobId);
       else if (msg.turn) stageRunner.enqueueTurn(msg.jobId, msg.turn);
-      log(`JOB_TURN:${msg.jobId}${msg.end ? `:${msg.end}` : ""}`);
+      log.info({ jobId: msg.jobId, ...(msg.end ? { end: msg.end } : {}) }, `JOB_TURN:${msg.jobId}${msg.end ? `:${msg.end}` : ""}`);
       return;
     }
     if (msg.type === "push") {
       // The `open-pr` action's git side: commit the worktree + push the run's branch, then resolve
       // the hub action handler's awakeable with the result. Mirrors the `job` path.
       const { job } = msg;
+      // Bind the correlation ids once, so every line this push emits can be joined to the hub's run.
+      const pushLog = log.child({ runId: job.runId, jobId: job.jobId, branch: job.branch });
       if (running.has(job.jobId)) {
-        log(`PUSH_DUPLICATE:${job.runId} ${job.jobId}`);
+        pushLog.warn({}, `PUSH_DUPLICATE:${job.runId} ${job.jobId}`);
         return;
       }
       const cachedPush = lastResults.get(job.jobId);
       if (cachedPush) {
         send(cachedPush);
-        log(`PUSH_REPLAY:${job.runId} ${job.jobId}`);
+        pushLog.info({}, `PUSH_REPLAY:${job.runId} ${job.jobId}`);
         return;
       }
       running.add(job.jobId);
-      log(`PUSH_STARTED:${job.runId} ${job.branch}`);
+      const pushStartedAt = Date.now();
+      pushLog.info({}, `PUSH_STARTED:${job.runId} ${job.branch}`);
       try {
         const result = await stageRunner.runPush(job);
         const frame: EdgeToHub = { type: "push-result", awakeableId: job.awakeableId, result };
@@ -273,7 +305,10 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         send(frame);
         // Log the git reason on failure (not just the status) so the edge transcript shows WHY the
         // push did not land - otherwise the cause is lost on a managed node.
-        log(`PUSH_DONE:${job.runId} ${result.status}${result.status !== "ok" ? ` - ${result.summary}` : ""}`);
+        pushLog.info(
+          { status: result.status, summary: result.summary, durationMs: Date.now() - pushStartedAt },
+          `PUSH_DONE:${job.runId} ${result.status}${result.status !== "ok" ? ` - ${result.summary}` : ""}`,
+        );
       } catch (e) {
         const frame: EdgeToHub = {
           type: "push-result",
@@ -282,7 +317,8 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
         };
         rememberResult(job.jobId, frame);
         send(frame);
-        log(`PUSH_ERROR:${job.runId} ${(e as Error).message}`);
+        // `err` carries the stack to the file sink; the marker line on stdout stays as it was.
+        pushLog.error({ err: e, durationMs: Date.now() - pushStartedAt }, `PUSH_ERROR:${job.runId} ${(e as Error).message}`);
       } finally {
         running.delete(job.jobId);
       }
@@ -290,26 +326,40 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     }
     if (msg.type !== "job") return;
     const { job } = msg;
+    // The same correlation ids the trace carries (`TraceMeta`), bound onto the log plane. This is what
+    // lets `dahrk logs --run <id>` and the hub's `/api/runs/:runId` describe the same run.
+    const jobLog = log.child({
+      runId: job.runId,
+      stageId: job.stageId,
+      jobId: job.jobId,
+      ...(job.tenantId ? { tenantId: job.tenantId } : {}),
+      ...(job.agentConfig?.runtime ? { runtime: job.agentConfig.runtime } : {}),
+      ...(job.agentConfig?.model ? { model: job.agentConfig.model } : {}),
+    });
     if (running.has(job.jobId)) {
       // A re-dispatch of a still-running stage: drop it. The original runJob still owns the worktree
       // and will resolve the (shared) awakeable; a second runner here would corrupt the worktree.
-      log(`JOB_DUPLICATE:${job.stageId} ${job.jobId}`);
+      jobLog.warn({}, `JOB_DUPLICATE:${job.stageId} ${job.jobId}`);
       return;
     }
     const cachedJob = lastResults.get(job.jobId);
     if (cachedJob) {
       send(cachedJob);
-      log(`JOB_REPLAY:${job.stageId} ${job.jobId}`);
+      jobLog.info({}, `JOB_REPLAY:${job.stageId} ${job.jobId}`);
       return;
     }
     running.add(job.jobId);
-    log(`JOB_STARTED:${job.stageId} ${job.jobId}`);
+    const startedAt = Date.now();
+    jobLog.info({}, `JOB_STARTED:${job.stageId} ${job.jobId}`);
     try {
       const result = await stageRunner.runJob(job);
       const frame: EdgeToHub = { type: "result", awakeableId: job.awakeableId, result };
       rememberResult(job.jobId, frame);
       send(frame);
-      log(`JOB_DONE:${job.stageId} ${result.status}`);
+      jobLog.info(
+        { status: result.status, costUsd: result.costUsd, summary: result.summary, durationMs: Date.now() - startedAt },
+        `JOB_DONE:${job.stageId} ${result.status}`,
+      );
     } catch (e) {
       const frame: EdgeToHub = {
         type: "result",
@@ -318,7 +368,8 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       };
       rememberResult(job.jobId, frame);
       send(frame);
-      log(`JOB_ERROR:${job.stageId} ${(e as Error).message}`);
+      // `err` carries the stack into the file sink - the old code dropped it and kept only `.message`.
+      jobLog.error({ err: e, durationMs: Date.now() - startedAt }, `JOB_ERROR:${job.stageId} ${(e as Error).message}`);
     } finally {
       running.delete(job.jobId);
     }
@@ -328,7 +379,8 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     const sock = new WebSocket(opts.hubUrl);
     ws = sock;
     sock.on("open", () => {
-      log("EDGE_CONNECTED");
+      connectCount++;
+      log.info({ hubUrl: opts.hubUrl, nodeId, connectCount }, "EDGE_CONNECTED");
       // Two-way handshake: announce ourselves with the runtimes we detected, our persisted
       // id, and host info; the hub replies `welcome` with our tenant + policy (or closes the socket on a
       // bad token). `credentialMode` is sent only as an explicit operator override; otherwise the hub
@@ -361,7 +413,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     sock.on("pong", () => {
       lastPongAt = Date.now();
     });
-    sock.on("error", (e) => log(`EDGE_ERROR ${(e as Error).message}`));
+    sock.on("error", (e) => log.error({ err: e, hubUrl: opts.hubUrl }, `EDGE_ERROR ${(e as Error).message}`));
     sock.on("close", (code: number, reason: Buffer) => {
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = undefined;
@@ -372,12 +424,17 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       if (isEnrolmentRejection(code)) {
         shuttingDown = true;
         const detail = reason.toString() || "enrolment rejected";
-        log(`EDGE_REJECTED:${code} ${detail}`);
+        log.error({ closeCode: code, detail, fatal: true }, `EDGE_REJECTED:${code} ${detail}`);
         process.exitCode = ENROLMENT_REJECTED_EXIT_CODE;
         onFatal?.(new Error(`hub rejected edge enrolment (${code}): ${detail}`));
         return;
       }
-      if (!shuttingDown) reconnectTimer = setTimeout(connect, 500); // reconnect with a small backoff
+      if (!shuttingDown) {
+        // Every reconnect is a datapoint: a node that flaps (DHK-109/DHK-216) shows up here as a
+        // climbing `connectCount` against a steady uptime, which is otherwise invisible.
+        log.warn({ closeCode: code, reason: reason.toString(), connectCount }, `EDGE_DISCONNECTED:${code} reconnecting in 500ms`);
+        reconnectTimer = setTimeout(connect, 500); // reconnect with a small backoff
+      }
     });
   };
 

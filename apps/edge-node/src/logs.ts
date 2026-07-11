@@ -12,7 +12,7 @@
  * how many lines, follow or not - are testable without spawning anything.
  */
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, statSync, truncateSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 
 /** Beyond this, the log is rotated on the next node boot. The node logs a line per lifecycle event, so
  *  this is months of normal operation - it exists to bound a pathological case (a crash-loop, a chatty
@@ -40,10 +40,73 @@ export function logsCommand(inputs: LogsInputs): string[] {
 
 export interface LogsDeps {
   files: { out: string; err: string };
+  /** The node's own structured log (`node.jsonl`), read by the `--run` / `--level` / `--json` mode. */
+  jsonlFile: string;
   fileExists: (path: string) => boolean;
+  readFile: (path: string) => string;
   /** Spawn tail, inheriting stdio, and resolve with its exit code. */
   run: (argv: string[]) => Promise<number>;
   out: (line: string) => void;
+}
+
+/** Levels, loudest last. `--level warn` means warn, error and fatal. */
+const LEVEL_RANK: Record<string, number> = { trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 60 };
+
+/** One line of `node.jsonl`. pino writes `level` as a NUMBER, which is why the filter compares ranks
+ *  rather than names. Everything else is whatever we bound onto the record. */
+interface LogRecord {
+  level: number;
+  time: string;
+  msg: string;
+  runId?: string;
+  stageId?: string;
+  jobId?: string;
+  component?: string;
+  err?: { type?: string; message?: string; stack?: string };
+  [k: string]: unknown;
+}
+
+const levelName = (n: number): string =>
+  Object.entries(LEVEL_RANK).find(([, rank]) => rank === n)?.[0] ?? String(n);
+
+/** Parse a JSONL log, skipping torn lines (we may be reading while the node writes). */
+export function parseRecords(raw: string): LogRecord[] {
+  const out: LogRecord[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as LogRecord);
+    } catch {
+      /* a torn final line is normal; the rest of the log is still worth reading */
+    }
+  }
+  return out;
+}
+
+/** Apply the `--level` / `--run` filters and cap to the last `lines`. Pure, so it unit-tests directly. */
+export function filterRecords(
+  records: LogRecord[],
+  q: { level?: string | undefined; run?: string | undefined; lines: number },
+): LogRecord[] {
+  const min = q.level ? (LEVEL_RANK[q.level] ?? 0) : 0;
+  const matched = records.filter((r) => r.level >= min && (q.run === undefined || r.runId === q.run));
+  return q.lines > 0 ? matched.slice(-q.lines) : matched;
+}
+
+/**
+ * Render one record for a human.
+ *
+ * The structured mode is the one you reach for when something is wrong, so it leads with what you are
+ * scanning for - when, how bad, and which run - and puts the message last where the eye lands. A stack,
+ * when there is one, is worth every line it costs: it is the reason this mode exists.
+ */
+export function renderRecord(r: LogRecord): string[] {
+  const where = [r.runId, r.stageId].filter(Boolean).join("/");
+  const scope = where ? ` [${where}]` : r.component ? ` [${r.component}]` : "";
+  const head = `${r.time} ${levelName(r.level).toUpperCase().padEnd(5)}${scope} ${r.msg}`;
+  const lines = [head];
+  if (r.err?.stack) lines.push(...r.err.stack.split("\n").map((l) => `    ${l}`));
+  return lines;
 }
 
 /**
@@ -54,9 +117,15 @@ export interface LogsDeps {
  * instead, and point at the command that explains why.
  */
 export async function runLogs(
-  inputs: { lines: number; follow: boolean },
+  inputs: { lines: number; follow: boolean; level?: string | undefined; run?: string | undefined; json?: boolean },
   deps: LogsDeps,
 ): Promise<number> {
+  // Any of --level / --run / --json means "read the structured log", because none of them can be
+  // answered from the plain transcript: it has no levels, no ids, and no JSON.
+  if (inputs.level !== undefined || inputs.run !== undefined || inputs.json) {
+    return runStructuredLogs(inputs, deps);
+  }
+
   const files = [deps.files.out, deps.files.err].filter((f) => deps.fileExists(f));
   if (files.length === 0) {
     deps.out("No logs yet - this node has not run under the service.");
@@ -66,6 +135,53 @@ export async function runLogs(
     return 0;
   }
   return deps.run(logsCommand({ files, lines: inputs.lines, follow: inputs.follow }));
+}
+
+/**
+ * The `--run` / `--level` / `--json` mode: read `node.jsonl`, filter, print.
+ *
+ * `--follow` here shells out to `tail -f` on the raw JSONL rather than re-implementing follow. That is a
+ * deliberate limitation, stated in the message rather than hidden: filtering a growing file properly
+ * means a streaming parser, and the honest 90% answer is to hand the operator a `tail -f | jq` they can
+ * see and adjust. Piping them a command beats pretending we filtered when we did not.
+ */
+async function runStructuredLogs(
+  inputs: { lines: number; follow: boolean; level?: string | undefined; run?: string | undefined; json?: boolean },
+  deps: LogsDeps,
+): Promise<number> {
+  if (!deps.fileExists(deps.jsonlFile)) {
+    deps.out("No structured log yet - this node has not run since structured logging was added.");
+    deps.out("Start it with `dahrk start`; it writes ~/.dahrk/logs/node.jsonl from the first boot.");
+    return 0;
+  }
+
+  if (inputs.follow) {
+    // Be straight about it rather than silently dropping the filters on the floor.
+    deps.out("(--follow on the structured log streams it unfiltered; pipe it through jq to narrow it:)");
+    deps.out(`  tail -f ${deps.jsonlFile} | jq -c 'select(.runId == "<runId>")'`);
+    deps.out("");
+    return deps.run(["tail", "-n", String(inputs.lines), "-f", deps.jsonlFile]);
+  }
+
+  const records = filterRecords(parseRecords(deps.readFile(deps.jsonlFile)), {
+    level: inputs.level,
+    run: inputs.run,
+    lines: inputs.lines,
+  });
+
+  if (records.length === 0) {
+    const narrowed = [inputs.run ? `run ${inputs.run}` : undefined, inputs.level ? `level ${inputs.level}+` : undefined]
+      .filter(Boolean)
+      .join(" at ");
+    deps.out(narrowed ? `No records for ${narrowed}.` : "No records.");
+    return 0;
+  }
+
+  for (const r of records) {
+    if (inputs.json) deps.out(JSON.stringify(r));
+    else for (const line of renderRecord(r)) deps.out(line);
+  }
+  return 0;
 }
 
 /**
@@ -89,9 +205,11 @@ export function rotateIfLarge(file: string, maxBytes: number = MAX_LOG_BYTES): v
   }
 }
 
-export const defaultLogsDeps = (files: { out: string; err: string }): LogsDeps => ({
+export const defaultLogsDeps = (files: { out: string; err: string }, jsonlFile: string): LogsDeps => ({
   files,
+  jsonlFile,
   fileExists: (path) => existsSync(path),
+  readFile: (path) => readFileSync(path, "utf8"),
   run: (argv) =>
     new Promise((resolve) => {
       const [cmd, ...args] = argv;
