@@ -20,16 +20,6 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
-- Interactive stages now surface an agent's structured multiple-choice question as a proper Linear
-  choice prompt with selectable options, instead of the question silently resolving to "the user did
-  not answer" and the agent falling back to a plain-text paragraph nobody could reply to. Your pick is
-  fed straight back to the agent and the stage continues. Only one question is shown at a time; if the
-  agent asks several at once, the first is shown and the rest are noted.
-
-## [0.1.4] - 2026-07-10
-
-### Added
-
 - `dahrk service install` / `uninstall`: run the node as an always-on service without a process
   manager. It generates and registers a launchd LaunchAgent on macOS or a systemd *user* service on
   Linux that runs `dahrk start` on boot, restarts on failure, and streams logs - no pm2, no root. The
@@ -39,14 +29,35 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   never surface in `ps`), along with the operator's PATH so the daemon finds `git` and the runtime CLIs
   (claude / codex / pi) that a supervisor's minimal PATH would otherwise hide. A bad or missing token
   exits 78 (`EX_CONFIG`): systemd stops the service and launchd throttles retries to one every 10s, so
-  the misconfiguration stays visible rather than hammering the hub. (DHK-231)
+  the misconfiguration stays visible rather than hammering the hub. (#22)
+
+- An enforceable `read_only` policy for a stage: it denies every write and shell tool outright while
+  still allowing reads (`Read` / `Grep` / `Glob`). Previously `shell_guard: deny` only blocked a small
+  dangerous-command blocklist, so effectful shells like `git push`, `curl -X POST`, and `>` / `>>`
+  redirection writes slipped through - there was no way to express a genuinely read-only stage. (#24)
+
+- Interactive stages now surface an agent's structured multiple-choice question as a proper Linear
+  choice prompt with selectable options, instead of the question silently resolving to "the user did
+  not answer" and the agent falling back to a plain-text paragraph nobody could reply to. Your pick is
+  fed straight back to the agent and the stage continues. Only one question is shown at a time; if the
+  agent asks several at once, the first is shown and the rest are noted. (#25)
+
+### Changed
+
+- The node now advertises its resolved worktree base to the hub when it connects, so a run's real
+  worktree location (`~/.dahrk/worktrees/<runId>`, or your `DAHRK_WORKTREES_DIR`) is recorded in the
+  hub's projection instead of an advisory placeholder. Observability only; never control flow. (#23)
+
+## [0.1.4] - 2026-07-10
+
+### Added
 
 - `dahrk update`: a local, user-initiated self-update to the latest published client. It reads this
   build's version, asks the npm registry for the newest release (the single source of "latest" across
   every channel), and - when behind - detects how the client was installed (npm / Homebrew / curl) and
   runs the right upgrade in place, or prints the exact command when it cannot safely automate it. It
   reports `current -> latest`, is a no-op when already current, and `--check` reports availability
-  without applying. No hub involvement; the same local path a future remote upgrade reuses.
+  without applying. No hub involvement; the same local path a future remote upgrade reuses. (#18)
 
 - `dahrk run <workflow>`: run a workflow through the engine locally against this node's worktree, the
   engine-backed twin of `doctor` and the first slice of a general `dahrk run`. The first workflow is
@@ -54,18 +65,29 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   plain-English read, and links the full report at `app.dahrk.ai/r/<runId>`, streaming `[n/5] <stage>`
   progress as it goes. It runs with no Linear, no OAuth, and no issue, and exits non-zero only on an
   unsound floor (old Node, not a git repo, git missing, worktree unwritable); a tool or hub it cannot
-  reach is a finding, not a failure.
+  reach is a finding, not a failure. (#17)
+
+### Fixed
 
 - Harden `deliver`: when a run branch adds nothing over the (possibly advanced) base - an empty delta,
   or one consisting solely of the engine-owned scratch dir or other git-ignored paths - the push now
   short-circuits to an explicit `noop` outcome. Nothing is pushed and no PR is opened; the run closes
   as a successful "already delivered" no-op rather than risking a base-advanced merge conflict on a
-  stray scratch path. A genuine code delta still integrates and pushes as before.
-
-### Fixed
+  stray scratch path. A genuine code delta still integrates and pushes as before. (#16)
 
 - Enforce edge policy decisions before Claude tool execution, and reject declared or handed-back
-  artifact paths that escape the run worktree.
+  artifact paths that escape the run worktree. (#19)
+
+- A stage that had already finished no longer re-runs when the hub re-sends its frame. The node
+  de-duped only against the set of in-flight jobs, which clears on completion, so a re-dispatched job
+  started a second runner and redid the agent's work at full token cost; it now replays the cached
+  result instead. A job that is neither running nor cached still re-runs, which is the genuine
+  recovery path. (#20)
+
+- Detect a dead hub connection instead of streaming into it. A half-open TCP connection leaves the
+  WebSocket reporting itself as open, so a node could send trace events to a hub that no longer knew
+  about it, never reconnect, and never receive its job again. The heartbeat now pings and terminates
+  the socket after three missed replies, letting the node reconnect. (#20)
 
 ## [0.1.3] - 2026-07-07
 
