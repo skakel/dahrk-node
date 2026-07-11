@@ -35,15 +35,29 @@ import { detectRuntimes, startEdgeNode, type EdgeOptions } from "@dahrk/edge";
 import type { CredentialMode, Runtime } from "@dahrk/contracts";
 import { parseCli, usage, type RunFlags, type StartFlags } from "./cli.js";
 import { runDoctor } from "./doctor.js";
+import { defaultLockDeps, acquireLock } from "./lock.js";
+import { defaultLogsDeps, rotateIfLarge, runLogs } from "./logs.js";
 import { runPreflight } from "./preflight.js";
-import { runServiceInstall, runServiceUninstall } from "./service.js";
-import { runUpdate } from "./update.js";
+import { runNodeStart, runNodeStop, runServiceInstall, runServiceUninstall } from "./service.js";
+import { fetchLatestVersion, runUpdate } from "./update.js";
+import {
+  checkForUpdate,
+  checkIntervalMs,
+  checkSuppressed,
+  jitterMs,
+  renderUpdateLogLine,
+  renderUpdateNotice,
+  type UpdateCheckDeps,
+} from "./update-check.js";
 import { runStatus, type StatusDeps } from "./status.js";
 import {
   legacyStateDir,
+  lockFile,
+  logFiles,
   persistEnrolment,
   readState,
   resolveEnrolToken,
+  setDesired,
   stateFile,
   writeState,
 } from "./state.js";
@@ -189,14 +203,76 @@ function envWithFlags(env: NodeJS.ProcessEnv, flags: StartFlags): NodeJS.Process
   return merged;
 }
 
-/** Run the node: resolve identity + runtimes, then dial the hub and serve Jobs (blocks until exit).
+/** Should this invocation run the worker in-process rather than hand the node to a supervisor?
  *
- *  Enrolment is a one-time act: `--token` / `DAHRK_ENROL_TOKEN` wins, but absent both we present the
- *  token cached by the last successful enrolment, so a bare `dahrk start` (or a reboot) re-attaches
- *  rather than dying with "an enrolment token is required". We cache the token only once the hub has
- *  welcomed it, so a typo is never written to disk. */
-async function start(flags: StartFlags): Promise<void> {
+ *  `DAHRK_SUPERVISED` is set by the unit we install, alongside the `--foreground` in its argv: a supervised
+ *  process MUST run the worker, because "ensure the node is running" is exactly what its supervisor is
+ *  already doing - it would see itself running, exit, and be restarted into the same no-op forever.
+ *  `DAHRK_FOREGROUND` is the operator's own spelling of `--foreground`, for a Dockerfile or a pm2 config
+ *  where setting an env var is easier than threading an argument. */
+function wantsForeground(env: NodeJS.ProcessEnv, flags: StartFlags): boolean {
+  return flags.foreground || env.DAHRK_FOREGROUND === "1" || env.DAHRK_SUPERVISED === "1";
+}
+
+/** `dahrk start`: make the node run, and come back. Installs (or repairs) the service, starts it, and
+ *  returns - unless this host cannot supervise anything, or the operator asked for the worker directly, in
+ *  which case we run it here and block. */
+async function start(flags: StartFlags): Promise<number> {
   const env = envWithFlags(process.env, flags);
+  if (wantsForeground(env, flags)) return startForeground(env, flags);
+
+  // Interactive only: the operator is here, at a prompt, about to commit to running this version for
+  // months. It is the one good moment to mention there is a newer one.
+  await offerUpdate(env);
+
+  const outcome = await runNodeStart({
+    ...(resolveEnrolToken(env) ? { token: resolveEnrolToken(env) as string } : {}),
+    ...(env.DAHRK_NODE_NAME ? { name: env.DAHRK_NODE_NAME } : {}),
+    ...(env.DAHRK_HUB_URL ? { hubUrl: env.DAHRK_HUB_URL } : {}),
+  });
+
+  if (outcome.kind === "error") return outcome.code;
+  if (outcome.kind === "running") {
+    setDesired(env, "running");
+    return 0;
+  }
+  // Daemonising is impossible here (no supervisor, or no user session - a container). Running the worker
+  // inline is the honest thing to do: the alternative is to "install" a service that can never start.
+  console.warn(`${outcome.reason}; running the node in this terminal instead.`);
+  console.warn("Use `dahrk start --foreground` (or DAHRK_FOREGROUND=1) to ask for this explicitly.");
+  return startForeground(env, flags);
+}
+
+/**
+ * Run the node in THIS process: resolve identity + runtimes, then dial the hub and serve Jobs (blocks
+ * until exit). This is what the installed service invokes, and what a container / pm2 / CI should invoke.
+ *
+ * Enrolment is a one-time act: `--token` / `DAHRK_ENROL_TOKEN` wins, but absent both we present the
+ * token cached by the last successful enrolment, so a bare start (or a reboot) re-attaches rather than
+ * dying with "an enrolment token is required". We cache the token only once the hub has welcomed it, so a
+ * typo is never written to disk.
+ */
+async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promise<number> {
+  // One node per host. The node's id is persisted and re-presented on every dial, so a second copy is not
+  // a second node - it is this node, dialling twice and racing itself for Jobs. An ephemeral node mints a
+  // throwaway id and so cannot collide with anything: it is the one case where a second process is sound.
+  if (!flags.ephemeral) {
+    const lock = acquireLock(defaultLockDeps(lockFile(env)));
+    if (!lock.ok) {
+      console.error(`A node is already running on this host (pid ${lock.heldBy}).`);
+      console.error("Follow it with `dahrk logs -f`, or stop it with `dahrk stop` first.");
+      // Non-zero: we were asked to run a node and did not. Exiting 0 here would tell a supervisor the
+      // worker had finished cleanly, and it would cheerfully restart it into the same refusal.
+      return 1;
+    }
+    process.on("exit", lock.release);
+  }
+
+  // Boot is the one moment nothing is mid-write, so it is when we bound the log files.
+  const files = logFiles(env);
+  rotateIfLarge(files.out);
+  rotateIfLarge(files.err);
+
   const nodeId = resolveNodeId(env, { ephemeral: flags.ephemeral });
   const token = resolveEnrolToken(env, { ephemeral: flags.ephemeral });
   if (token) env.DAHRK_ENROL_TOKEN = token;
@@ -207,6 +283,10 @@ async function start(flags: StartFlags): Promise<void> {
         "none and serve no Jobs. Install a runtime or set DAHRK_RUNTIMES to override. Run `dahrk doctor` to check.",
     );
   }
+  if (!flags.ephemeral) setDesired(env, "running");
+  // Nobody is watching a daemon's stdin, so it never prompts - it just says so in the log, once a day.
+  scheduleUpdateChecks(env);
+
   const resolved: ResolvedBoot = { nodeId, runtimes, clientVersion: CLIENT_VERSION };
   const persist = token !== undefined && !flags.ephemeral;
   await startEdgeNode({
@@ -218,6 +298,72 @@ async function start(flags: StartFlags): Promise<void> {
         }
       : {}),
   });
+  // startEdgeNode blocks for the life of the node; reaching here is a clean shutdown.
+  return 0;
+}
+
+/** `dahrk stop`: stop the node, and remember that we meant it - so `status` reports a stopped node as
+ *  stopped rather than as a crash-loop, and so its exit code stays a usable health check. */
+async function stop(env: NodeJS.ProcessEnv): Promise<number> {
+  const code = await runNodeStop();
+  if (code === 0) setDesired(env, "stopped");
+  return code;
+}
+
+/** The IO the update check runs on: the clock, the registry, and the state file it caches into. */
+function updateCheckDeps(env: NodeJS.ProcessEnv): UpdateCheckDeps {
+  return {
+    env,
+    now: () => Date.now(),
+    binPath: process.argv[1],
+    readState: () => readState(stateFile(env)),
+    saveResult: (patch) => writeState(env, patch),
+    fetchLatest: fetchLatestVersion,
+  };
+}
+
+/** Is there a human at a terminal to answer a question? A piped or redirected `dahrk start` - the curl
+ *  installer, a provisioning script, CI - must never block waiting on an answer nobody is there to give. */
+const isInteractive = (): boolean => Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
+/** Ask a yes/no question, defaulting to yes on a bare Enter. */
+async function confirm(question: string): Promise<boolean> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(`${question} [Y/n] `)).trim().toLowerCase();
+    return answer === "" || answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+/** The interactive half of the update check: tell the operator they are behind, and offer to fix it while
+ *  they are here. A failed upgrade is reported but never fatal - being on an old client is not a reason to
+ *  refuse to start the node. */
+async function offerUpdate(env: NodeJS.ProcessEnv): Promise<void> {
+  const available = await checkForUpdate(CLIENT_VERSION, updateCheckDeps(env));
+  if (!available) return;
+  console.log(renderUpdateNotice(available));
+  if (!isInteractive()) return;
+  if (!(await confirm("update now?"))) return;
+  const code = await runUpdate({ currentVersion: CLIENT_VERSION, check: false });
+  if (code !== 0) console.warn("Update failed; starting the node on the current version anyway.");
+}
+
+/** The daemon half: no prompt, no self-update, just a line in the log so that whoever eventually reads it
+ *  (or greps a fleet's logs) can see the node is behind. Jittered, so a thousand nodes booted from one
+ *  image do not all ask npm the same question in the same second. */
+function scheduleUpdateChecks(env: NodeJS.ProcessEnv): void {
+  if (checkSuppressed(env)) return;
+  const deps = updateCheckDeps(env);
+  const tick = async (): Promise<void> => {
+    const available = await checkForUpdate(CLIENT_VERSION, deps);
+    if (available) process.stdout.write(`${renderUpdateLogLine(available)}\n`);
+  };
+  // unref'd throughout: an update check must never be the reason a node refuses to exit.
+  setTimeout(() => void tick(), jitterMs(Math.random())).unref();
+  setInterval(() => void tick(), checkIntervalMs(env)).unref();
 }
 
 /** The real IO `dahrk status` runs on: the host, the state file, the supervisor probe. Kept here (not in
@@ -227,6 +373,7 @@ function statusDeps(env: NodeJS.ProcessEnv): StatusDeps {
     platform: osPlatform(),
     homeDir: homedir(),
     env,
+    binPath: process.argv[1],
     detectRuntimes: () => resolveRuntimes(env),
     fileExists: (path) => existsSync(path),
     capture: (argv) => {
@@ -337,8 +484,26 @@ async function main(): Promise<void> {
       process.exitCode = await runUpdate({ currentVersion: CLIENT_VERSION, check: parsed.flags.check });
       break;
     case "start":
-      await start(parsed.flags);
+      process.exitCode = await start(parsed.flags);
       break;
+    case "stop":
+      process.exitCode = await stop(applyEnvAliases(process.env));
+      break;
+    case "restart": {
+      const env = envWithFlags(process.env, parsed.flags);
+      const code = await stop(env);
+      if (code !== 0) {
+        process.exitCode = code;
+        break;
+      }
+      process.exitCode = await start(parsed.flags);
+      break;
+    }
+    case "logs": {
+      const env = applyEnvAliases(process.env);
+      process.exitCode = await runLogs(parsed.flags, defaultLogsDeps(logFiles(env)));
+      break;
+    }
   }
 }
 

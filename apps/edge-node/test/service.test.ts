@@ -1,12 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  availabilityCommand,
   detectManager,
   renderLaunchdPlist,
   renderSystemdUnit,
   buildPlan,
+  runNodeStart,
+  runNodeStop,
   runServiceInstall,
   runServiceUninstall,
+  serviceArgv,
+  unitIsCurrent,
   LAUNCHD_LABEL,
   SYSTEMD_UNIT,
   UNIT_FILE_MODE,
@@ -98,7 +103,8 @@ test("buildPlan: systemd path + systemctl --user enable/disable, linger is best-
   assert.deepEqual(plan.installCommands[1]?.argv, ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT]);
   const linger = plan.installCommands.find((c) => c.argv[0] === "loginctl");
   assert.equal(linger?.ignoreFailure, true);
-  assert.match(plan.logHint, /journalctl --user/);
+  // Both managers now write the same log files, so there is one hint on every platform.
+  assert.equal(plan.logHint, "dahrk logs -f");
 });
 
 /** A recording harness: capture printed lines, written files, and the loader commands that ran. */
@@ -276,4 +282,195 @@ test("unitPath / statusCommand: the paths and probes match what install actually
   assert.equal(unitPath("systemd", "/home/u"), "/home/u/.config/systemd/user/dahrk-node.service");
   assert.deepEqual(statusCommand("launchd"), ["launchctl", "list", LAUNCHD_LABEL]);
   assert.deepEqual(statusCommand("systemd").slice(0, 3), ["systemctl", "--user", "show"]);
+});
+
+// --- The daemon reshuffle: `start` now means "ensure running", so the supervised process must run the
+// --- WORKER. A unit that invoked bare `start` would have the daemon see itself running, exit, and be
+// --- restarted into the same no-op every ThrottleInterval - i.e. a node that silently stops serving Jobs.
+
+test("the unit runs the WORKER, not `start` - else the daemon would restart-loop on itself", () => {
+  assert.deepEqual(serviceArgv(BASE), [BASE.nodeBin, BASE.scriptPath, "start", "--foreground"]);
+
+  const plist = renderLaunchdPlist(BASE);
+  assert.match(plist, /<string>--foreground<\/string>/);
+  assert.match(plist, /<key>DAHRK_SUPERVISED<\/key>\s*\n\s*<string>1<\/string>/);
+
+  const unit = renderSystemdUnit({ ...BASE, manager: "systemd" });
+  assert.match(unit, /^ExecStart=.*main\.js start --foreground$/m);
+  assert.match(unit, /^Environment=DAHRK_SUPERVISED=1$/m);
+});
+
+test("systemd logs to the same files as launchd, so `dahrk logs` is one thing everywhere", () => {
+  const unit = renderSystemdUnit({ ...BASE, manager: "systemd" });
+  assert.match(unit, /^StandardOutput=append:\/Users\/me\/\.dahrk\/logs\/node\.out\.log$/m);
+  assert.match(unit, /^StandardError=append:\/Users\/me\/\.dahrk\/logs\/node\.err\.log$/m);
+});
+
+test("the render is DETERMINISTIC - the self-heal compares content, so drift here is an infinite loop", () => {
+  // `start` rewrites and reloads the unit whenever it differs from what it would write today. If the
+  // render were not byte-stable, every start would "repair" the unit and restart the node, forever.
+  const a = renderLaunchdPlist(BASE);
+  const b = renderLaunchdPlist({ ...BASE });
+  assert.equal(a, b);
+  assert.equal(renderSystemdUnit({ ...BASE, manager: "systemd" }), renderSystemdUnit({ ...BASE, manager: "systemd" }));
+
+  const plan = buildPlan(BASE);
+  assert.equal(unitIsCurrent(plan, a), true);
+  assert.equal(unitIsCurrent(plan, undefined), false, "no unit on disk is not current");
+  assert.equal(unitIsCurrent(plan, a.replace("--foreground", "")), false, "a pre-upgrade unit is stale");
+});
+
+test("stopCommands make a stop STICK - a stop that undid itself at the next boot is not a stop", () => {
+  // launchd re-loads an agent at the next login unless it is unloaded with -w; a systemd unit that is
+  // merely `stop`ped is still enabled, so it comes back at the next boot.
+  const launchd = buildPlan(BASE);
+  assert.deepEqual(launchd.stopCommands[0]?.argv, [
+    "launchctl",
+    "unload",
+    "-w",
+    `/Users/me/Library/LaunchAgents/${LAUNCHD_LABEL}.plist`,
+  ]);
+
+  const systemd = buildPlan({ ...BASE, manager: "systemd" });
+  assert.deepEqual(systemd.stopCommands[0]?.argv, ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT]);
+});
+
+test("availabilityCommand: systemd is probed with `show`, not `is-system-running`", () => {
+  // `is-system-running` exits non-zero on a healthy-but-`degraded` host, which would send a perfectly good
+  // machine down the foreground fallback for no reason.
+  assert.deepEqual(availabilityCommand("systemd"), ["systemctl", "--user", "show", "-p", "Version"]);
+  assert.equal(availabilityCommand("launchd"), undefined);
+});
+
+/** A harness for the start/stop shells: a fake host whose unit file and supervisor answers we control. */
+function startHarness(over: Partial<ServiceDeps> & { onDisk?: string } = {}): {
+  deps: Partial<ServiceDeps>;
+  lines: string[];
+  writes: Array<{ path: string; content: string }>;
+  ran: string[][];
+} {
+  const lines: string[] = [];
+  const writes: Array<{ path: string; content: string }> = [];
+  const ran: string[][] = [];
+  let onDisk = over.onDisk;
+  const deps: Partial<ServiceDeps> = {
+    platform: "darwin",
+    homeDir: "/Users/me",
+    nodeBin: BASE.nodeBin,
+    scriptPath: BASE.scriptPath,
+    logDir: BASE.logDir,
+    pathEnv: undefined,
+    mkdirp: () => {},
+    writeFile: (path, content) => {
+      writes.push({ path, content });
+      onDisk = content;
+    },
+    readFile: () => onDisk,
+    removeFile: () => {},
+    fileExists: () => onDisk !== undefined,
+    run: (argv) => {
+      ran.push(argv);
+      return 0;
+    },
+    capture: () => ({ code: 0, stdout: '\t"PID" = 4821;\n' }),
+    out: (l) => void lines.push(l),
+    ...over,
+  };
+  return { deps, lines, writes, ran };
+}
+
+test("runNodeStart: a healthy node is a NO-OP - `start` must not restart what is already working", async () => {
+  const current = renderLaunchdPlist(BASE);
+  const h = startHarness({ onDisk: current });
+
+  const outcome = await runNodeStart({ token: BASE.token }, h.deps);
+
+  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.equal(h.writes.length, 0, "the unit is already what we would write");
+  assert.equal(h.ran.length, 0, "and it is already up, so touching launchctl would be a restart in disguise");
+  assert.match(h.lines.join("\n"), /already running \(pid 4821\)/);
+});
+
+test("runNodeStart: SELF-HEALS a stale unit - this is what saves an upgraded node from crash-looping", async () => {
+  // The unit an older client wrote: it invokes bare `start`, which the new `start` would treat as
+  // "ensure running" -> exit 0 -> KeepAlive restarts it -> forever.
+  const stale = renderLaunchdPlist(BASE).replace(
+    "<string>--foreground</string>\n",
+    "",
+  );
+  const h = startHarness({ onDisk: stale });
+
+  const outcome = await runNodeStart({ token: BASE.token }, h.deps);
+
+  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.equal(h.writes.length, 1, "the stale unit is rewritten");
+  assert.match(h.writes[0]!.content, /--foreground/);
+  assert.deepEqual(
+    h.ran.map((c) => c[0]),
+    ["launchctl", "launchctl"],
+    "and reloaded, so the supervisor picks up the repaired unit",
+  );
+});
+
+test("runNodeStart: a stopped node is started again from the unit already on disk", async () => {
+  const h = startHarness({
+    onDisk: renderLaunchdPlist(BASE),
+    capture: () => ({ code: 0, stdout: '\t"LastExitStatus" = 0;\n' }), // loaded, no PID: not running
+  });
+
+  const outcome = await runNodeStart({ token: BASE.token }, h.deps);
+
+  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.equal(h.writes.length, 0, "the unit is current - only the loader needs to run");
+  assert.deepEqual(h.ran[1], ["launchctl", "load", "-w", `/Users/me/Library/LaunchAgents/${LAUNCHD_LABEL}.plist`]);
+});
+
+test("runNodeStart: no token and no unit is a clear error, not a mystery", async () => {
+  const h = startHarness();
+  const outcome = await runNodeStart({}, h.deps);
+  assert.deepEqual(outcome, { kind: "error", code: 2 });
+  assert.match(h.lines.join("\n"), /No enrolment token/);
+});
+
+test("runNodeStart: no token but an EXISTING unit still starts - the unit carries its own token", async () => {
+  const h = startHarness({ onDisk: renderLaunchdPlist(BASE), capture: () => ({ code: 1, stdout: "" }) });
+
+  const outcome = await runNodeStart({}, h.deps);
+
+  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.equal(h.writes.length, 0, "we cannot re-render without a token, so we must not try");
+  assert.ok(h.ran.length > 0, "but we can still load what is there");
+});
+
+test("runNodeStart: a host that cannot daemonise says so, and asks to be run in the foreground", async () => {
+  const windows = startHarness({ platform: "win32" });
+  assert.deepEqual(await runNodeStart({ token: BASE.token }, windows.deps), {
+    kind: "foreground",
+    reason: "no supported supervisor on this platform (launchd / systemd)",
+  });
+
+  // A Linux container: systemd exists as a binary, but there is no user session to talk to.
+  const container = startHarness({ platform: "linux", capture: () => ({ code: 1, stdout: "" }) });
+  const outcome = await runNodeStart({ token: BASE.token }, container.deps);
+  assert.equal(outcome.kind, "foreground");
+  assert.equal(container.writes.length, 0, "do not 'install' a service that could never start");
+});
+
+test("runNodeStop: stops without uninstalling, so `dahrk start` brings it straight back", async () => {
+  const h = startHarness({ onDisk: renderLaunchdPlist(BASE) });
+
+  assert.equal(await runNodeStop(h.deps), 0);
+
+  assert.deepEqual(h.ran, [
+    ["launchctl", "unload", "-w", `/Users/me/Library/LaunchAgents/${LAUNCHD_LABEL}.plist`],
+  ]);
+  assert.match(h.lines.join("\n"), /stay stopped across reboots until you run `dahrk start`/);
+});
+
+test("runNodeStop: nothing installed is not an error, and points at how you would actually stop it", async () => {
+  const h = startHarness();
+  assert.equal(await runNodeStop(h.deps), 0);
+  assert.equal(h.ran.length, 0);
+  assert.match(h.lines.join("\n"), /nothing to stop/);
+  assert.match(h.lines.join("\n"), /Ctrl-C/, "the likely case: they are running one in a terminal");
 });
