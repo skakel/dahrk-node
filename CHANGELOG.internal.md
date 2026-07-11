@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-11
+
 - Default an interactive stage's exit to `either` rather than `gate` in all three runtime adapters
   (claude / codex / pi). With `gate`, `wantsTool` is false so the stage-complete tool is never
   offered, leaving the hub's allow-keyword scan as the only `ok` path. (DHK-363, #31)
@@ -36,3 +38,4 @@ this file is left verbatim.
 - Introduce this internal changelog and the split-changelog convention. `pnpm release` now rolls both
   files; CI's "changelog entry required" gate accepts a note in either file; the public changelog lint
   and GitHub-release extraction stay scoped to `CHANGELOG.md`. (#32)
+

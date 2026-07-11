@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-11
+
 ### Fixed
 
 - Interactive stages that did not set `exit` could never finish. The default was `gate`, which
@@ -157,7 +159,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/dahrkai/dahrk-node/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/dahrkai/dahrk-node/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/dahrkai/dahrk-node/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/dahrkai/dahrk-node/compare/v0.1.3...v0.1.4
