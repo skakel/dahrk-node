@@ -60,6 +60,23 @@ export function toElicitQuestion(q: {
   return { prompt, options, ...(q.multiSelect ? { multiSelect: true } : {}) };
 }
 
+/**
+ * Build the `ElicitQuestion` to surface for a batch of questions from one tool call. v1 surfaces
+ * only the first; when >1 arrive together the degrade note is folded into the prompt so the human
+ * knows more are pending (DHK-223 D5 degrade philosophy: no denial, no forced retry loop).
+ */
+export function buildElicitFromQuestions(
+  questions: { question: string; options: { label: string; description?: string }[]; multiSelect?: boolean }[],
+): ElicitQuestion {
+  const first = questions[0]!;
+  const q = toElicitQuestion(first);
+  const prompt =
+    questions.length > 1
+      ? `${q.prompt}\n\n(Note: ${questions.length} questions were asked at once; answer this one first, then ask the rest.)`
+      : q.prompt;
+  return { ...q, prompt };
+}
+
 export function createAskUserQuestionTool(deps: {
   /** Surface the question as a Linear elicitation and block until the human replies. Returns the
    *  text handed back to the model (the selected value, or a soft note on no-reply / one-at-a-time). */
@@ -71,15 +88,7 @@ export function createAskUserQuestionTool(deps: {
       "when you need the human to choose between options before you can continue.",
     { questions: z.array(questionSchema).min(1) },
     async (args) => {
-      const first = args.questions[0]!;
-      const question = toElicitQuestion(first);
-      // v1 surfaces one question at a time. Note any extra questions in the prompt rather than
-      // denying the call or forcing a retry loop (the DHK-223 D5 degrade philosophy).
-      const prompt =
-        args.questions.length > 1
-          ? `${question.prompt}\n\n(Note: ${args.questions.length} questions were asked at once; answer this one first, then ask the rest.)`
-          : question.prompt;
-      const text = await deps.ask({ ...question, prompt });
+      const text = await deps.ask(buildElicitFromQuestions(args.questions));
       return { content: [{ type: "text", text }] };
     },
   );

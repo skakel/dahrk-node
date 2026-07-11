@@ -7,6 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   toElicitQuestion,
+  buildElicitFromQuestions,
   createAskUserQuestionTool,
   ASK_USER_QUESTION_TOOL_NAME,
   ASK_USER_QUESTION_ALIAS,
@@ -67,4 +68,32 @@ test("createAskUserQuestionTool exposes the server and the auto-approve tool nam
   const built = createAskUserQuestionTool({ ask: async () => "The user selected: A" });
   assert.equal(built.allowedToolName, ASK_USER_QUESTION_TOOL_NAME);
   assert.ok(built.server, "an in-process MCP server is created for the shadow tool");
+});
+
+test("buildElicitFromQuestions: a single question has no degrade note", () => {
+  const q = buildElicitFromQuestions([
+    { question: "Deploy now?", options: [{ label: "Yes" }, { label: "No" }] },
+  ]);
+  assert.ok(!q.prompt.includes("Note:"));
+  assert.equal(q.prompt, "Deploy now?");
+  assert.deepEqual(q.options, [
+    { label: "Yes", value: "Yes" },
+    { label: "No", value: "No" },
+  ]);
+});
+
+test("buildElicitFromQuestions: >1 questions surfaces only the first with a degrade note", () => {
+  const q = buildElicitFromQuestions([
+    { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+    { question: "Second?", options: [{ label: "C" }, { label: "D" }] },
+  ]);
+  // Only the first question's options are surfaced.
+  assert.deepEqual(q.options, [
+    { label: "A", value: "A" },
+    { label: "B", value: "B" },
+  ]);
+  // The prompt contains the first question and a note about the total count.
+  assert.ok(q.prompt.includes("First?"), "prompt starts with first question");
+  assert.ok(q.prompt.includes("2 questions were asked at once"), "total count is named");
+  assert.ok(q.prompt.includes("answer this one first"), "degrade note directs the human");
 });
