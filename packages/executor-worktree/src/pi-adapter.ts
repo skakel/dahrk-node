@@ -273,12 +273,12 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
 
 /**
  * The live session factory: embed Pi via `createAgentSession` bound to the stage worktree, with
- * brokered inference creds applied as runtime API-key overrides (never persisted). Loaded through a
- * variable-specifier dynamic import so `tsc` does not resolve the package at build time: the vendored
- * docs pin (0.73.1) is unavailable on npm and the exact installed version may drift, so the build must
- * not hard-depend on the SDK's types. This is the live path exercised end-to-end under a managed node
- * and refined by container isolation; the adapter orchestration itself is
- * covered by tests through the injected factory.
+ * brokered inference creds applied as runtime API-key overrides (never persisted). The SDK is a pinned
+ * dependency (`@earendil-works/pi-coding-agent@0.80.6`, published on npm) but is still loaded through a
+ * variable-specifier dynamic import as `any` so `tsc` does not resolve its types at build time: the
+ * package is loaded lazily only on the live path, so typecheck and the injected-fake tests never need
+ * it resolved. This is the live path exercised end-to-end under a managed node and refined by container
+ * isolation; the adapter orchestration itself is covered by tests through the injected factory.
  */
 async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike> {
   const spec = "@earendil-works/pi-coding-agent";
