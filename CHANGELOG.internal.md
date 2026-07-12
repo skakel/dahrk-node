@@ -19,6 +19,20 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Pin the pi SDK to an installable version, DHK-343
+
+- `pi-adapter` loaded `@earendil-works/pi-coding-agent` without the package being a declared dependency,
+  and its docstring still described `0.73.1` as "unavailable on npm". Pinned to an exact `0.80.6` in
+  `packages/executor-worktree/package.json` and refreshed the lockfile; `pnpm-workspace.yaml` sets
+  `allowBuilds: false` for the `@google/genai`/`protobufjs` build scripts the new dependency pulls in, so
+  `--frozen-lockfile` stays clean in CI.
+- The ticket's premise - that the SDK had removed the model-resolution API - was checked and is false:
+  `0.80.6` still exports `resolveCliModel`, so the working resolution path is left untouched. The change is
+  a dependency pin plus a corrected docstring, no behaviour change. Three adapter tests added for the
+  previously uncovered `runBatch` catch and `summarise` paths (143/143, `tsc` clean).
+- **Not verified:** the runtime path against `0.80.6`. The SDK is loaded as `any` and the tests inject
+  fakes, so the pin is proven to install and typecheck, not to execute.
+
 ## [0.1.13] - 2026-07-12
 
 ### Multi-question AskUserQuestion no longer discards questions 2..N, DHK-406 (#54)
