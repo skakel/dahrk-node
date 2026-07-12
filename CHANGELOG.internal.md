@@ -33,6 +33,26 @@ this file is left verbatim.
 - **Not verified:** the runtime path against `0.80.6`. The SDK is loaded as `any` and the tests inject
   fakes, so the pin is proven to install and typecheck, not to execute.
 
+### The changelog gate is now self-serviceable
+
+- The `changelog` CI job was the single biggest source of red PRs: four of the last five failures, every
+  one resolved by a human hand-pushing the note the author had missed. The harness half of that is already
+  fixed - `eca1004` (dahrk-harness #346) added a changelog step to the code-writing stage prompts - but it
+  landed at 16:48 UTC on 12 Jul, *after* both #54 (07:39) and #56 (15:51) had already gone red. Those two
+  failed with no instruction in play at all.
+- What was still missing is what that instruction points at. The prompt says "the README or contributor
+  guide says which file takes which kind of change", and no such guide existed: `CLAUDE.md` - the one file
+  every stage auto-loads - said nothing about the changelog, and there is no `CONTRIBUTING.md`. The routing
+  rule lived only in `README.md` and this file's header.
+- The rule now lives in one place, `scripts/check-changelog.mjs`, which `ci.yml` calls instead of
+  reimplementing it in inline bash. It is also exposed as `pnpm check:changelog`, and locally it diffs the
+  **working tree** (uncommitted and untracked included), so an agent mid-stage - which has not committed
+  anything, since the edge node only commits at deliver - sees the real verdict rather than a vacuous pass.
+- `CLAUDE.md` now states the rule categorically: a path under `packages/*/src` or `apps/*/src` needs a note,
+  full stop, including comment-only and dependency-only edits; an internal note always satisfies the gate;
+  omit the PR ref when you cannot know it. The gate's behaviour is unchanged - replayed against PRs #49-#56
+  it returns the identical verdict on every one.
+
 ## [0.1.13] - 2026-07-12
 
 ### Multi-question AskUserQuestion no longer discards questions 2..N, DHK-406 (#54)

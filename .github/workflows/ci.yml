@@ -43,23 +43,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The rule itself lives in scripts/check-changelog.mjs, not inline here, so `pnpm check:changelog`
+      # locally is the same check CI runs — an author (human or agent) can go green before pushing
+      # instead of discovering the gate from a red PR.
       - name: Require a changelog entry for source changes
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
-          CHANGED=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")
-          if ! echo "$CHANGED" | grep -qE '^(packages|apps)/[^/]+/src/'; then
-            echo "no source changes under packages/*/src or apps/*/src — changelog not required"
-            exit 0
-          fi
-          # A note in either changelog satisfies the gate: user-visible -> CHANGELOG.md; internal-only
-          # (refactor/tooling) -> CHANGELOG.internal.md.
-          if echo "$CHANGED" | grep -qxE 'CHANGELOG(\.internal)?\.md'; then
-            echo "source changed and a changelog (public or internal) was updated"
-            exit 0
-          fi
-          echo "::error::source changed but neither CHANGELOG.md nor CHANGELOG.internal.md was updated. Add a note under [Unreleased] (user-visible -> CHANGELOG.md with the PR ref (#N); internal-only -> CHANGELOG.internal.md), or apply the 'no-changelog' label if this PR genuinely needs no note."
-          exit 1
+        run: node scripts/check-changelog.mjs
