@@ -61,20 +61,25 @@ export function toElicitQuestion(q: {
 }
 
 /**
- * Build the `ElicitQuestion` to surface for a batch of questions from one tool call. v1 surfaces
- * only the first; when >1 arrive together the degrade note is folded into the prompt so the human
- * knows more are pending (DHK-223 D5 degrade philosophy: no denial, no forced retry loop).
+ * Drain a batch of questions through the one-at-a-time elicit surface (DHK-406). v1 surfaced only
+ * `questions[0]` and folded a prose "ask the rest later" note into the prompt, silently discarding
+ * `questions[1..N]`. Here each question is mapped to an `ElicitQuestion` and `ask`ed in turn: `ask`
+ * is awaited before the next is raised, so the router's one-elicit-in-flight rule (which forbids
+ * only *concurrent* asks) is never tripped. Every question reaches the human; none is dropped.
+ *
+ * The returned text is the single answer for a one-question batch (unchanged), or the per-question
+ * answers labelled `Q1..QN` so the model can tie each reply back to its question.
  */
-export function buildElicitFromQuestions(
+export async function askQuestionsSequentially(
   questions: { question: string; options: { label: string; description?: string }[]; multiSelect?: boolean }[],
-): ElicitQuestion {
-  const first = questions[0]!;
-  const q = toElicitQuestion(first);
-  const prompt =
-    questions.length > 1
-      ? `${q.prompt}\n\n(Note: ${questions.length} questions were asked at once; answer this one first, then ask the rest.)`
-      : q.prompt;
-  return { ...q, prompt };
+  ask: (question: ElicitQuestion) => Promise<string>,
+): Promise<string> {
+  const answers: string[] = [];
+  for (const q of questions) {
+    answers.push(await ask(toElicitQuestion(q)));
+  }
+  if (answers.length === 1) return answers[0]!;
+  return answers.map((a, i) => `Q${i + 1} (${questions[i]!.question}): ${a}`).join("\n");
 }
 
 export function createAskUserQuestionTool(deps: {
@@ -88,7 +93,7 @@ export function createAskUserQuestionTool(deps: {
       "when you need the human to choose between options before you can continue.",
     { questions: z.array(questionSchema).min(1) },
     async (args) => {
-      const text = await deps.ask(buildElicitFromQuestions(args.questions));
+      const text = await askQuestionsSequentially(args.questions, deps.ask);
       return { content: [{ type: "text", text }] };
     },
   );
