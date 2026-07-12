@@ -19,6 +19,32 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-07-12
+
+### Multi-question AskUserQuestion no longer discards questions 2..N, DHK-406 (#54)
+
+- `buildElicitFromQuestions` mapped `questions[0]` and threw the rest away, folding a prose note into the
+  prompt asking the agent to "ask the rest later". The agent could not: the tool call had already returned.
+  So the questions were not deferred, they were lost, and the stage continued on answers it never got. The
+  degrade was designed under DHK-223's D5 philosophy (no denial, no forced retry loop) on the belief that
+  the elicit surface could only ever carry one question — which is true of the *surface*, but was never a
+  reason to drop the others.
+- Replaced by an exported `async askQuestionsSequentially(questions, ask)` that maps each question and
+  `await`s `ask` in turn. The router's one-elicit-in-flight rule forbids only *concurrent* asks, and `ask`
+  clears `ref.settle` after each reply, so a sequential drain never trips it. One-question batches return
+  the bare answer exactly as before; multi-question batches return answers labelled `Q1..QN` so the model
+  can tie each reply back to its question.
+- **Note for the next reader:** this deletes `buildElicitFromQuestions`, which #49 extracted and pinned
+  only one release ago. That test asserted the drop *as correct behaviour* — it was, in the end, the
+  reproduction for this bug. A test can pin a defect just as faithfully as a feature; #49's real value was
+  making the behaviour visible enough to argue with.
+- **Deliberately out of scope:** the second half of the issue title — a later reply falling through to
+  `extractGate` and killing the stage. That gate hazard was confirmed **absent from this repo**; it lives
+  in `dahrk-harness` and must be fixed there. Nothing in this change addresses it, and DHK-406 should not
+  be read as closing it.
+- Regression tests: both questions in a batch reach the human, and a "deny"-containing mid-interview reply
+  is relayed intact rather than being read as a refusal. Suite 140/140, `tsc` clean.
+
 ## [0.1.12] - 2026-07-12
 
 ### Fix the flaky replay race that reddened main (#52)
