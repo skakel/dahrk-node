@@ -153,6 +153,20 @@ export function sandboxOptions(ctx: RunnerContext): Partial<Options> {
   };
 }
 
+/**
+ * Brokered inference for a credential-less node (DHK-89). A managed / Docker-isolated node has no
+ * ambient `claude` login, so the hub mints the provider key into `runtimeEnv` (claude-code ->
+ * ANTHROPIC_API_KEY) and delivers it on the Job; the edge threads it onto the RunnerContext. Pass it
+ * as the CLI subprocess env so the runtime authenticates. The SDK's `env` REPLACES the inherited
+ * environment when set, so spread `process.env` to keep PATH etc. The key rides the child-process env
+ * only, never the agent's own tool surface. Absent on ambient nodes -> `{}` -> the SDK inherits
+ * process.env (the operator's ambient login), unchanged.
+ */
+export function runtimeEnvOptions(ctx: RunnerContext): Partial<Options> {
+  if (!ctx.runtimeEnv) return {};
+  return { env: { ...process.env, ...ctx.runtimeEnv } };
+}
+
 export function createClaudeRunner(): Runner {
   const abortController = new AbortController();
   let cancelled = false;
@@ -197,6 +211,8 @@ export function createClaudeRunner(): Runner {
     // .claude/ + CLAUDE.md + .mcp.json, which is all section 9 actually requires. Claude auth is
     // keychain/OAuth and independent of settingSources, so dropping "user" does not affect it.
     settingSources: ["project", "local"],
+    // Brokered inference env (DHK-89), for a managed / Docker-isolated node with no ambient login.
+    ...runtimeEnvOptions(ctx),
     ...(ctx.config.model ? { model: ctx.config.model } : {}),
     ...(ctx.sessionId ? { resume: ctx.sessionId } : {}),
     ...(ctx.config.skill ? { skills: [ctx.config.skill] } : {}),

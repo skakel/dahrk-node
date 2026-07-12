@@ -15,6 +15,22 @@ import { makeEmit, raceNextTurn, interactiveIdleWindows, resolveStagePrompt, int
 
 const COALESCE_MS = Number(process.env.DAHRK_COALESCE_MS ?? process.env.SKAKEL_COALESCE_MS ?? 40);
 
+/**
+ * Brokered inference for a credential-less node (DHK-89). A managed / Docker-isolated node has no
+ * ambient `codex` login, so the hub mints the provider key into `runtimeEnv` (codex -> OPENAI_API_KEY)
+ * and delivers it on the Job; the edge threads it onto the RunnerContext. Returns the Codex SDK's
+ * `env` option merging `runtimeEnv` over `process.env`, or `{}` on ambient nodes (the SDK then
+ * inherits process.env, the operator's ambient login). The SDK's `env` REPLACES the inherited
+ * environment, so process.env (PATH, HOME, ...) must be carried through or the CLI cannot spawn; its
+ * `undefined` values are dropped so the result satisfies the SDK's `Record<string, string>` type.
+ */
+export function runtimeEnvOptions(ctx: RunnerContext): { env?: Record<string, string> } {
+  if (!ctx.runtimeEnv) return {};
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+  return { env: { ...env, ...ctx.runtimeEnv } };
+}
+
 export function createCodexRunner(): Runner {
   const abortController = new AbortController();
   const signal = abortController.signal;
@@ -30,7 +46,8 @@ export function createCodexRunner(): Runner {
   });
 
   const openThread = (ctx: RunnerContext): Thread => {
-    const codex = new Codex();
+    // Brokered inference env (DHK-89), for a managed / Docker-isolated node with no ambient login.
+    const codex = new Codex(runtimeEnvOptions(ctx));
     const t = ctx.sessionId ? codex.resumeThread(ctx.sessionId, threadOptions(ctx)) : codex.startThread(threadOptions(ctx));
     thread = t;
     return t;
