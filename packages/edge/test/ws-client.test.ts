@@ -138,13 +138,15 @@ test("a job frame for a finished job replays the cached result and never re-runs
     await waitFor(() => ctx.inbound.some((m) => m.type === "result"));
     assert.equal(marker(ctx.lines, "JOB_STARTED:"), 1);
 
-    // The hub re-sends the same Job (a re-arm tick, or a reconnect flush).
+    // The hub re-sends the same Job (a re-arm tick, or a reconnect flush). Wait on the frame reaching
+    // the hub, not on the JOB_REPLAY marker: the marker is written the instant `send()` queues the
+    // frame, so waiting on it races the frame's delivery and the count below can still be in flight.
     ctx.toEdge({ type: "job", job: foreignJob("job-1") });
-    await waitFor(() => marker(ctx.lines, "JOB_REPLAY:") === 1);
+    await waitFor(() => ctx.inbound.filter((m) => m.type === "result").length === 2);
 
-    // The runner was never invoked a second time, and the hub got the cached result again.
+    // The hub got the cached result again, off the replay path, and the runner never ran a second time.
+    assert.equal(marker(ctx.lines, "JOB_REPLAY:"), 1);
     assert.equal(marker(ctx.lines, "JOB_STARTED:"), 1);
-    assert.equal(ctx.inbound.filter((m) => m.type === "result").length, 2);
   });
 });
 
@@ -154,11 +156,12 @@ test("a push frame for a finished push replays the cached result", async () => {
     await waitFor(() => ctx.inbound.some((m) => m.type === "push-result"));
     assert.equal(marker(ctx.lines, "PUSH_STARTED:"), 1);
 
+    // As above: the hub-side frame is the observable to wait on, not the stdout marker.
     ctx.toEdge({ type: "push", job: foreignPush("push-1") });
-    await waitFor(() => marker(ctx.lines, "PUSH_REPLAY:") === 1);
+    await waitFor(() => ctx.inbound.filter((m) => m.type === "push-result").length === 2);
 
+    assert.equal(marker(ctx.lines, "PUSH_REPLAY:"), 1);
     assert.equal(marker(ctx.lines, "PUSH_STARTED:"), 1);
-    assert.equal(ctx.inbound.filter((m) => m.type === "push-result").length, 2);
   });
 });
 
