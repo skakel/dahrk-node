@@ -232,3 +232,39 @@ test("cancel: aborts then disposes the session and suppresses a late error", asy
   assert.equal(fake.disposed, true);
   await runner.cancel(); // idempotent
 });
+
+test("runBatch: a prompt() exception (not a Pi SDK error event) emits runtime_error and settles fail", async () => {
+  const events: TraceEvent[] = [];
+  const throwingSession: PiSessionLike = {
+    sessionId: "pi-throw",
+    subscribe: (l) => {
+      // Fire a partial event before the throw so we confirm it was received.
+      l(pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "partial" } }));
+      return () => {};
+    },
+    prompt: async () => { throw new Error("network timeout"); },
+    abort: async () => {},
+    dispose: () => {},
+  };
+  const result = await createPiRunner({ createSession: async () => throwingSession }).runBatch(ctx(), (e) => events.push(e));
+  assert.equal(result.status, "fail");
+  const err = events.find((e) => e.type === "error") as Extract<TraceEvent, { type: "error" }>;
+  assert.equal(err.kind, "runtime_error");
+  assert.equal(err.message, "network timeout");
+});
+
+test("summarise: returns the no-session placeholder when the session was never opened", async () => {
+  const runner = createPiRunner({ createSession: async () => { throw new Error("should not be called"); } });
+  const result = await runner.summarise(ctx());
+  assert.equal(result, "(no summary: session not established)");
+});
+
+test("summarise: returns the unavailable message when prompt() throws during the handoff turn", async () => {
+  const fake = new FakePiSession([STAGE_SCRIPT]);
+  const runner = createPiRunner({ createSession: async () => fake });
+  await runner.runBatch(ctx(), () => {});
+  // Patch the session so the summarise prompt() throws.
+  fake.prompt = async () => { throw new Error("model unavailable"); };
+  const result = await runner.summarise(ctx());
+  assert.match(result, /summary unavailable.*model unavailable/);
+});
