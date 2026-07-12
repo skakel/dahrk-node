@@ -6,6 +6,19 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **When an agent asks you several questions at once, you now get asked all of them.** The elicit surface
+  raises one question at a time, and the tool honoured that by surfacing only the first question of a batch
+  and appending a note asking the agent to raise the rest later. The agent had no way to do so: the tool
+  call had already returned, so questions two onwards were simply discarded, and the stage carried on with
+  answers it never actually received.
+
+  The batch is now drained through the same one-at-a-time surface, awaiting each answer before raising the
+  next question, so every question reaches you and none is dropped. A single-question batch behaves exactly
+  as before; a multi-question batch returns the answers labelled `Q1..QN` so the agent can tie each reply
+  back to the question it answers. (#54)
+
 ## [0.1.12] - 2026-07-12
 
 ### Added
