@@ -6,6 +6,20 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **A node with no login of its own can now run Claude and Codex stages.** A managed node, or one you run
+  in a container, has no ambient `claude` or `codex` session to borrow: nothing on the box has ever logged
+  in. The hub already mints a provider key for those nodes and delivers it on the job, but only the Pi
+  runtime was reading it, so a `claude-code` or `codex` stage on such a node simply failed to authenticate.
+
+  Both adapters now pass that brokered key to the runtime as the CLI subprocess environment, layered over
+  the inherited one so `PATH` and friends survive. The key rides the child process env only; it is never
+  put on the agent's own tool surface.
+
+  This changes nothing for a self-managed node. No brokered key on the job means no `env` override, so the
+  runtime keeps using the ambient login on your machine exactly as before. (#51)
+
 ### Fixed
 
 - **A runtime that was briefly slow to answer is no longer written off as missing for the life of the
