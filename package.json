@@ -22,6 +22,7 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "lint:changelog": "node scripts/lint-changelog.mjs",
+    "check:changelog": "node scripts/check-changelog.mjs",
     "smoke": "bash scripts/smoke-pack.sh",
     "edge": "pnpm --filter @dahrk/edge-node dev",
     "release": "node scripts/release.mjs"
