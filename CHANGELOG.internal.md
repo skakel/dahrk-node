@@ -19,6 +19,48 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-07-12
+
+### Fix the flaky replay race that reddened main (#52)
+
+- Tests only, no `src/` change. `main` went red on `build (22)` with the replay test seeing 1 received
+  frame where it expected 2. Not fallout from #51: that branch already contained main's tip, so the merged
+  tree was byte-identical to the branch head that went green — CI ran the same code twice and disagreed.
+  A pre-existing race, first lost on a loaded runner.
+- The replay path in `ws-client.ts` sends the cached frame and *then* logs the marker. `send()` only
+  queues bytes; the hub's `message` handler pushes onto `inbound` a tick or more later. The test waited on
+  the stdout marker and asserted on the hub's frame count — waiting on a *proxy* for the thing it asserts.
+  Loopback delivery wins that race on an idle box and loses it on a starved runner.
+- Fix: wait on the assertion's own observable (the inbound frame count), assert the markers after. Safe in
+  that direction because the marker is written synchronously before the frame can reach the server. The
+  `JOB_REPLAY` / `PUSH_REPLAY` assertions are retained, moved from wait-condition to assertion, so the
+  tests still pin that the frame came off the replay path rather than a re-run. No sleeps, no tolerances.
+  Send-then-log stays: it is the correct order.
+- Closed, not won: injecting a 50ms delay into the hub's `message` handler makes the *old* assertions fail
+  (reproducing the CI signature in both replay tests) and the new ones pass. Suite stressed 20x under CPU
+  contention, 0 failures.
+
+### Brokered runtime auth injection for Claude/Codex adapters, DHK-89 (#51)
+
+- The hub already minted the provider key into `JobRequest.runtimeEnv` (gated on brokered credential-mode)
+  and the edge already threaded it onto `RunnerContext` — but only the **Pi** adapter read it. So a
+  `claude-code` or `codex` stage on a credential-less node (managed, or containerised) failed to
+  authenticate with all the plumbing already in place. This wires the remaining two runtimes.
+- `claude-adapter`: `runtimeEnv` becomes the Claude Agent SDK `query()` `env`, spread over `process.env` —
+  load-bearing, because the SDK's `env` *replaces* the inherited environment rather than layering onto it,
+  so a bare pass-through would strip `PATH`. One exported `runtimeEnvOptions` helper feeds `baseOptions`,
+  so batch, interactive and summarise all authenticate.
+- `codex-adapter`: `runtimeEnv` as the Codex SDK `env` at the single `new Codex()` site, filtering
+  `undefined` values to satisfy the SDK's `Record<string, string>` type.
+- Inert on ambient nodes by construction: no `runtimeEnv` means no `env` option, so the SDK keeps the
+  operator's ambient login. Self-managed nodes are unchanged. The key rides the child-process env only,
+  never the agent's tool surface.
+- `claude-runtime-env.test.ts` / `codex-runtime-env.test.ts` pin both helpers (brokered key injected over
+  an inherited env; ambient → no `env`).
+- **Left open:** the E2E — a credential-less brokered node running a real `claude-code` stage authenticated
+  only by the brokered key — has not been run. It needs a pool `runtime-cred` holding a live
+  `ANTHROPIC_API_KEY`. Still tracked on DHK-89. Companion hub-side hardening PR landed in `dahrk-harness`.
+
 ### Runtime detection: retry, re-probe, and say so, DHK-390 (#50)
 
 - Two independent faults compounded. `probe()` in `detect-runtimes.ts` mapped *every* failure — error,
