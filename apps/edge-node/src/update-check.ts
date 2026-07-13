@@ -25,10 +25,21 @@
 import type { NodeState } from "./state.js";
 import { detectChannel, fetchLatestVersion, isNewer, upgradeCommand, type Channel } from "./update.js";
 
-/** Check at most once a day. Frequent enough that a node is never more than a day behind in what it knows,
- *  rare enough to be invisible. `DAHRK_UPDATE_CHECK_INTERVAL_MS` overrides (0 forces every start, which is
- *  how the tests and a curious operator get at it). */
-export const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** Check every six hours. Frequent enough that a running node's view of the registry is never more than a
+ *  few hours old - which matters, because `dahrk status` reports what this check last learned, and a whole
+ *  day of blind spot is a long time to be quietly telling someone they are current. Rare enough to remain
+ *  invisible: one small GET per node per interval, jittered across a fleet. `DAHRK_UPDATE_CHECK_INTERVAL_MS`
+ *  overrides (0 forces every start, which is how the tests and a curious operator get at it). */
+export const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/** How far past the check interval the cached answer is treated as STALE rather than merely old.
+ *
+ *  Expressed as a multiple of the interval rather than as its own constant, so that overriding the interval
+ *  moves both together: someone who checks hourly should hear about staleness sooner than someone who checks
+ *  daily, and neither should have to discover a second knob to make that happen. Four intervals is the point
+ *  at which "we have not managed to ask in a while" stops being noise and starts being the explanation for
+ *  why the answer on screen looks wrong. */
+export const STALE_AFTER_INTERVALS = 4;
 
 /** The check may delay a start by at most this. Deliberately short: nobody agreed to wait on npm to start
  *  their node, and the cost of missing a check is that we mention the update tomorrow instead. */
@@ -121,8 +132,11 @@ export async function checkForUpdate(
 
   const state = deps.readState();
   if (!shouldCheck(deps.now(), state.updateCheckedAt, checkIntervalMs(deps.env), deps.env)) {
-    // Not time to ask - but we may already know, from the last time we did.
-    return cachedUpdate(state, currentVersion, deps.binPath);
+    // Not time to ask - but we may already know, from the last time we did. This path only ever wants the
+    // one state it can act on: `current` and `unknown` are both "say nothing and carry on", which is exactly
+    // what `undefined` has always meant to these callers.
+    const cached = cachedUpdate(state, currentVersion, deps.binPath);
+    return cached.kind === "available" ? cached : undefined;
   }
 
   let latest: string;
@@ -138,15 +152,52 @@ export async function checkForUpdate(
   return { current: currentVersion, latest, channel: detectChannel(deps.binPath) };
 }
 
-/** What the last check found, straight from the state file - no network. This is what `dahrk status` uses:
- *  its whole contract is that it is local, instant, and works offline, and an update notice is not worth
- *  breaking that for. */
+/**
+ * What we know about this client's currency, and - just as importantly - when we last knew it.
+ *
+ * The three states exist because the old shape had only two, and one of them was doing the work of two very
+ * different facts. `cachedUpdate` used to return `UpdateAvailable | undefined`, reading only `updateLatest`
+ * and ignoring `updateCheckedAt` entirely - so "we asked a minute ago and you are on the latest" and "we
+ * have never once managed to ask" both came back as `undefined`, and `status` printed the same bare version
+ * line for both. Silence was being asked to mean two opposite things, and the reader had no way to tell
+ * which one they were getting.
+ *
+ * `unknown` is that missing third state. It is not a failure and it is not reassurance; it is the honest
+ * answer when nothing has ever successfully asked the registry (a client installed but never started, a node
+ * that has been down since before the first check, a machine that is always offline).
+ *
+ * `checkedAt` rides along on the other two because a claim of currency is only as good as its age. We cannot
+ * promise you are on the latest - the registry may have moved a minute after we looked - but we can promise
+ * what we last learned, and when. That is a claim we can actually stand behind.
+ */
+export type UpdateStatus =
+  | ({ kind: "available"; checkedAt: number } & UpdateAvailable)
+  | { kind: "current"; checkedAt: number }
+  | { kind: "unknown" };
+
+/** Is a cached answer old enough that presenting it as fact would be misleading? See
+ *  {@link STALE_AFTER_INTERVALS}. */
+export const isStale = (checkedAt: number, now: number, intervalMs: number): boolean =>
+  now - checkedAt >= intervalMs * STALE_AFTER_INTERVALS;
+
+/**
+ * What the last check found, straight from the state file - no network. This is what `dahrk status` reads:
+ * its whole contract is that it is local, instant, and works offline, and an update notice is not worth
+ * breaking that for.
+ *
+ * A cache with no (or an unparseable) `updateCheckedAt` is `unknown` even when it happens to carry an
+ * `updateLatest`: without a timestamp we cannot say how old that answer is, and an answer we cannot date is
+ * one we have no business presenting as current.
+ */
 export function cachedUpdate(
   state: NodeState,
   currentVersion: string,
   binPath: string | undefined,
-): UpdateAvailable | undefined {
-  const latest = state.updateLatest;
-  if (!latest || !isNewer(latest, currentVersion)) return undefined;
-  return { current: currentVersion, latest, channel: detectChannel(binPath) };
+): UpdateStatus {
+  const { updateLatest: latest, updateCheckedAt } = state;
+  const checkedAt = updateCheckedAt ? Date.parse(updateCheckedAt) : NaN;
+  if (!latest || !Number.isFinite(checkedAt)) return { kind: "unknown" };
+  return isNewer(latest, currentVersion)
+    ? { kind: "available", checkedAt, current: currentVersion, latest, channel: detectChannel(binPath) }
+    : { kind: "current", checkedAt };
 }

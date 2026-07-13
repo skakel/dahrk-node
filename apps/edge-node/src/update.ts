@@ -17,6 +17,7 @@
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { nodeIsRunning, runNodeRestart } from "./service.js";
+import { writeState } from "./state.js";
 import { arrow, confirm, dim, hint, isInteractive, kv, out as uiOut, verdict } from "./ui.js";
 
 /** How this client was installed, which decides how it upgrades. `unknown` covers a curl install.sh, a
@@ -100,6 +101,16 @@ export interface UpdateDeps {
   binPath?: string;
   /** Fetch the latest published version; throws on a network/registry failure. */
   fetchLatest: () => Promise<string>;
+  /** Write down what the registry just told us, so that `dahrk status` - which is offline by contract and
+   *  can only report what someone else has already learned - is not left reasoning from a stale answer.
+   *
+   *  This command is the ONLY thing an operator can run to deliberately refresh that knowledge on a machine
+   *  whose node is not up (the daemon's periodic check is the only other writer). It used to fetch the true
+   *  latest version, print it, and throw it away, so you could be told 0.1.16 exists and have `status` go on
+   *  insisting it knew nothing. Fetching the truth and then forgetting it is the bug. */
+  saveResult: (patch: { updateCheckedAt: string; updateLatest: string }) => void;
+  /** The clock, injected so the persisted timestamp is testable. */
+  now: () => number;
   /** Spawn the upgrade command, capturing what it printed. */
   runUpgrade: (argv: string[]) => UpgradeResult;
   /** Is a node actually running on this host right now? Decides whether the "you must restart" advice is
@@ -151,6 +162,11 @@ export async function runUpdate(inputs: UpdateInputs, deps: Partial<UpdateDeps> 
     d.out(hint(`You are on ${current}. See https://www.npmjs.com/package/dahrk-node for releases.`));
     return 1;
   }
+
+  // Write down what we just learned, BEFORE deciding what to do about it - so the cache records the answer
+  // on every path that got one: `--check`, an upgrade, and "already current" alike. `status` reads this and
+  // nothing else, so the moment we know something and do not save it, `status` goes on being wrong.
+  d.saveResult({ updateCheckedAt: new Date(d.now()).toISOString(), updateLatest: latest });
 
   if (!isNewer(latest, current)) {
     d.out(verdict("ok", `Already on the latest version (${current}).`));
@@ -286,6 +302,10 @@ const defaultDeps = (): UpdateDeps => ({
   binPath: process.argv[1],
   fetchLatest: fetchLatestVersion,
   runUpgrade: spawnUpgrade,
+  // The same cache the daemon's periodic check writes (`updateCheckDeps` in main.ts), so both writers agree
+  // on where "what the registry last said" lives and `status` has one place to read it from.
+  saveResult: (patch) => writeState(process.env, patch),
+  now: () => Date.now(),
   nodeRunning: nodeIsRunning,
   interactive: isInteractive,
   confirm,

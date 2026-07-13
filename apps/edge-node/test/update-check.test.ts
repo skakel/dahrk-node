@@ -9,6 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   cachedUpdate,
+  isStale,
   checkForUpdate,
   checkIntervalMs,
   checkSuppressed,
@@ -131,7 +132,11 @@ test("CACHED: a second check inside the interval does not touch the registry", a
   // This is the crash-loop case: the daemon restarts every ThrottleInterval and calls this each boot.
   const again = await checkForUpdate("0.1.8", d);
   assert.equal(d.fetches, 1, "a restart loop must not become a registry flood");
-  assert.deepEqual(again, { current: "0.1.8", latest: "0.2.1", channel: "npm" }, "but we still know");
+  assert.deepEqual(
+    again,
+    { kind: "available", checkedAt: NOW, current: "0.1.8", latest: "0.2.1", channel: "npm" },
+    "but we still know",
+  );
 });
 
 test("opting out means out: no fetch, and no nagging from what the cache already knows", async () => {
@@ -143,15 +148,48 @@ test("opting out means out: no fetch, and no nagging from what the cache already
   assert.equal(d.fetches, 0);
 });
 
-test("cachedUpdate: what `dahrk status` reads - the last answer, no network", () => {
-  const bin = "/usr/local/lib/node_modules/dahrk-node/dist/main.js";
-  assert.deepEqual(cachedUpdate({ updateLatest: "0.2.1" }, "0.1.8", bin), {
+const BIN = "/usr/local/lib/node_modules/dahrk-node/dist/main.js";
+const AT = "2026-07-13T12:00:00Z";
+
+test("cachedUpdate: what `dahrk status` reads - the last answer, dated, and no network", () => {
+  assert.deepEqual(cachedUpdate({ updateLatest: "0.2.1", updateCheckedAt: AT }, "0.1.8", BIN), {
+    kind: "available",
+    checkedAt: Date.parse(AT),
     current: "0.1.8",
     latest: "0.2.1",
     channel: "npm",
   });
-  assert.equal(cachedUpdate({}, "0.1.8", bin), undefined, "never checked: say nothing");
-  assert.equal(cachedUpdate({ updateLatest: "0.1.8" }, "0.1.8", bin), undefined, "already current");
+});
+
+test("cachedUpdate: 'you are current' and 'I have never checked' are DIFFERENT answers", () => {
+  // The conflation this exists to fix. Both used to come back as `undefined`, so `status` printed an
+  // identical bare version line whether it had just confirmed you were on the latest or had never once
+  // managed to ask. A blank space cannot mean "you are fine" and "I have no idea" at the same time.
+  assert.deepEqual(cachedUpdate({ updateLatest: "0.1.8", updateCheckedAt: AT }, "0.1.8", BIN), {
+    kind: "current",
+    checkedAt: Date.parse(AT),
+  });
+  assert.deepEqual(cachedUpdate({}, "0.1.8", BIN), { kind: "unknown" }, "nothing has ever asked");
+});
+
+test("cachedUpdate: an answer we cannot DATE is one we must not present as current", () => {
+  // A `updateLatest` with no (or an unparseable) timestamp could be from ten minutes ago or from last year.
+  // Without an age we cannot qualify the claim, so we decline to make it.
+  assert.deepEqual(cachedUpdate({ updateLatest: "0.1.8" }, "0.1.8", BIN), { kind: "unknown" });
+  assert.deepEqual(cachedUpdate({ updateLatest: "0.9.9", updateCheckedAt: "not-a-date" }, "0.1.8", BIN), {
+    kind: "unknown",
+  });
+});
+
+test("isStale: a cached answer goes stale at a MULTIPLE of the interval, so one knob moves both", () => {
+  const now = Date.parse(AT);
+  const hour = 3_600_000;
+  const interval = 6 * hour;
+  assert.equal(isStale(now - 3 * hour, now, interval), false, "fresher than one interval");
+  assert.equal(isStale(now - 12 * hour, now, interval), false, "old, but not yet misleading");
+  assert.equal(isStale(now - 25 * hour, now, interval), true, "past 4 intervals: stop stating it as fact");
+  // Someone who checks hourly hears about staleness sooner, without discovering a second knob.
+  assert.equal(isStale(now - 5 * hour, now, hour), true);
 });
 
 test("BOUNDED: a registry that hangs forever is aborted, not waited on - a start must never hang", async () => {
