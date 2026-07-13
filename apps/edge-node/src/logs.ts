@@ -12,6 +12,7 @@
  * how many lines, follow or not - are testable without spawning anything.
  */
 import { spawn } from "node:child_process";
+import { out as uiOut } from "./ui.js";
 import { copyFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 
 /** Beyond this, the log is rotated on the next node boot. The node logs a line per lifecycle event, so
@@ -218,5 +219,5 @@ export const defaultLogsDeps = (files: { out: string; err: string }, jsonlFile: 
       child.on("error", () => resolve(1));
       child.on("close", (code) => resolve(code ?? 0));
     }),
-  out: (line) => void process.stdout.write(`${line}\n`),
+  out: uiOut,
 });

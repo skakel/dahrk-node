@@ -19,6 +19,45 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Changed
+
+- **New `apps/edge-node/src/ui.ts`: the client's one presentation layer.** Colour, status symbols, the
+  key/value row, next-step hints, durations, and the confirm prompt now live in one module that every command
+  renders through. Before this, each command had invented its own formatting (`status` had a padded label
+  gutter, `doctor` had `[PASS]`/`[WARN]`/`[FAIL]` tags, `preflight` was the only place that had ever used a
+  tick) and the identical `process.stdout.write` sink was copy-pasted into seven modules.
+
+  Zero new dependencies: colour is `node:util`'s `styleText`, which has been in Node since 22 - the floor the
+  client already requires. The capability gate (TTY / `NO_COLOR` / `TERM=dumb` / `FORCE_COLOR`) is our own
+  rather than `styleText`'s, because that only learned to check the stream in 22.8 and we support 22.0, and
+  because doing it ourselves makes the decision injectable and therefore testable.
+
+- **`ServiceDeps.run` captures instead of inheriting stdio**, returning `{ code, output }`. `runCommands`
+  prints the captured text only when a non-`ignoreFailure` command fails. This is what silences the
+  `launchctl` chatter; the previous `ignoreFailure` flag suppressed the exit code but the output had already
+  been streamed to the terminal by the time anyone looked at it. `spawnUpgrade` in `update.ts` does the same
+  for the package manager.
+
+- **`runNodeRestart` in `service.ts`**, replacing the `stop()`-then-`start()` composition in `main.ts`. It
+  passes `alwaysLoad` to `runNodeStart`, which is a correctness fix, not an optimisation: `launchctl` returns
+  before the job has finished going away (the race `foreignNodePid` already documents), so re-probing "is it
+  running?" after the unload could see the node still up, no-op the start half, and leave it DOWN. A restart
+  has already decided; it does not ask again.
+
+- **`status.ts` splits into `gatherFacts` (IO) and `renderStatus` (pure)**, so `start` / `restart` / `stop`
+  render the same canonical block rather than three hand-rolled summaries. New facts enter as fields on
+  `StatusFacts` plus an injectable dep, keeping the renderer testable: pidfile liveness (via `resolvePresence`,
+  which is what fixes the foreground node reading as "not installed"), `probeRuntimeStatuses` for versions,
+  the job ledger for in-flight work, and `lastConnection` over the `EDGE_*` markers in `node.jsonl`.
+
+  The two contracts `status` is built on are unchanged and still enforced by tests: it makes NO network
+  request, and the only process it spawns is the supervisor probe. Every new fact is a local file read
+  precisely so that stays true.
+
+- `dahrk diagnose` strips ANSI from the doctor's report before writing it into the support bundle: stdout is a
+  TTY when an operator runs it, so the report is correctly coloured, but the bundle is a JSON file someone
+  will read in an editor.
+
 ## [0.1.14] - 2026-07-13
 
 ### Node announces its in-flight jobs on connect, and persists them across a restart, DHK-416

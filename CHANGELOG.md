@@ -6,6 +6,63 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`dahrk status` now tells you what the node is actually doing.** It leads with a single verdict line
+  (running, stopped, crash-looping) instead of burying it at the bottom, reports the runtimes it can serve
+  with their versions rather than just their names, and lists the stages it has in flight, read from the
+  node's own on-disk job ledger. The hub line now says when the node was last known to be connected
+  (`welcomed 2h ago`), taken from its log. It still dials nothing, so it stays instant and works offline,
+  and it says "last known" rather than claiming a live connection it cannot verify without dialling.
+
+- **`dahrk status --json`** prints the same facts as JSON, for a script or a monitoring check. The enrolment
+  token is withheld, as it is from the human report.
+
+- **`dahrk stop` and `dahrk restart` refuse to kill a stage in flight.** A stage is minutes to hours of agent
+  time, and it was being interrupted silently by anyone restarting the node to pick up a new client. They now
+  list what is running and leave the node up; `--force` interrupts it anyway.
+
+- **`dahrk update` offers to restart the node.** A running node keeps executing the build it started with, so
+  an upgrade does nothing until it is restarted. If a node is up, `update` now asks; where there is nobody to
+  ask (a script, CI), it prints the right command instead.
+
+### Fixed
+
+- **`dahrk update` no longer tells you to run `dahrk start` to pick up the new version.** It does not work:
+  `start` on a running node is a deliberate no-op, so it returned success and left the node on the old build.
+  The command to use is `dahrk restart`, and that is now what it says (and offers to do).
+
+- **`launchctl` no longer leaks `Unload failed: 5: Input/output error` into `start` and `restart`.** Making
+  `start` idempotent means unloading the unit before loading it, and on a node that is not currently loaded
+  launchd complains about that. The complaint was expected and ignored, but it was being printed anyway. The
+  supervisor's output is now shown only when a step that mattered actually failed, where it is genuinely
+  useful.
+
+- **`dahrk restart` no longer claims the node "will stay stopped across reboots".** That is `stop`'s message,
+  and it was untrue: `restart` was implemented as `stop` followed by `start`, so it printed both commands'
+  output back to back. It is now one command that reports one outcome. It also no longer leaves the node
+  recorded as deliberately stopped when the start half fails, which had been hiding a down node from the very
+  health check meant to catch it.
+
+- **`dahrk status` no longer reports a node started with `--foreground` (or under pm2, or in a container) as
+  "not installed".** It asked the launchd/systemd service and nothing else, so a perfectly healthy node that
+  it had not started itself was invisible to it. It now also reads the pidfile, which every node takes
+  whoever supervises it.
+
+- **`dahrk doctor` no longer fails with "no hub URL configured" on a default install.** The client falls back
+  to `wss://api.dahrk.ai` when `DAHRK_HUB_URL` is unset, but the doctor did not, so it reported a failure
+  against the very hub the node was connected to. The same fix applies to `dahrk run preflight`.
+
+- **`dahrk update` no longer dumps the package manager's output on success.** A successful `npm install -g`
+  prints a wall of `ERESOLVE` peer-dependency warnings about the client's own transitive dependencies: it is
+  alarming, it is not actionable, and it is not a problem. It is hidden unless the upgrade fails, or you pass
+  `--verbose`.
+
+- **The CLI now speaks with one voice.** Every command shares the same status symbols, the same aligned
+  layout, and the same style of next-step hints, where each had previously invented its own. Colour is used
+  only to classify (pass, warn, fail) and is switched off automatically when the output is piped or redirected,
+  when `NO_COLOR` is set, or on a terminal that cannot render it.
+
 ## [0.1.14] - 2026-07-13
 
 ### Added

@@ -98,7 +98,7 @@ test("runPreflight: findings alone stay sound (exit 0) - a missing tool is a fin
   assert.equal(code, 0);
   const text = out.join("\n");
   assert.match(text, /SOUND with 1 finding\./);
-  assert.match(text, /• docker: not present/);
+  assert.match(text, /▲ docker: not present/);
 });
 
 test("runPreflight: an unreachable hub is a finding, never an unsound floor (issue-less run)", async () => {

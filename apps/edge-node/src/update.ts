@@ -16,6 +16,8 @@
  */
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { nodeIsRunning, runNodeRestart } from "./service.js";
+import { arrow, confirm, dim, hint, isInteractive, kv, out as uiOut, verdict } from "./ui.js";
 
 /** How this client was installed, which decides how it upgrades. `unknown` covers a curl install.sh, a
  *  run-from-source checkout, or anything we cannot positively identify - we print the command, never guess. */
@@ -86,14 +88,29 @@ export function isNewer(latest: string, current: string): boolean {
   return false;
 }
 
+/** What the upgrade command produced: its exit code and its (captured) output. See {@link spawnUpgrade}. */
+export interface UpgradeResult {
+  code: number;
+  output: string;
+}
+
 /** Injectable IO so `runUpdate` exercises without a network or a real package manager. */
 export interface UpdateDeps {
   /** This client's bin path (`process.argv[1]`), resolved to infer the install channel. */
   binPath?: string;
   /** Fetch the latest published version; throws on a network/registry failure. */
   fetchLatest: () => Promise<string>;
-  /** Spawn the upgrade command and return its exit code (0 = success). */
-  runUpgrade: (argv: string[]) => number;
+  /** Spawn the upgrade command, capturing what it printed. */
+  runUpgrade: (argv: string[]) => UpgradeResult;
+  /** Is a node actually running on this host right now? Decides whether the "you must restart" advice is
+   *  worth saying at all: on a machine with no node up, it is noise about a problem nobody has. */
+  nodeRunning: () => boolean;
+  /** Is there a human here to answer a question? False under a pipe, in CI, or from the curl installer. */
+  interactive: () => boolean;
+  /** Ask a yes/no question, defaulting to yes. */
+  confirm: (question: string) => Promise<boolean>;
+  /** Restart the node. Returns its exit code. */
+  restart: () => Promise<number>;
   out: (line: string) => void;
 }
 
@@ -102,13 +119,15 @@ export interface UpdateInputs {
   currentVersion: string;
   /** `--check`: report whether an update is available without applying it. */
   check: boolean;
+  /** `--verbose`: show the package manager's own output even when it succeeds. */
+  verbose?: boolean;
 }
 
 /** Print the per-channel upgrade commands - the fallback when we cannot tell how the client was installed. */
 function printChannelCommands(out: (line: string) => void): void {
-  out(`  npm:      ${CHANNEL_COMMANDS.npm}`);
-  out(`  Homebrew: ${CHANNEL_COMMANDS.homebrew}`);
-  out(`  curl:     ${CHANNEL_COMMANDS.curl}`);
+  out(kv("npm", CHANNEL_COMMANDS.npm));
+  out(kv("Homebrew", CHANNEL_COMMANDS.homebrew));
+  out(kv("curl", CHANNEL_COMMANDS.curl));
 }
 
 /**
@@ -121,24 +140,24 @@ export async function runUpdate(inputs: UpdateInputs, deps: Partial<UpdateDeps> 
   const d = { ...defaultDeps(), ...deps };
   const current = inputs.currentVersion;
 
-  d.out("dahrk update");
   d.out("");
 
   let latest: string;
   try {
     latest = await d.fetchLatest();
   } catch (e) {
-    d.out(`Could not determine the latest version: ${(e as Error).message}`);
-    d.out(`You are on ${current}. See https://www.npmjs.com/package/dahrk-node for releases.`);
+    d.out(verdict("fail", `Could not determine the latest version: ${(e as Error).message}`));
+    d.out("");
+    d.out(hint(`You are on ${current}. See https://www.npmjs.com/package/dahrk-node for releases.`));
     return 1;
   }
 
   if (!isNewer(latest, current)) {
-    d.out(`Already on the latest version (${current}).`);
+    d.out(verdict("ok", `Already on the latest version (${current}).`));
     return 0;
   }
 
-  d.out(`Update available: ${current} -> ${latest}`);
+  d.out(verdict("warn", `Update available: ${current} ${arrow()} ${latest}`));
   const channel = detectChannel(d.binPath);
   const cmd = upgradeCommand(channel);
 
@@ -146,9 +165,9 @@ export async function runUpdate(inputs: UpdateInputs, deps: Partial<UpdateDeps> 
   if (inputs.check) {
     d.out("");
     if (cmd) {
-      d.out(`Run \`dahrk update\` to upgrade (${channel}: ${cmd.display}).`);
+      d.out(hint(`Run \`dahrk update\` to upgrade (${channel}: ${cmd.display}).`));
     } else {
-      d.out("Run \`dahrk update\`, or upgrade with the command for your install channel:");
+      d.out(hint("Run `dahrk update`, or upgrade with the command for your install channel:"));
       printChannelCommands(d.out);
     }
     return 0;
@@ -157,23 +176,65 @@ export async function runUpdate(inputs: UpdateInputs, deps: Partial<UpdateDeps> 
   // Unknown channel: we cannot safely automate the upgrade, so print the exact commands instead.
   if (!cmd) {
     d.out("");
-    d.out("Could not tell how this client was installed. Upgrade with the command for your channel:");
+    d.out(hint("Could not tell how this client was installed. Upgrade with the command for your channel:"));
     printChannelCommands(d.out);
     return 0;
   }
 
   // Known channel: run the package manager in place.
   d.out("");
-  d.out(`Upgrading via ${channel}: ${cmd.display}`);
+  d.out(hint(`Upgrading via ${channel}: ${cmd.display}`));
+  const { code, output } = d.runUpgrade(cmd.argv);
   d.out("");
-  const code = d.runUpgrade(cmd.argv);
-  d.out("");
-  if (code === 0) {
-    d.out(`Upgraded to ${latest}. Restart a running node (\`dahrk start\`) to pick it up.`);
-  } else {
-    d.out(`Upgrade exited with code ${code}. Run it yourself to see the error: ${cmd.display}`);
+
+  if (code !== 0) {
+    d.out(verdict("fail", `Upgrade failed (exit ${code}).`));
+    // On failure the package manager's output is the entire point, so it is printed whether or not
+    // --verbose was asked for.
+    for (const line of output.split("\n")) if (line.trim()) d.out(`    ${dim(line)}`);
+    d.out("");
+    d.out(hint(`Run it yourself to retry: ${cmd.display}`));
+    return code;
   }
-  return code;
+
+  if (inputs.verbose) for (const line of output.split("\n")) if (line.trim()) d.out(`    ${dim(line)}`);
+  d.out(verdict("ok", `Upgraded to ${latest}.`));
+  await offerRestart(d);
+  return 0;
+}
+
+/**
+ * The upgrade landed on disk, but a node that is already running is still executing the OLD build: a
+ * long-lived daemon does not re-exec itself because npm replaced its files underneath it. So it has to be
+ * restarted, and until it is, `dahrk status` will cheerfully report the new version while the node serving
+ * Jobs is the old one.
+ *
+ * This used to advise `dahrk start`, which does not work: `start` on a running node takes the "already
+ * running" branch and returns without touching it, so the operator would follow the instruction, see a
+ * reassuring message, and still be on the old build. `restart` is the verb that actually does it.
+ *
+ * Better still, do it for them. There is a human at the terminal (they just typed `dahrk update`), so ask -
+ * the same courtesy `dahrk start` already extends when it notices an update is available. A node that is not
+ * running needs no advice at all, and a non-interactive caller gets the correct command instead of a prompt
+ * nobody is there to answer.
+ */
+async function offerRestart(d: UpdateDeps): Promise<void> {
+  if (!d.nodeRunning()) return;
+
+  if (!d.interactive()) {
+    d.out(hint("A node is running on the old build. Run `dahrk restart` to pick this up."));
+    return;
+  }
+  d.out("");
+  if (!(await d.confirm("A node is running on the old build. Restart it now?"))) {
+    d.out(hint("Left running on the old build. Run `dahrk restart` when you are ready."));
+    return;
+  }
+  const code = await d.restart();
+  // A restart that refused (a stage in flight) or failed has already said why. Do not paper over it with a
+  // success line: the upgrade landed, but the node is still serving the old build, and that is the fact.
+  if (code !== 0) d.out(hint("The node is still on the old build. Run `dahrk restart` once it is free."));
+  else d.out(verdict("ok", "Node restarted on the new build."));
 }
 
 /** Fetch the latest published version from the npm registry's `latest` dist-tag. Exported so the passive
@@ -194,16 +255,30 @@ export async function fetchLatestVersion(signal?: AbortSignal): Promise<string> 
   return body.version;
 }
 
-/** Spawn an upgrade command, inheriting stdio so the operator sees the package manager's own output.
- *  A non-zero exit (or spawn failure) surfaces as its status code, defaulting to 1. */
-function spawnUpgrade(argv: string[]): number {
+/**
+ * Spawn an upgrade command, capturing its output rather than inheriting it.
+ *
+ * A successful `npm install -g` is not interesting, and npm does not agree: it prints a wall of ERESOLVE
+ * peer-dependency warnings about our own transitive `zod` versions, which is alarming, is not actionable,
+ * and is not a problem. The operator asked to be upgraded, not to be shown npm's working. So the output is
+ * captured and thrown away on success, and printed in full on failure - where it is the only thing that
+ * matters, and where today it was already being drowned in the same noise. `--verbose` opts back in.
+ */
+function spawnUpgrade(argv: string[]): UpgradeResult {
   const [cmd, ...args] = argv;
   try {
-    execFileSync(cmd as string, args, { stdio: "inherit" });
-    return 0;
+    const stdout = execFileSync(cmd as string, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { code: 0, output: stdout };
   } catch (e) {
     const status = (e as { status?: unknown }).status;
-    return typeof status === "number" ? status : 1;
+    const { stdout, stderr } = e as { stdout?: string | Buffer; stderr?: string | Buffer };
+    return {
+      code: typeof status === "number" ? status : 1,
+      output: `${stdout?.toString() ?? ""}${stderr?.toString() ?? ""}`,
+    };
   }
 }
 
@@ -211,5 +286,16 @@ const defaultDeps = (): UpdateDeps => ({
   binPath: process.argv[1],
   fetchLatest: fetchLatestVersion,
   runUpgrade: spawnUpgrade,
-  out: (line: string) => void process.stdout.write(`${line}\n`),
+  nodeRunning: nodeIsRunning,
+  interactive: isInteractive,
+  confirm,
+  // No inputs: the installed unit already carries this node's token and overrides in its env block, so a
+  // restart re-registers exactly what was there before, with the new client on disk behind it. `desired` is
+  // untouched on purpose - the node was running, and it still is.
+  restart: async () => {
+    const outcome = await runNodeRestart({});
+    if (outcome.kind === "running") return 0;
+    return outcome.kind === "error" ? outcome.code : 1;
+  },
+  out: uiOut,
 });

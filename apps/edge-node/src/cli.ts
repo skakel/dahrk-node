@@ -111,22 +111,29 @@ export interface ServiceFlags {
   hubUrl?: string;
 }
 
-/** `dahrk update` flags: the sole option is `--check`, a dry run that reports whether an update is
- *  available without applying it. */
+/** `dahrk update` flags: `--check` is a dry run that reports whether an update is available without
+ *  applying it; `--verbose` shows the package manager's own output even when it succeeds (it is hidden by
+ *  default, because a successful npm install is a wall of peer-dependency warnings about nothing). */
 export interface UpdateFlags {
   check: boolean;
+  verbose: boolean;
+}
+
+/** `dahrk status` flags: `--json` prints the facts as JSON for a script, and nothing else. */
+export interface StatusFlags extends StartFlags {
+  json: boolean;
 }
 
 export type ParsedCli =
   | { kind: "start"; flags: StartFlags }
-  | { kind: "stop" }
-  | { kind: "restart"; flags: StartFlags }
+  | { kind: "stop"; force: boolean }
+  | { kind: "restart"; flags: StartFlags; force: boolean }
   | { kind: "logs"; flags: LogsFlags }
   | { kind: "diagnose"; flags: DiagnoseFlags }
   | { kind: "run"; flags: RunFlags }
   | { kind: "service"; flags: ServiceFlags }
   | { kind: "doctor"; flags: StartFlags }
-  | { kind: "status"; flags: StartFlags }
+  | { kind: "status"; flags: StatusFlags }
   | { kind: "update"; flags: UpdateFlags }
   | { kind: "help"; command?: Command }
   | { kind: "version" }
@@ -191,6 +198,10 @@ export function parseCli(argv: string[]): ParsedCli {
         "hub-url": { type: "string" },
         ephemeral: { type: "boolean", default: false },
         foreground: { type: "boolean", default: false },
+        // `stop` / `restart`: take the node down even though it has work in flight.
+        force: { type: "boolean", default: false },
+        // `status`: machine-readable output.
+        json: { type: "boolean", default: false },
         help: { type: "boolean", default: false },
       },
       allowPositionals: false,
@@ -202,6 +213,7 @@ export function parseCli(argv: string[]): ParsedCli {
   if (values.help) return { kind: "help", command };
 
   const ephemeral = values.ephemeral ?? false;
+  const force = values.force ?? false;
   const flags: StartFlags = {
     ...(values.token ? { token: values.token } : {}),
     ...(values.name ? { name: values.name } : {}),
@@ -211,8 +223,10 @@ export function parseCli(argv: string[]): ParsedCli {
     // a supervisor that restarts it on boot. It is a foreground node by definition.
     foreground: (values.foreground ?? false) || ephemeral,
   };
-  if (command === "stop") return { kind: "stop" };
-  return { kind: command, flags };
+  if (command === "stop") return { kind: "stop", force };
+  if (command === "restart") return { kind: "restart", flags, force };
+  if (command === "status") return { kind: "status", flags: { ...flags, json: values.json ?? false } };
+  return { kind: command as "start" | "doctor", flags };
 }
 
 /** The levels `--level` accepts, loudest last. A filter of `warn` means "warn, error and fatal". */
@@ -364,6 +378,7 @@ function parseUpdate(flagArgs: string[]): ParsedCli {
       args: flagArgs,
       options: {
         check: { type: "boolean", default: false },
+        verbose: { type: "boolean", default: false },
         help: { type: "boolean", default: false },
       },
       allowPositionals: false,
@@ -372,7 +387,7 @@ function parseUpdate(flagArgs: string[]): ParsedCli {
     return { kind: "error", message: (e as Error).message };
   }
   if (values.help) return { kind: "help", command: "update" };
-  return { kind: "update", flags: { check: values.check ?? false } };
+  return { kind: "update", flags: { check: values.check ?? false, verbose: values.verbose ?? false } };
 }
 
 /** The usage/help text. `bin` is the invoked program name; `command` scopes help to one subcommand. */
@@ -409,26 +424,39 @@ export function usage(bin: string, command?: Command): string {
   }
   if (command === "stop") {
     return [
-      `Usage: ${bin} stop`,
+      `Usage: ${bin} stop [--force]`,
       "",
       "Stop the node. It stays stopped across reboots until you run `dahrk start` again - a stop that",
       "quietly undid itself at the next boot would not be a stop.",
       "",
+      "A node that is running a stage refuses to stop, because stopping it would kill work that costs real",
+      "agent time. It lists what is in flight and leaves the node up; --force stops it anyway.",
+      "",
       "The service stays installed, so starting it again is instant. To remove it entirely, use",
       "`dahrk service uninstall`. To stop a node running in a terminal (--foreground), press Ctrl-C.",
+      "",
+      "Options:",
+      "  --force            Stop even if the node has stages in flight (this kills them).",
     ].join("\n");
   }
   if (command === "restart") {
     return [
       `Usage: ${bin} restart [options]`,
       "",
-      "Stop the node and start it again. Picks up a new client version, a rotated token, or a runtime you",
-      "have just installed (the node detects runtimes at boot, so a fresh `claude` on PATH needs a restart).",
+      "Stop the node and start it again, then report its status. Picks up a new client version, a rotated",
+      "token, or a runtime you have just installed (the node detects runtimes at boot, so a fresh `claude`",
+      "on PATH needs a restart).",
+      "",
+      "This is what picks up a `dahrk update`: a running node keeps executing the build it started with, so",
+      "`dahrk start` on it does nothing at all.",
+      "",
+      "Like `stop`, it refuses on a node with stages in flight rather than killing them; --force overrides.",
       "",
       "Options:",
       "  --token <token>    Re-enrol with a new token (or set DAHRK_ENROL_TOKEN).",
       "  --hub-url <url>    Hub WebSocket URL (or set DAHRK_HUB_URL).",
       "  --name <name>      Display-name override (else the hub assigns one).",
+      "  --force            Restart even if the node has stages in flight (this kills them).",
     ].join("\n");
   }
   if (command === "logs") {
@@ -520,26 +548,38 @@ export function usage(bin: string, command?: Command): string {
   }
   if (command === "status") {
     return [
-      `Usage: ${bin} status`,
+      `Usage: ${bin} status [--json]`,
       "",
-      "Report this node's local state: whether it is enrolled (and as whom), its node id, the runtimes",
-      "it can serve, and whether the always-on service is installed and actually running.",
+      "Report this node's local state: whether it is running (and how), whether it is enrolled and as whom,",
+      "its node id, the runtimes it can serve with their versions, and what it is working on right now.",
       "",
-      "Local only - it dials nothing, so it is instant and works offline. Use `doctor` to check the hub",
-      "is reachable and the token still valid. Exits non-zero only when the service is installed but",
-      "not running, so it works as a health check in a script.",
+      "Local only - it dials nothing, so it is instant and works offline. That is also why the hub line says",
+      "when the node was LAST known to be connected (from its log) rather than claiming it is connected now,",
+      "which this command cannot know without dialling. Use `doctor` for that: it checks the hub is",
+      "reachable and the token still valid.",
+      "",
+      "Exits non-zero only when the node is installed but not running and nobody asked for that (i.e. it is",
+      "crash-looping), so it works as a health check in a script. A node you deliberately stopped is not a",
+      "failure.",
+      "",
+      "Options:",
+      "  --json     Print the facts as JSON (for a script) instead of the report.",
     ].join("\n");
   }
   if (command === "update") {
     return [
-      `Usage: ${bin} update [--check]`,
+      `Usage: ${bin} update [--check] [--verbose]`,
       "",
       "Update this client in place to the latest published release. Detects how it was installed",
       "(npm / Homebrew / curl) and runs the right upgrade, or prints the exact command when it cannot.",
       "Reports current -> latest, and a no-op when already current.",
       "",
+      "A node that is already running keeps executing the OLD build until it is restarted, so if one is up",
+      "this offers to restart it for you (and tells you to run `dahrk restart` when there is nobody to ask).",
+      "",
       "Options:",
       "  --check    Report whether an update is available without applying it (dry run).",
+      "  --verbose  Show the package manager's own output, which is hidden unless the upgrade fails.",
     ].join("\n");
   }
   return [
@@ -548,10 +588,10 @@ export function usage(bin: string, command?: Command): string {
     "Commands:",
     "  start     Run the node, and keep it running (installs the service). --token to enrol, once.",
     "  stop      Stop the node. It stays stopped until the next `start`.",
-    "  restart   Stop it and start it again.",
+    "  restart   Stop it and start it again. This is what picks up a `dahrk update`.",
     "  logs      Show what the node is doing (-f to follow, --run <id> to narrow to one run).",
     "  diagnose  Write a support bundle you can read, and send on if you choose. Uploads nothing.",
-    "  status    Is this node enrolled, and is it up? (local, dials nothing)",
+    "  status    Is it up, is it enrolled, what is it working on? (local, dials nothing)",
     "  run       Run a workflow locally (engine-backed), e.g. `run preflight`.",
     "  doctor    Preflight checks: Node, runtimes, hub reachability, token validity.",
     "  service   Install/uninstall the always-on service by hand (`start` does this for you).",
