@@ -150,12 +150,23 @@ test("the ledger is written 0600: it sits beside node.json, which holds a token"
 });
 
 test("an unwritable path warns and is swallowed: losing the ledger must not break the run in hand", () => {
-  const warnings: string[] = [];
-  const ledger = fileJobLedger("/proc/definitely/not/writable/jobs.json", (m) => warnings.push(m));
-  ledger.upsert(entry());
-  assert.equal(ledger.all().length, 0);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0] ?? "", /could not persist the job ledger/);
+  withDir((dir) => {
+    // The unwritable path is a file standing where a directory has to be, which yields a deterministic
+    // ENOTDIR. Two other tempting choices are wrong: a `chmod 0500` dir does not stop ROOT (and CI runs
+    // as root, so it would simply succeed), and a path under `/proc` HANGS - `mkdirSync` recursive into
+    // procfs never returns on Linux, which is exactly how this test wedged CI for 14 minutes rather than
+    // failing. Structural impossibility beats permissions.
+    const notADir = join(dir, "in-the-way");
+    writeFileSync(notADir, "i am a file, not a directory\n");
+
+    const warnings: string[] = [];
+    const ledger = fileJobLedger(join(notADir, "jobs.json"), (m) => warnings.push(m));
+    ledger.upsert(entry());
+
+    assert.deepEqual(ledger.all(), [], "nothing was persisted, and nothing threw");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0] ?? "", /could not persist the job ledger/);
+  });
 });
 
 test("the null ledger persists nothing, which is the pre-DHK-416 behaviour exactly", () => {
