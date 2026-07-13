@@ -36,6 +36,9 @@ const facts = (over: Partial<StatusFacts> = {}): StatusFacts => ({
   presence: { kind: "running", pid: 42 },
   jobs: [],
   service: { installed: true, running: true, pid: 42 },
+  // Checked recently, and current: the boring happy case, so a test that cares about currency has to say so.
+  update: { kind: "current", checkedAt: NOW - 60_000 },
+  updateIntervalMs: 6 * 3600_000,
   now: NOW,
   ...over,
 });
@@ -85,9 +88,49 @@ test("a node the operator STOPPED is reported as stopped, not as a crash-loop", 
   assert.doesNotMatch(out, /crash-looping/);
 });
 
-test("an available update is reported on the Client line, from cache", () => {
-  const out = report({ update: { current: "0.1.7", latest: "0.2.1", channel: "npm" } });
-  assert.match(out, /Client\s+0\.1\.7\s+\(update available: 0\.2\.1 - run `dahrk update`\)/);
+// --- Currency: status must never be silent about whether the client is current -----------------
+
+test("an available update gets its own line, right under the verdict, where the eye already is", () => {
+  const out = report({
+    update: { kind: "available", checkedAt: NOW - 3600_000, current: "0.1.7", latest: "0.2.1", channel: "npm" },
+  });
+  assert.match(out, /Update available: 0\.1\.7 .* 0\.2\.1/);
+  assert.match(out, /run `dahrk update`/);
+  // It sits above the detail block, not buried inside it: the second non-blank line of the report.
+  const visible = renderStatus(
+    facts({ update: { kind: "available", checkedAt: NOW, current: "0.1.7", latest: "0.2.1", channel: "npm" } }),
+  ).filter((l) => l.trim() !== "");
+  assert.match(visible[1] ?? "", /Update available/);
+});
+
+test("being CURRENT is stated positively, and dated - silence used to mean this AND 'no idea'", () => {
+  const out = report({ update: { kind: "current", checkedAt: NOW - 3 * 3600_000 } });
+  assert.match(out, /Client\s+0\.1\.7\s+.*up to date \(checked 3h ago\)/);
+});
+
+test("NEVER having checked says so, and names the command that fixes it", () => {
+  const out = report({ update: { kind: "unknown" } });
+  assert.match(out, /Client\s+0\.1\.7\s+.*update status unknown - run `dahrk update --check`/);
+  assert.doesNotMatch(out, /up to date/, "we have no business implying a clean bill of health");
+});
+
+test("a STALE answer is not presented as fact - no tick, and it points at the refresh", () => {
+  // Four intervals past the last check. The registry may have moved several times since; saying "up to
+  // date ✔" here would be believed, and would be a guess.
+  const out = report({
+    update: { kind: "current", checkedAt: NOW - 30 * 3600_000 },
+    updateIntervalMs: 6 * 3600_000,
+  });
+  assert.match(out, /as of 1d 6h ago - run `dahrk update --check` to refresh/);
+  assert.doesNotMatch(out, /✔ .*up to date/, "a week-old answer with a green tick is worse than no answer");
+});
+
+test("opting out of update checks means status says nothing about them at all", () => {
+  // Distinct from `unknown`: the operator asked us to stop, so nagging them from the cache in a quieter
+  // voice would be the same disrespect.
+  const out = report({ update: undefined });
+  assert.match(out, /Client\s+0\.1\.7\s*$/m);
+  assert.doesNotMatch(out, /up to date|update status unknown|Update available/);
 });
 
 test("no service installed, and no runtimes, each explain the consequence", () => {
@@ -252,7 +295,7 @@ test("runStatus: an update notice comes from the state file - status never dials
 
     await runStatus({ clientVersion: "0.1.7", hubUrl: "wss://x" }, d);
 
-    assert.match(out.join("\n"), /Client\s+0\.1\.7\s+\(update available: 0\.9\.9/);
+    assert.match(out.join("\n"), /Update available: 0\.1\.7 .* 0\.9\.9/);
   } finally {
     globalThis.fetch = realFetch;
     rmSync(dir, { recursive: true, force: true });
@@ -313,6 +356,53 @@ test("runStatus --json: parseable, carries the verdict, and still withholds the 
     assert.equal(parsed.state.name, "local-a1");
     assert.equal(parsed.state.enrolToken, undefined, "a status blob gets pasted into issues");
     assert.doesNotMatch(out.join("\n"), /Enrolled/, "no human framing in --json");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runStatus: CI (or an explicit opt-out) suppresses the update line entirely, even from cache", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-status-"));
+  try {
+    const out: string[] = [];
+    const d = deps({ stateDir: dir, out: (l) => void out.push(l) });
+    d.env.CI = "true";
+    // There IS an update, and we know about it. The operator has asked not to hear about it.
+    writeState(d.env, { updateLatest: "9.9.9", updateCheckedAt: new Date(NOW).toISOString() });
+
+    await runStatus({ clientVersion: "0.1.7", hubUrl: "wss://x" }, d);
+
+    assert.doesNotMatch(out.join("\n"), /Update available|up to date|update status unknown/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runStatus --json: carries the update kind, so a script can alert on it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-status-"));
+  try {
+    const out: string[] = [];
+    const d = deps({ stateDir: dir, out: (l) => void out.push(l) });
+    writeState(d.env, { updateLatest: "9.9.9", updateCheckedAt: new Date(NOW).toISOString() });
+
+    const code = await runStatus({ clientVersion: "0.1.7", hubUrl: "wss://x", json: true }, d);
+
+    const parsed = JSON.parse(out.join("\n"));
+    assert.equal(parsed.update.kind, "available");
+    assert.equal(parsed.update.latest, "9.9.9");
+    assert.equal(code, 0, "an available update is NOT a health failure - status stays a usable check");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runStatus --json: a never-checked client is reported as unknown, not as healthy-and-current", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-status-"));
+  try {
+    const out: string[] = [];
+    const d = deps({ stateDir: dir, out: (l) => void out.push(l) });
+    await runStatus({ clientVersion: "0.1.7", hubUrl: "wss://x", json: true }, d);
+    assert.equal(JSON.parse(out.join("\n")).update.kind, "unknown");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

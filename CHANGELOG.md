@@ -6,6 +6,41 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`dahrk status` now tells you whether your client is up to date.** Previously the only way to find out was
+  to run `dahrk update` and read what it said. The `Client` line now always states where you stand, and how
+  old that information is: `up to date (checked 3h ago)`. An available update gets a line of its own directly
+  under the node verdict, rather than a dim aside halfway down the report that was easy to read past.
+
+  It says "as of" rather than "you are current" on purpose. `dahrk status` makes no network request, so it
+  cannot know what the registry published a minute ago; what it can do is tell you what it last learned and
+  when. Once that answer is old enough to mislead, it stops being stated as fact and points at the command
+  that refreshes it.
+
+- **`dahrk status --json` reports currency as `update: { kind, latest, checkedAt }`**, where `kind` is
+  `available`, `current`, or `unknown`, so a monitoring script can alert on a fleet that is falling behind
+  (and, just as usefully, on nodes that have never managed to check at all). The exit code is unchanged: an
+  available update is not a health failure.
+
+### Changed
+
+- **The node checks for a new client every six hours rather than once a day**, so a running node's view of
+  the registry is never more than a few hours old. Still jittered across a fleet, still fails open, still one
+  small request per node per interval.
+
+### Fixed
+
+- **`dahrk update` now records what it learned.** It fetched the latest published version, printed it, and
+  threw it away, so you could be told a new version existed and have `dahrk status` go on knowing nothing
+  about it. This also makes `dahrk update --check` the way to refresh a stale answer by hand, which matters
+  on a machine whose node is not running: the node's own periodic check was otherwise the only thing that
+  ever updated it.
+
+- **`dahrk status` could not tell "you are on the latest" from "I have never checked".** Both produced an
+  identical bare version line, so an absence of news was doing duty for two opposite facts. They are now
+  reported as what they are.
+
 ## [0.1.15] - 2026-07-13
 
 ### Added

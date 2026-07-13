@@ -26,8 +26,14 @@
 import type { JobLedgerEntry, RuntimeStatus } from "@dahrk/edge";
 import { detectManager, parseServiceStatus, statusCommand, unitPath, type ServiceStatus } from "./service.js";
 import { readState, stateFile, type NodeState } from "./state.js";
-import { ago, dim, hints, humanDuration, kv, verdict, type Level } from "./ui.js";
-import { cachedUpdate, checkSuppressed, type UpdateAvailable } from "./update-check.js";
+import { ago, arrow, dim, hints, humanDuration, kv, symbol, verdict, type Level } from "./ui.js";
+import {
+  cachedUpdate,
+  checkIntervalMs,
+  checkSuppressed,
+  isStale,
+  type UpdateStatus,
+} from "./update-check.js";
 
 /** How the node is running, which is a richer question than "is the unit up". `foreign` is a node this
  *  client did not supervise - `dahrk start --foreground`, pm2, a container - which is a perfectly healthy
@@ -71,9 +77,18 @@ export interface StatusFacts {
   /** Absent when the host has no supervisor we drive (Windows), where "installed" is meaningless. */
   service?: ServiceStatus;
   connection?: ConnectionFact;
-  /** A newer client, as of the last time anything checked. Read from the state file, never fetched - see
-   *  the module note about staying offline. */
-  update?: UpdateAvailable;
+  /** What we know about this client's currency, and when we last knew it. Read from the state file, never
+   *  fetched - see the module note about staying offline.
+   *
+   *  Note the two different kinds of nothing. `{ kind: "unknown" }` means "we have never managed to ask", and
+   *  is a fact worth reporting. `undefined` means the operator has switched update checks OFF entirely
+   *  (`DAHRK_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` / `CI`), in which case `status` says nothing about
+   *  updates at all - opted out is opted out, and nagging someone from the cache after they asked us to stop
+   *  would be the same disrespect in a quieter voice. */
+  update?: UpdateStatus;
+  /** The check interval in force, so the renderer can decide when a cached answer has gone stale without
+   *  reaching for the environment itself. */
+  updateIntervalMs: number;
   /** Now, injected so the renderer stays pure and elapsed times are testable. */
   now: number;
 }
@@ -121,7 +136,19 @@ function presenceHints(f: StatusFacts): string[] {
  *  can I serve a Job, what am I doing. */
 export function renderStatus(f: StatusFacts): string[] {
   const v = presenceVerdict(f);
-  const lines: string[] = ["", verdict(v.level, v.text), ""];
+  const lines: string[] = ["", verdict(v.level, v.text)];
+
+  // An available update earns a line of its own, right under the node's verdict, because that is where the
+  // eye already is. It spent its life as a dim parenthetical halfway down the Client line, which is a fine
+  // place to put something you do not mind people missing - and people missed it. An always-on node is
+  // started once and then runs for months, so this is the only moment anyone will ever be told it is stale.
+  if (f.update?.kind === "available") {
+    lines.push(
+      verdict("warn", `Update available: ${f.clientVersion} ${arrow()} ${f.update.latest}`) +
+        `    ${dim("run `dahrk update`")}`,
+    );
+  }
+  lines.push("");
 
   // Enrolment. The token is a secret and is never printed - not even a prefix; that it exists is the
   // fact worth reporting, and a partial token is still a partial token in a screenshot.
@@ -138,16 +165,7 @@ export function renderStatus(f: StatusFacts): string[] {
   }
   lines.push(kv("Node id", nodeId ?? dim("not yet minted (first `dahrk start` mints one)")));
 
-  // An always-on node is started once and then runs for months, so this line is the main place anyone will
-  // ever find out it is stale. Reported from the cache the last check wrote, so `status` stays offline.
-  lines.push(
-    kv(
-      "Client",
-      f.update
-        ? `${f.clientVersion}  ${dim(`(update available: ${f.update.latest} - run \`dahrk update\`)`)}`
-        : f.clientVersion,
-    ),
-  );
+  lines.push(kv("Client", `${f.clientVersion}${currency(f)}`));
 
   // The hub we WOULD dial, plus the last thing we actually know about that connection. Never "connected":
   // see the module note. A node that has never connected has no marker, and says nothing rather than lying.
@@ -181,6 +199,36 @@ export function renderStatus(f: StatusFacts): string[] {
   lines.push(...presenceHints(f).flatMap((h) => ["", h]));
   lines.push("", dim(`  State file: ${f.stateFile}`));
   return lines;
+}
+
+/**
+ * The tail of the `Client` line: are we current, and how old is that belief?
+ *
+ * This is never empty (unless the operator has opted out of update checks entirely), and that is the whole
+ * point. It used to print nothing at all whenever `cachedUpdate` returned `undefined` - which it did both
+ * when we had just checked and you were on the latest, AND when nothing had ever managed to ask the registry.
+ * A blank space cannot mean "you are fine" and "I have no idea" at the same time, but it was being asked to.
+ *
+ * The age is not decoration. `status` is offline by contract, so it can never truthfully say "you are on the
+ * latest" - the registry may have published something thirty seconds ago. What it can say is what it last
+ * learned and when it learned it, and let the reader judge. Once that answer is old enough to be misleading,
+ * it stops being stated as fact and starts pointing at the command that refreshes it.
+ */
+function currency(f: StatusFacts): string {
+  const u = f.update;
+  if (!u) return ""; // opted out of update checks: not our business to mention them
+  if (u.kind === "unknown") {
+    return `  ${dim("update status unknown - run `dahrk update --check`")}`;
+  }
+  const age = ago(f.now - u.checkedAt);
+  if (isStale(u.checkedAt, f.now, f.updateIntervalMs)) {
+    // Deliberately NOT a tick: we are not vouching for this. A week-old answer presented with a green tick
+    // is worse than no answer, because it is believed.
+    return `  ${dim(`as of ${age} - run \`dahrk update --check\` to refresh`)}`;
+  }
+  // `available` already has its own loud line above; here we only date it.
+  if (u.kind === "available") return `  ${dim(`(checked ${age})`)}`;
+  return `  ${symbol("ok")} ${dim(`up to date (checked ${age})`)}`;
 }
 
 /** One in-flight job: where it is, and how long it has been there. */
@@ -265,7 +313,9 @@ export async function gatherFacts(
   const livePid = presence.kind === "running" || presence.kind === "foreign" ? presence.pid : undefined;
   const jobs = livePid === undefined ? [] : deps.jobs().filter((j) => j.nodePid === livePid);
 
-  // From the CACHE, never a fetch: `status` is the command you run on a plane, and it stays that way.
+  // From the CACHE, never a fetch: `status` is the command you run on a plane, and it stays that way. What
+  // keeps that honest rather than merely convenient is that the cache's AGE travels with it, so the renderer
+  // can date every claim it makes instead of passing off whatever it last heard as the current truth.
   const update = checkSuppressed(deps.env)
     ? undefined
     : cachedUpdate(state, inputs.clientVersion, deps.binPath);
@@ -280,6 +330,7 @@ export async function gatherFacts(
     runtimes: await deps.probeRuntimes(),
     presence,
     jobs,
+    updateIntervalMs: checkIntervalMs(deps.env),
     now: deps.now(),
     ...(service ? { service } : {}),
     ...(connection ? { connection } : {}),

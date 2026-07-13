@@ -60,7 +60,7 @@ import {
   runServiceUninstall,
   STOP_FOREIGN_NODE,
 } from "./service.js";
-import { fetchLatestVersion, runUpdate } from "./update.js";
+import { fetchLatestVersion, runUpdate, type UpdateDeps } from "./update.js";
 import { confirm, hint, isInteractive, out as uiOut, stripAnsi, verdict } from "./ui.js";
 import {
   checkForUpdate,
@@ -425,6 +425,16 @@ async function stop(env: NodeJS.ProcessEnv, force: boolean): Promise<number> {
   return code;
 }
 
+/** Point `dahrk update`'s cache write at the SAME state file everything else uses.
+ *
+ *  `update.ts` defaults to `process.env`, which is very nearly right - but `status` reads through the
+ *  alias-applied env (`applyEnvAliases`), so a node still configured with the legacy `SKAKEL_STATE_DIR`
+ *  would have `update` writing its answer to one file and `status` reading from another, and the cache would
+ *  appear never to update at all. Resolve it once, here, where the aliases have already been folded in. */
+const updateStateDeps = (env: NodeJS.ProcessEnv): Partial<UpdateDeps> => ({
+  saveResult: (patch) => writeState(env, patch),
+});
+
 /** The IO the update check runs on: the clock, the registry, and the state file it caches into. */
 function updateCheckDeps(env: NodeJS.ProcessEnv): UpdateCheckDeps {
   return {
@@ -447,7 +457,7 @@ async function offerUpdate(env: NodeJS.ProcessEnv): Promise<void> {
   uiOut(renderUpdateNotice(available));
   if (!isInteractive()) return;
   if (!(await confirm("Update now?"))) return;
-  const code = await runUpdate({ currentVersion: CLIENT_VERSION, check: false });
+  const code = await runUpdate({ currentVersion: CLIENT_VERSION, check: false }, updateStateDeps(env));
   if (code !== 0) uiOut(hint("Update failed; starting the node on the current version anyway."));
 }
 
@@ -631,12 +641,16 @@ async function main(): Promise<void> {
       break;
     }
     case "update":
-      // Self-update is issue-less and hub-less: no env/flag overlay, just current vs latest.
-      process.exitCode = await runUpdate({
-        currentVersion: CLIENT_VERSION,
-        check: parsed.flags.check,
-        verbose: parsed.flags.verbose,
-      });
+      // Self-update is issue-less and hub-less: no flag overlay, just current vs latest. The env is still
+      // resolved, because whatever it learns is written into the state file `status` reads.
+      process.exitCode = await runUpdate(
+        {
+          currentVersion: CLIENT_VERSION,
+          check: parsed.flags.check,
+          verbose: parsed.flags.verbose,
+        },
+        updateStateDeps(applyEnvAliases(process.env)),
+      );
       break;
     case "start":
       process.exitCode = await start(parsed.flags);

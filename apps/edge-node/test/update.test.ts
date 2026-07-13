@@ -41,15 +41,19 @@ test("upgradeCommand: npm/homebrew have a command, unknown has none", () => {
  *
  *  The default host has NO node running, which is the case where the restart question never comes up at
  *  all. The tests that care about it opt in with `nodeRunning: () => true`. */
+const NOW = Date.parse("2026-07-13T12:00:00Z");
+
 function harness(over: Partial<UpdateDeps>): {
   deps: Partial<UpdateDeps>;
   lines: string[];
   ran: string[][];
   counter: { restarts: number };
+  saved: Array<{ updateCheckedAt: string; updateLatest: string }>;
 } {
   const lines: string[] = [];
   const ran: string[][] = [];
   const counter = { restarts: 0 };
+  const saved: Array<{ updateCheckedAt: string; updateLatest: string }> = [];
   const deps: Partial<UpdateDeps> = {
     binPath: "/usr/local/lib/node_modules/dahrk-node/dist/main.js", // npm channel by default
     out: (l) => lines.push(l),
@@ -57,6 +61,8 @@ function harness(over: Partial<UpdateDeps>): {
       ran.push(argv);
       return { code: 0, output: "npm warn ERESOLVE overriding peer dependency\nchanged 123 packages" };
     },
+    saveResult: (patch) => void saved.push(patch),
+    now: () => NOW,
     nodeRunning: () => false,
     interactive: () => false,
     confirm: async () => true,
@@ -68,7 +74,7 @@ function harness(over: Partial<UpdateDeps>): {
   };
   // `counter` is returned as an object, not a number: destructuring a getter would snapshot it at zero
   // and every "did it restart?" assertion would silently pass.
-  return { deps, lines, ran, counter };
+  return { deps, lines, ran, counter, saved };
 }
 
 test("runUpdate: already current is a no-op, exit 0, and runs nothing", async () => {
@@ -198,4 +204,43 @@ test("runUpdate: a registry failure reports it and exits 1 without running", asy
   assert.equal(code, 1);
   assert.equal(ran.length, 0);
   assert.match(lines.join("\n"), /Could not determine the latest version: registry responded 503/);
+});
+
+// --- The cache: fetching the truth and then forgetting it is the bug -----------------------------
+
+test("runUpdate: writes down what the registry said, so `dahrk status` is not left guessing", async () => {
+  // `status` is offline by contract - it can only ever report what someone else has already learned. This
+  // command used to fetch the true latest version, print it, and throw it away, so you could be told 0.2.0
+  // exists and have `status` go on insisting it knew nothing about any update.
+  const { deps, saved } = harness({ fetchLatest: async () => "0.2.0" });
+  await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
+  assert.deepEqual(saved, [{ updateCheckedAt: new Date(NOW).toISOString(), updateLatest: "0.2.0" }]);
+});
+
+test("runUpdate --check: persists too - it is the ONLY way to refresh a stale cache by hand", async () => {
+  // The daemon's periodic check is the only other writer, so on a machine whose node is not running this is
+  // the sole command that can bring `status` up to date. A --check that reported the truth and forgot it
+  // would leave the operator no way out of a stale answer at all.
+  const { deps, saved, ran } = harness({ fetchLatest: async () => "0.2.0" });
+  await runUpdate({ currentVersion: "0.1.3", check: true }, deps);
+  assert.equal(ran.length, 0, "--check still changes nothing on disk except what we now know");
+  assert.deepEqual(saved, [{ updateCheckedAt: new Date(NOW).toISOString(), updateLatest: "0.2.0" }]);
+});
+
+test("runUpdate: 'already current' is a fact worth recording, not just printing", async () => {
+  // Otherwise the cache stays `unknown` forever on a machine that is perfectly up to date, and `status`
+  // keeps saying "update status unknown" to someone who has just been told they are current.
+  const { deps, saved } = harness({ fetchLatest: async () => "0.1.3" });
+  await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
+  assert.deepEqual(saved, [{ updateCheckedAt: new Date(NOW).toISOString(), updateLatest: "0.1.3" }]);
+});
+
+test("runUpdate: a registry failure writes NOTHING - we must not record an answer we never got", async () => {
+  const { deps, saved } = harness({
+    fetchLatest: async () => {
+      throw new Error("ENOTFOUND");
+    },
+  });
+  assert.equal(await runUpdate({ currentVersion: "0.1.3", check: false }, deps), 1);
+  assert.deepEqual(saved, [], "a failed check must leave the previous answer, and its age, untouched");
 });
