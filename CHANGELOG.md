@@ -6,6 +6,22 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Pi stage on a credential-less node no longer asks the wrong provider for a key.** Pi resolves a model
+  alias against its entire registry, roughly a thousand models across thirty-odd providers, and the plain
+  aliases (`sonnet`, `opus`, `haiku`) resolve to Amazon Bedrock: `opus` becomes
+  `us.anthropic.claude-opus-4-8`. A node with no login of its own is handed an Anthropic key by the hub, so
+  Pi went looking for Bedrock credentials that were never going to be there, and the stage stopped on its
+  first turn with `No API key found for amazon-bedrock` - having spent nothing and written no trace, which
+  made it look like a broken node rather than a model pointed at the wrong door.
+
+  A resolved model is now landed on a provider the node can actually authenticate to: if the one Pi picked
+  is not among the models the registry reports as available, the same model is taken from a provider that
+  is. It substitutes nothing - a Claude model is never quietly swapped for someone else's - so if no
+  available provider carries that model, Pi's own error stands. Nothing changes on a node using its own
+  ambient login.
+
 ### Added
 
 - **`dahrk status` now tells you whether your client is up to date.** Previously the only way to find out was

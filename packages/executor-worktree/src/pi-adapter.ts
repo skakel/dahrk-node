@@ -300,7 +300,9 @@ async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike
   let model: unknown;
   if (ctx.config.model) {
     const resolved = resolveCliModel({ cliModel: ctx.config.model, modelRegistry });
-    if (!resolved?.error) model = resolved?.model;
+    if (!resolved?.error) {
+      model = pickAuthedModel(resolved?.model, modelRegistry.getAvailable());
+    }
   }
 
   // The injected stage-complete tool (interactive tool-exit); harmless on batch stages.
@@ -330,3 +332,51 @@ const PROVIDER_BY_ENV: Record<string, string> = {
   GEMINI_API_KEY: "google",
   GOOGLE_API_KEY: "google",
 };
+
+/** The minimum of a Pi model we depend on. The SDK's own type is not resolved at build time (the
+ *  package is imported by variable specifier), so we describe only what we read. */
+export interface PiModelLike {
+  id: string;
+  provider: string;
+}
+
+/**
+ * The model id with its provider's packaging stripped, so the SAME model can be recognised across
+ * providers: Bedrock's `us.anthropic.claude-opus-4-8` and Anthropic's `claude-opus-4-8` are one model
+ * reached two ways. Take the last dot-segment (dropping a `us.` / `eu.` region and an `anthropic.`
+ * vendor prefix) and drop a trailing `-v1:0`-style revision.
+ */
+function modelFamily(id: string): string {
+  const last = id.split(".").pop() ?? id;
+  return last.replace(/-v\d+:\d+$/, "").toLowerCase();
+}
+
+/**
+ * Land a resolved model on a provider we can actually authenticate to.
+ *
+ * `resolveCliModel` resolves an alias against the WHOLE registry - over a thousand models across
+ * thirty-odd providers - and the bare aliases every Dahrk workflow uses (`sonnet`, `opus`, `haiku`)
+ * land on **amazon-bedrock**: `opus` becomes `us.anthropic.claude-opus-4-8`. On a managed node the hub
+ * brokers an *Anthropic* key, so Pi would ask Bedrock for a credential that does not exist and the
+ * stage died on its first turn with "No API key found for amazon-bedrock". Nothing about this is
+ * specific to Anthropic; the same trap sits under every alias for every provider.
+ *
+ * `registry.getAvailable()` is Pi's own answer to "which models can this auth storage actually use",
+ * and it already accounts for the runtime keys the broker injected. So: if the resolved model's
+ * provider is not one of those, prefer the same model family from the available set. Deterministic,
+ * and it never invents a model - if nothing available matches, the resolution is left exactly as Pi
+ * made it so Pi raises its own clear error rather than one we fabricate.
+ *
+ * With no available models at all (nothing brokered, ambient/self-managed node), this is a no-op:
+ * Pi resolves against whatever the operator has configured, exactly as before.
+ */
+export function pickAuthedModel(
+  resolved: PiModelLike | undefined,
+  available: readonly PiModelLike[] | undefined,
+): PiModelLike | undefined {
+  if (!resolved || !available?.length) return resolved;
+  const providers = new Set(available.map((m) => m.provider));
+  if (providers.has(resolved.provider)) return resolved;
+  const family = modelFamily(resolved.id);
+  return available.find((m) => modelFamily(m.id) === family) ?? resolved;
+}
