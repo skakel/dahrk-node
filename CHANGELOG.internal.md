@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-07-13
+
 ### Node announces its in-flight jobs on connect, and persists them across a restart, DHK-416
 
 The node half of DHK-415 (whose hub-side adoption path shipped live but **dormant**: `reconcileAnnouncedJobs`
