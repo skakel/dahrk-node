@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-07-13
+
 ### Added
 
 - **The node now tells the hub what it is running, so a hub redeploy no longer restarts your stage.** When
@@ -15,7 +17,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
   The node now announces its in-flight jobs when it connects, so the hub adopts the work already under way
   instead of duplicating it. An idle node says so explicitly, and a node running nothing it can identify
-  stays silent rather than risk the hub cancelling healthy work.
+  stays silent rather than risk the hub cancelling healthy work. (#58)
 
 ### Fixed
 
@@ -26,7 +28,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
   The node now keeps that list on disk (`~/.dahrk/jobs.json`, alongside `node.json`; honours
   `DAHRK_STATE_DIR`, and is skipped entirely for an ephemeral node). On the next start it reconciles what
-  the dead process left behind rather than pretending it never happened.
+  the dead process left behind rather than pretending it never happened. (#58)
 
 - **An interrupted stage no longer leaves half-written files for the next attempt to trip over.** An agent
   killed mid-edit leaves the worktree dirty, and because the worktree is reused for the same run, the
@@ -35,7 +37,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
   The node now preserves whatever the killed agent had written - committed to a disposable
   `dahrk/wip/<runId>` ref, pushed when it can reach the remote and kept locally when it cannot, so the work
-  is never lost - and resets the worktree to the last commit the agent actually completed.
+  is never lost - and resets the worktree to the last commit the agent actually completed. (#58)
 
 ## [0.1.13] - 2026-07-12
 
@@ -496,7 +498,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/dahrkai/dahrk-node/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/dahrkai/dahrk-node/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/dahrkai/dahrk-node/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/dahrkai/dahrk-node/compare/v0.1.10...v0.1.11
