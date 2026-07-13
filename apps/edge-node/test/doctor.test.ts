@@ -72,17 +72,17 @@ test("formatReport: a FAIL drives the summary; warnings alone still read as PASS
     { status: "pass", label: "A" },
     { status: "fail", label: "B", detail: "boom" },
   ]);
-  assert.match(withFail, /\[FAIL\] B: boom/);
-  assert.match(withFail, /^FAIL - 1 check failed\.$/m);
+  assert.match(withFail, /✖ B: boom/);
+  assert.match(withFail, /✖ 1 check failed\./);
 
   const warnOnly = formatReport([
     { status: "pass", label: "A" },
     { status: "warn", label: "C" },
   ]);
-  assert.match(warnOnly, /^PASS with 1 warning\.$/m);
+  assert.match(warnOnly, /▲ Passed with 1 warning\./);
 
   const allGreen = formatReport([{ status: "pass", label: "A" }]);
-  assert.match(allGreen, /^PASS - all checks green\.$/m);
+  assert.match(allGreen, /✔ All checks green\./);
 });
 
 // -- runDoctor orchestration (injected deps: no network, no host probing) ---
@@ -101,7 +101,7 @@ test("runDoctor: happy path returns exit 0 and prints a green report", async () 
     },
   );
   assert.equal(code, 0);
-  assert.match(lines.join("\n"), /PASS - all checks green\./);
+  assert.match(lines.join("\n"), /✔ All checks green\./);
 });
 
 test("runDoctor: a failing check returns exit 1", async () => {

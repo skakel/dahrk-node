@@ -29,6 +29,7 @@ import { join } from "node:path";
 import type { HubProbeResult } from "@dahrk/edge";
 import { probeHub as realProbeHub } from "@dahrk/edge";
 import { checkHub, checkNode, checkToken, type CheckResult } from "./doctor.js";
+import { dim, out as uiOut, symbol } from "./ui.js";
 
 /** The public web surface that renders a full run report; the CLI prints a deep link to it. */
 export const REPORT_BASE_URL = "https://app.dahrk.ai/r";
@@ -201,17 +202,21 @@ function worst(checks: CheckResult[]): CheckResult["status"] {
   return "pass";
 }
 
-/** Render one completed stage: a green tick when clean, else the stage line followed by a `•` bullet
- *  per finding (warn or fail), matching the CLI-twin mock. */
-function renderStage(index: number, total: number, verdict: StageVerdict, out: (l: string) => void): void {
-  const head = `[${index}/${total}] ${verdict.label}`;
-  const findings = verdict.checks.filter((c) => c.status !== "pass");
+/** Render one completed stage: a tick when clean, else the stage line followed by a bullet per finding
+ *  (warn or fail). The glyphs come from the shared vocabulary, so a tick here means what it means in
+ *  `status` and `doctor` rather than being this module's private invention. */
+function renderStage(index: number, total: number, stage: StageVerdict, out: (l: string) => void): void {
+  const head = `  ${dim(`[${index}/${total}]`)} ${stage.label}`;
+  const findings = stage.checks.filter((c) => c.status !== "pass");
   if (findings.length === 0) {
-    out(`${head} ✓`);
+    out(`${head} ${symbol("ok")}`);
     return;
   }
   out(head);
-  for (const f of findings) out(`      • ${f.label}: ${f.detail ?? f.status}`);
+  for (const f of findings) {
+    const level = f.status === "fail" ? "fail" : "warn";
+    out(`      ${symbol(level)} ${f.label}: ${dim(f.detail ?? f.status)}`);
+  }
 }
 
 /**
@@ -294,7 +299,7 @@ const defaultDeps = (): PreflightDeps => ({
   probeHub: realProbeHub,
   gatherHost: gatherHostFacts,
   newRunId: () => randomUUID(),
-  out: (line: string) => void process.stdout.write(`${line}\n`),
+  out: uiOut,
 });
 
 // -- real host probes --------------------------------------------------------

@@ -26,6 +26,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { scrubValue } from "@dahrk/edge";
+import { out as uiOut } from "./ui.js";
 import type { NodeState } from "./state.js";
 
 /** How much of the structured log to include. Enough to cover a boot, an enrolment and a run or two;
@@ -210,7 +211,7 @@ export const defaultDiagnoseDeps = (
     // world-readable in a shared /tmp.
     writeFileSync(p, content, { mode: 0o600 });
   },
-  out: (line) => void process.stdout.write(`${line}\n`),
+  out: uiOut,
 });
 
 /** Default bundle location: the current directory, timestamped. Deliberately NOT a temp dir - the operator

@@ -96,8 +96,8 @@ test("a `service` subcommand's --help scopes to `service`", () => {
 });
 
 test("`update` parses `--check`; bare `update` defaults check off", () => {
-  assert.deepEqual(parseCli(["update"]), { kind: "update", flags: { check: false } });
-  assert.deepEqual(parseCli(["update", "--check"]), { kind: "update", flags: { check: true } });
+  assert.deepEqual(parseCli(["update"]), { kind: "update", flags: { check: false, verbose: false } });
+  assert.deepEqual(parseCli(["update", "--check"]), { kind: "update", flags: { check: true, verbose: false } });
 });
 
 test("`update` takes no positionals and rejects unknown flags", () => {

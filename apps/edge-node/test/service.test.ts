@@ -7,8 +7,11 @@ import {
   renderSystemdUnit,
   buildPlan,
   foreignNodePid,
+  runNodeRestart,
   runNodeStart,
   runNodeStop,
+  liveNodePid,
+  BUSY_NODE,
   runServiceInstall,
   STOP_FOREIGN_NODE,
   runServiceUninstall,
@@ -134,8 +137,14 @@ function harness(over: Partial<ServiceDeps>): {
     fileExists: () => true,
     run: (argv) => {
       ran.push(argv);
-      return 0;
+      return { code: 0, output: "" };
     },
+    // Hermetic by default. Without these the shells fall through to the REAL deps and a unit test would
+    // shell out to the developer's launchctl and read their actual ~/.dahrk/jobs.json.
+    capture: () => ({ code: 1, stdout: "" }),
+    readFile: () => undefined,
+    isAlive: () => false,
+    inFlightJobs: () => [],
     out: (l) => lines.push(l),
     ...over,
   };
@@ -170,7 +179,7 @@ test("install: an unsupported platform exits 1 and points at pm2", async () => {
 });
 
 test("install: a failed loader command surfaces its non-zero exit", async () => {
-  const { deps } = harness({ run: () => 3, platform: "linux" });
+  const { deps } = harness({ run: () => ({ code: 3, output: "boom" }), platform: "linux" });
   const code = await runServiceInstall({ token: "t" }, deps);
   assert.equal(code, 3);
 });
@@ -179,7 +188,7 @@ test("install (systemd): the best-effort linger failure does not fail the instal
   // loginctl is the only failing command; because it is ignoreFailure, install still succeeds.
   const { deps } = harness({
     platform: "linux",
-    run: (argv) => (argv[0] === "loginctl" ? 1 : 0),
+    run: (argv) => ({ code: argv[0] === "loginctl" ? 1 : 0, output: "" }),
   });
   const code = await runServiceInstall({ token: "t" }, deps);
   assert.equal(code, 0);
@@ -240,7 +249,8 @@ test("install: the unit carries the token, so it is written 0600 and never world
     logDir: "/home/u/.dahrk/logs",
     mkdirp: () => {},
     writeFile: (path) => void written.push({ path }),
-    run: () => 0,
+    run: () => ({ code: 0, output: "" }),
+    inFlightJobs: () => [],
     out: () => {},
   };
   const code = await runServiceInstall({ token: "sket_abc" }, deps);
@@ -383,9 +393,10 @@ function startHarness(
     fileExists: () => onDisk !== undefined,
     run: (argv) => {
       ran.push(argv);
-      return 0;
+      return { code: 0, output: "" };
     },
     capture: () => ({ code: 0, stdout: '\t"PID" = 4821;\n' }),
+    inFlightJobs: () => [],
     out: (l) => void lines.push(l),
     ...over,
   };
@@ -398,10 +409,12 @@ test("runNodeStart: a healthy node is a NO-OP - `start` must not restart what is
 
   const outcome = await runNodeStart({ token: BASE.token }, h.deps);
 
-  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.deepEqual(outcome, { kind: "running", code: 0, already: true });
   assert.equal(h.writes.length, 0, "the unit is already what we would write");
   assert.equal(h.ran.length, 0, "and it is already up, so touching launchctl would be a restart in disguise");
-  assert.match(h.lines.join("\n"), /already running \(pid 4821\)/);
+  // It prints NOTHING: `start` hands off to the caller, which renders the full status block. Two lines of
+  // "already running" was a worse answer to "is my node ok" than the report the operator would type next.
+  assert.deepEqual(h.lines, []);
 });
 
 test("runNodeStart: SELF-HEALS a stale unit - this is what saves an upgraded node from crash-looping", async () => {
@@ -415,7 +428,7 @@ test("runNodeStart: SELF-HEALS a stale unit - this is what saves an upgraded nod
 
   const outcome = await runNodeStart({ token: BASE.token }, h.deps);
 
-  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.deepEqual(outcome, { kind: "running", code: 0, already: false });
   assert.equal(h.writes.length, 1, "the stale unit is rewritten");
   assert.match(h.writes[0]!.content, /--foreground/);
   assert.deepEqual(
@@ -433,7 +446,7 @@ test("runNodeStart: a stopped node is started again from the unit already on dis
 
   const outcome = await runNodeStart({ token: BASE.token }, h.deps);
 
-  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.deepEqual(outcome, { kind: "running", code: 0, already: false });
   assert.equal(h.writes.length, 0, "the unit is current - only the loader needs to run");
   assert.deepEqual(h.ran[1], ["launchctl", "load", "-w", `/Users/me/Library/LaunchAgents/${LAUNCHD_LABEL}.plist`]);
 });
@@ -450,7 +463,7 @@ test("runNodeStart: no token but an EXISTING unit still starts - the unit carrie
 
   const outcome = await runNodeStart({}, h.deps);
 
-  assert.deepEqual(outcome, { kind: "running", code: 0 });
+  assert.deepEqual(outcome, { kind: "running", code: 0, already: false });
   assert.equal(h.writes.length, 0, "we cannot re-render without a token, so we must not try");
   assert.ok(h.ran.length > 0, "but we can still load what is there");
 });
@@ -472,17 +485,18 @@ test("runNodeStart: a host that cannot daemonise says so, and asks to be run in 
 test("runNodeStop: stops without uninstalling, so `dahrk start` brings it straight back", async () => {
   const h = startHarness({ onDisk: renderLaunchdPlist(BASE) });
 
-  assert.equal(await runNodeStop(h.deps), 0);
+  assert.equal(await runNodeStop({}, h.deps), 0);
 
   assert.deepEqual(h.ran, [
     ["launchctl", "unload", "-w", `/Users/me/Library/LaunchAgents/${LAUNCHD_LABEL}.plist`],
   ]);
-  assert.match(h.lines.join("\n"), /stay stopped across reboots until you run `dahrk start`/);
+  assert.match(h.lines.join("\n"), /Node stopped/);
+  assert.match(h.lines.join("\n"), /stays stopped across reboots until you run `dahrk start`/);
 });
 
 test("runNodeStop: nothing installed is not an error, and points at how you would actually stop it", async () => {
   const h = startHarness();
-  assert.equal(await runNodeStop(h.deps), 0);
+  assert.equal(await runNodeStop({}, h.deps), 0);
   assert.equal(h.ran.length, 0);
   assert.match(h.lines.join("\n"), /nothing to stop/);
   assert.match(h.lines.join("\n"), /Ctrl-C/, "the likely case: they are running one in a terminal");
@@ -503,7 +517,7 @@ test("runNodeStop: a node under ANOTHER supervisor survives the stop, and stop m
   // pidfile, so the holder is somebody else's - and stopping the unit does nothing to it.
   const h = startHarness({ onDisk: renderLaunchdPlist(BASE), lock: "82324\n", alive: [82324, 4821] });
 
-  assert.equal(await runNodeStop(h.deps), STOP_FOREIGN_NODE, "a non-zero exit: the host is still running a node");
+  assert.equal(await runNodeStop({}, h.deps), STOP_FOREIGN_NODE, "a non-zero exit: the host is still running a node");
 
   const out = h.lines.join("\n");
   assert.match(out, /STILL RUNNING on this host \(pid 82324\)/);
@@ -516,6 +530,122 @@ test("runNodeStop: the service's own node, mid-shutdown, is not mistaken for a f
   // would fire on every single healthy stop.
   const h = startHarness({ onDisk: renderLaunchdPlist(BASE), lock: "4821\n", alive: [4821] });
 
-  assert.equal(await runNodeStop(h.deps), 0);
+  assert.equal(await runNodeStop({}, h.deps), 0);
   assert.doesNotMatch(h.lines.join("\n"), /STILL RUNNING/);
+});
+
+// --- The supervisor's chatter is ours to relay, not to leak ------------------------------------
+
+test("an ignoreFailure command's output is SWALLOWED: `Unload failed` is not news, it is how start works", async () => {
+  // `installCommands` opens with an unconditional `launchctl unload` so a re-install picks up a rewritten
+  // plist. On a job launchd does not have loaded, that prints `Unload failed: 5: Input/output error` and
+  // exits non-zero. It is marked ignoreFailure - but the old `run` inherited stdio, so the message had
+  // ALREADY reached the operator's terminal before anyone checked the exit code. On every start, and on
+  // every restart. Capturing it is what lets `runCommands` decide that nobody needs to read it.
+  const h = harness({
+    run: (argv) =>
+      argv[1] === "unload"
+        ? { code: 1, output: "Unload failed: 5: Input/output error\nTry running `launchctl bootout` as root" }
+        : { code: 0, output: "" },
+  });
+  const code = await runServiceInstall({ token: "t" }, h.deps);
+  assert.equal(code, 0, "the failure is ignored, as it always was");
+  assert.doesNotMatch(h.lines.join("\n"), /Unload failed/, "and now so is its output");
+  assert.doesNotMatch(h.lines.join("\n"), /bootout/);
+});
+
+test("a REAL failure prints the command's output, which is the only thing worth reading at that point", async () => {
+  const h = harness({
+    run: (argv) =>
+      argv[1] === "load" ? { code: 1, output: "Load failed: 5: Input/output error" } : { code: 0, output: "" },
+  });
+  const code = await runServiceInstall({ token: "t" }, h.deps);
+  assert.equal(code, 1);
+  const out = h.lines.join("\n");
+  assert.match(out, /command failed \(1\)/);
+  assert.match(out, /Load failed: 5: Input\/output error/);
+});
+
+// --- restart is one act, not stop-then-start ---------------------------------------------------
+
+test("restart NEVER says the node will stay stopped - that is stop's line, and it is false here", async () => {
+  const h = startHarness({ onDisk: renderLaunchdPlist(BASE) });
+  const outcome = await runNodeRestart({ token: BASE.token }, h.deps);
+  assert.equal(outcome.kind, "running");
+  const out = h.lines.join("\n");
+  assert.doesNotMatch(out, /stays stopped across reboots/);
+  assert.doesNotMatch(out, /Node stopped/);
+});
+
+test("restart stops and then starts: the unit is unloaded and loaded again in that order", async () => {
+  const h = startHarness({ onDisk: renderLaunchdPlist(BASE) });
+  await runNodeRestart({ token: BASE.token }, h.deps);
+  const verbs = h.ran.filter((c) => c[0] === "launchctl").map((c) => c[1]);
+  assert.ok(verbs.includes("unload"), "it stops");
+  assert.equal(verbs.at(-1), "load", "and the last thing it does is bring it back up");
+});
+
+test("restart on a node with a stage in flight REFUSES, and names what it would have killed", async () => {
+  // A stage is minutes-to-hours of agent time and real money. Killing one silently, because the operator
+  // typed `restart` to pick up a client upgrade, is not a thing a tool should do without asking.
+  const h = startHarness({
+    onDisk: renderLaunchdPlist(BASE),
+    inFlightJobs: () => [
+      { jobId: "j1", runId: "r_8fa2c1", kind: "stage", stageId: "implement", startedAt: Date.now() - 60_000, nodePid: 4821 },
+    ],
+  });
+  const outcome = await runNodeRestart({ token: BASE.token }, h.deps);
+
+  assert.deepEqual(outcome, { kind: "error", code: BUSY_NODE });
+  assert.equal(h.ran.length, 0, "nothing was touched");
+  const out = h.lines.join("\n");
+  assert.match(out, /running 1 job/);
+  assert.match(out, /r_8fa2c1/);
+  assert.match(out, /--force/);
+});
+
+test("restart --force interrupts the stage anyway, but says so rather than doing it silently", async () => {
+  const h = startHarness({
+    onDisk: renderLaunchdPlist(BASE),
+    inFlightJobs: () => [
+      { jobId: "j1", runId: "r_8fa2c1", kind: "stage", stageId: "implement", startedAt: Date.now(), nodePid: 4821 },
+    ],
+  });
+  const outcome = await runNodeRestart({ token: BASE.token, force: true }, h.deps);
+  assert.equal(outcome.kind, "running");
+  assert.match(h.lines.join("\n"), /Forcing restart with 1 job/);
+});
+
+test("a ledger entry owned by a DEAD process does not block a restart - it is a leftover, not work", async () => {
+  const h = startHarness({
+    onDisk: renderLaunchdPlist(BASE),
+    // The live node is pid 4821 (the harness's launchctl probe says so). This entry is from a node that died.
+    inFlightJobs: () => [
+      { jobId: "j1", runId: "r_dead", kind: "stage", startedAt: Date.now(), nodePid: 999 },
+    ],
+  });
+  const outcome = await runNodeRestart({ token: BASE.token }, h.deps);
+  assert.equal(outcome.kind, "running", "boot reconciliation deals with it; it must not wedge restart shut");
+});
+
+// --- liveness: a foreground / pm2 node is a REAL node --------------------------------------------
+
+test("liveNodePid: falls back to the pidfile, so a node the supervisor never started is still seen", () => {
+  const h = harness({
+    fileExists: () => false, // no unit at all
+    lockFile: "/lock",
+    readFile: (p) => (p === "/lock" ? "4821\n" : undefined),
+    isAlive: (pid) => pid === 4821,
+  });
+  assert.equal(liveNodePid(h.deps as ServiceDeps), 4821);
+});
+
+test("liveNodePid: a STALE pidfile (the process is gone) is not read back as a live node", () => {
+  const h = harness({
+    fileExists: () => false,
+    lockFile: "/lock",
+    readFile: (p) => (p === "/lock" ? "4821\n" : undefined),
+    isAlive: () => false,
+  });
+  assert.equal(liveNodePid(h.deps as ServiceDeps), undefined);
 });

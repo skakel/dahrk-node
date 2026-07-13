@@ -15,6 +15,7 @@
  */
 import type { HubProbeResult, RuntimeStatus } from "@dahrk/edge";
 import { probeHub as realProbeHub, probeRuntimeStatuses } from "@dahrk/edge";
+import { dim, out as uiOut, symbol, verdict, type Level } from "./ui.js";
 
 /** The minimum Node major this client supports (README: "Requires Node 22+"). */
 export const MIN_NODE_MAJOR = 22;
@@ -26,7 +27,10 @@ export interface CheckResult {
   detail?: string;
 }
 
-const TAG: Record<CheckStatus, string> = { pass: "[PASS]", warn: "[WARN]", fail: "[FAIL]" };
+/** The doctor's own vocabulary, mapped onto the one every command shares. It used to print `[PASS]` /
+ *  `[WARN]` / `[FAIL]` tags that existed nowhere else in the tool; now a tick means the same thing here as
+ *  it does in `status` and `run preflight`. */
+const LEVEL: Record<CheckStatus, Level> = { pass: "ok", warn: "warn", fail: "fail" };
 
 /** Check the running Node version against the supported floor. */
 export function checkNode(nodeVersion: string): CheckResult {
@@ -139,18 +143,22 @@ export function checkToken(
   return { status: "warn", label: "Enrolment token", detail: "present but unverified (hub not reachable)" };
 }
 
-/** Render the gathered checks into the report body, ending with an overall pass/fail summary line. */
+/** Render the gathered checks into the report body, ending with an overall pass/fail summary line.
+ *
+ *  The verdict comes LAST here, not first as it does in `status`, because a doctor's checks are the point:
+ *  you run it to read them. `status` answers one question, so it leads with the answer; `doctor` answers
+ *  four, so it shows its working and then adds them up. */
 export function formatReport(checks: CheckResult[]): string {
   const failed = checks.filter((c) => c.status === "fail").length;
   const warned = checks.filter((c) => c.status === "warn").length;
-  const lines = checks.map((c) => `${TAG[c.status]} ${c.label}${c.detail ? `: ${c.detail}` : ""}`);
+  const lines = checks.map((c) => `  ${symbol(LEVEL[c.status])} ${c.label}${c.detail ? `: ${dim(c.detail)}` : ""}`);
   const summary =
     failed > 0
-      ? `FAIL - ${failed} check${failed === 1 ? "" : "s"} failed${warned ? `, ${warned} warning${warned === 1 ? "" : "s"}` : ""}.`
+      ? verdict("fail", `${failed} check${failed === 1 ? "" : "s"} failed${warned ? `, ${warned} warning${warned === 1 ? "" : "s"}` : ""}.`)
       : warned > 0
-        ? `PASS with ${warned} warning${warned === 1 ? "" : "s"}.`
-        : "PASS - all checks green.";
-  return ["dahrk doctor", "", ...lines, "", summary].join("\n");
+        ? verdict("warn", `Passed with ${warned} warning${warned === 1 ? "" : "s"}.`)
+        : verdict("ok", "All checks green.");
+  return ["", ...lines, "", summary].join("\n");
 }
 
 /** Injectable IO/probes so `runDoctor` can be exercised without a network or a real host. */
@@ -165,7 +173,7 @@ const defaultDeps = (): DoctorDeps => ({
   nodeVersion: process.versions.node,
   probeRuntimes: probeRuntimeStatuses,
   probeHub: realProbeHub,
-  out: (line: string) => void process.stdout.write(`${line}\n`),
+  out: uiOut,
 });
 
 export interface DoctorInputs {

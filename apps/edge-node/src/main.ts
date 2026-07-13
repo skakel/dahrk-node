@@ -26,7 +26,7 @@
  * `DAHRK_TENANT_ID` still act as explicit overrides.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir, platform as osPlatform } from "node:os";
 import { basename, join } from "node:path";
@@ -39,6 +39,7 @@ import {
   fileJobLedger,
   jobLedgerFile,
   LogShipper,
+  probeRuntimeStatuses,
   shipperStream,
   startEdgeNode,
   type EdgeOptions,
@@ -47,11 +48,12 @@ import type { CredentialMode, Runtime } from "@dahrk/contracts";
 import { parseCli, usage, type RunFlags, type StartFlags } from "./cli.js";
 import { runDiagnose, defaultDiagnoseDeps, defaultBundlePath } from "./diagnose.js";
 import { runDoctor } from "./doctor.js";
-import { defaultLockDeps, acquireLock } from "./lock.js";
-import { defaultLogsDeps, rotateIfLarge, runLogs } from "./logs.js";
+import { defaultLockDeps, acquireLock, isAlive, parseLock } from "./lock.js";
+import { defaultLogsDeps, parseRecords, rotateIfLarge, runLogs } from "./logs.js";
 import { installProcessSafetyNet, writeCrashRecord } from "./process-safety.js";
 import { runPreflight } from "./preflight.js";
 import {
+  runNodeRestart,
   runNodeStart,
   runNodeStop,
   runServiceInstall,
@@ -59,6 +61,7 @@ import {
   STOP_FOREIGN_NODE,
 } from "./service.js";
 import { fetchLatestVersion, runUpdate } from "./update.js";
+import { confirm, hint, isInteractive, out as uiOut, stripAnsi, verdict } from "./ui.js";
 import {
   checkForUpdate,
   checkIntervalMs,
@@ -68,7 +71,7 @@ import {
   renderUpdateNotice,
   type UpdateCheckDeps,
 } from "./update-check.js";
-import { runStatus, type StatusDeps } from "./status.js";
+import { lastConnection, runStatus, type StatusDeps } from "./status.js";
 import {
   crashDir,
   jsonlLogFile,
@@ -248,22 +251,57 @@ async function start(flags: StartFlags): Promise<number> {
   // months. It is the one good moment to mention there is a newer one.
   await offerUpdate(env);
 
-  const outcome = await runNodeStart({
-    ...(resolveEnrolToken(env) ? { token: resolveEnrolToken(env) as string } : {}),
-    ...(env.DAHRK_NODE_NAME ? { name: env.DAHRK_NODE_NAME } : {}),
-    ...(env.DAHRK_HUB_URL ? { hubUrl: env.DAHRK_HUB_URL } : {}),
-  });
+  const outcome = await runNodeStart(serviceInputs(env));
 
   if (outcome.kind === "error") return outcome.code;
   if (outcome.kind === "running") {
     setDesired(env, "running");
+    // Whether we started it or found it already up, the useful answer is the same, and it is the one the
+    // operator would have got by typing `dahrk status` next. So just give it to them.
+    await printStatus(env);
     return 0;
   }
   // Daemonising is impossible here (no supervisor, or no user session - a container). Running the worker
   // inline is the honest thing to do: the alternative is to "install" a service that can never start.
-  console.warn(`${outcome.reason}; running the node in this terminal instead.`);
-  console.warn("Use `dahrk start --foreground` (or DAHRK_FOREGROUND=1) to ask for this explicitly.");
+  uiOut("");
+  uiOut(verdict("warn", `${outcome.reason}; running the node in this terminal instead.`));
+  uiOut("");
+  uiOut(hint("Use `dahrk start --foreground` (or DAHRK_FOREGROUND=1) to ask for this explicitly."));
   return startForeground(env, flags);
+}
+
+/** The connection / identity inputs the service commands bake into the unit, resolved once from the env
+ *  (which the caller has already overlaid the flags onto). */
+const serviceInputs = (env: NodeJS.ProcessEnv): { token?: string; name?: string; hubUrl?: string } => ({
+  ...(resolveEnrolToken(env) ? { token: resolveEnrolToken(env) as string } : {}),
+  ...(env.DAHRK_NODE_NAME ? { name: env.DAHRK_NODE_NAME } : {}),
+  ...(env.DAHRK_HUB_URL ? { hubUrl: env.DAHRK_HUB_URL } : {}),
+});
+
+/**
+ * `dahrk restart`: stop the node and start it again, as one act.
+ *
+ * `desired` is written ONCE, at the end, and only on success. The old composition wrote "stopped" in the
+ * middle (because it really did call `stop`), so a restart whose start half failed left the node down and
+ * recorded as though the operator had wanted it down - which is exactly the state `status` is meant to raise
+ * the alarm about, silently disarmed by the command that caused it.
+ */
+async function restart(flags: StartFlags, force: boolean): Promise<number> {
+  const env = envWithFlags(process.env, flags);
+  uiOut("");
+  uiOut(hint("Restarting the node..."));
+
+  const outcome = await runNodeRestart({ ...serviceInputs(env), force });
+  if (outcome.kind === "error") return outcome.code;
+  if (outcome.kind === "foreground") {
+    uiOut(verdict("warn", `${outcome.reason}; there is no service to restart.`));
+    uiOut("");
+    uiOut(hint("A node running in a terminal is restarted by stopping it (Ctrl-C) and starting it again."));
+    return 1;
+  }
+  setDesired(env, "running");
+  await printStatus(env);
+  return 0;
 }
 
 /**
@@ -378,8 +416,8 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
 
 /** `dahrk stop`: stop the node, and remember that we meant it - so `status` reports a stopped node as
  *  stopped rather than as a crash-loop, and so its exit code stays a usable health check. */
-async function stop(env: NodeJS.ProcessEnv): Promise<number> {
-  const code = await runNodeStop();
+async function stop(env: NodeJS.ProcessEnv, force: boolean): Promise<number> {
+  const code = await runNodeStop({ force });
   // STOP_FOREIGN_NODE is a non-zero exit, but the service IS stopped and the operator DID mean it - the
   // node still up is one another supervisor owns. Record the intent anyway, or `status` would read the
   // stopped service back as a crash-loop.
@@ -399,33 +437,18 @@ function updateCheckDeps(env: NodeJS.ProcessEnv): UpdateCheckDeps {
   };
 }
 
-/** Is there a human at a terminal to answer a question? A piped or redirected `dahrk start` - the curl
- *  installer, a provisioning script, CI - must never block waiting on an answer nobody is there to give. */
-const isInteractive = (): boolean => Boolean(process.stdin.isTTY && process.stdout.isTTY);
-
-/** Ask a yes/no question, defaulting to yes on a bare Enter. */
-async function confirm(question: string): Promise<boolean> {
-  const { createInterface } = await import("node:readline/promises");
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = (await rl.question(`${question} [Y/n] `)).trim().toLowerCase();
-    return answer === "" || answer === "y" || answer === "yes";
-  } finally {
-    rl.close();
-  }
-}
-
 /** The interactive half of the update check: tell the operator they are behind, and offer to fix it while
  *  they are here. A failed upgrade is reported but never fatal - being on an old client is not a reason to
  *  refuse to start the node. */
 async function offerUpdate(env: NodeJS.ProcessEnv): Promise<void> {
   const available = await checkForUpdate(CLIENT_VERSION, updateCheckDeps(env));
   if (!available) return;
-  console.log(renderUpdateNotice(available));
+  uiOut("");
+  uiOut(renderUpdateNotice(available));
   if (!isInteractive()) return;
-  if (!(await confirm("update now?"))) return;
+  if (!(await confirm("Update now?"))) return;
   const code = await runUpdate({ currentVersion: CLIENT_VERSION, check: false });
-  if (code !== 0) console.warn("Update failed; starting the node on the current version anyway.");
+  if (code !== 0) uiOut(hint("Update failed; starting the node on the current version anyway."));
 }
 
 /** The daemon half: no prompt, no self-update, just a line in the log so that whoever eventually reads it
@@ -443,15 +466,27 @@ function scheduleUpdateChecks(env: NodeJS.ProcessEnv): void {
   setInterval(() => void tick(), checkIntervalMs(env)).unref();
 }
 
-/** The real IO `dahrk status` runs on: the host, the state file, the supervisor probe. Kept here (not in
- *  status.ts) so that module stays free of node:child_process and unit-tests with plain fakes. */
+/** The real IO `dahrk status` runs on: the host, the state file, the supervisor probe, the pidfile, the job
+ *  ledger and the log tail. Kept here (not in status.ts) so that module stays free of node:child_process and
+ *  node:fs, and unit-tests with plain fakes.
+ *
+ *  Every source here is a LOCAL read. That is the contract `status` is built on, and there is a test that
+ *  fails the moment anything in this object reaches for the network. */
 function statusDeps(env: NodeJS.ProcessEnv): StatusDeps {
   return {
     platform: osPlatform(),
     homeDir: homedir(),
     env,
     binPath: process.argv[1],
-    detectRuntimes: () => resolveRuntimes(env),
+    // The rich probe, with versions - the same one `doctor` runs. An explicit DAHRK_RUNTIMES override still
+    // wins, and is reported as installed-without-a-version, because a pinned runtime was never probed.
+    probeRuntimes: async () => {
+      const override = list(env.DAHRK_RUNTIMES).filter(isRuntime);
+      if (override.length > 0) {
+        return RUNTIMES.map((r) => ({ runtime: r, cmd: r, installed: override.includes(r) }));
+      }
+      return probeRuntimeStatuses();
+    },
     fileExists: (path) => existsSync(path),
     capture: (argv) => {
       const [cmd, ...args] = argv;
@@ -465,8 +500,39 @@ function statusDeps(env: NodeJS.ProcessEnv): StatusDeps {
         return { code: typeof status === "number" ? status : 1, stdout: "" };
       }
     },
-    out: (line) => void process.stdout.write(`${line}\n`),
+    lockedPid: () => {
+      const held = parseLock(readFileOrUndefined(lockFile(env)));
+      return held !== undefined && isAlive(held) ? held : undefined;
+    },
+    // Best-effort by construction: a missing or unreadable ledger reads as "no jobs in flight", which shows
+    // an idle node rather than failing the whole report over a file that only exists while work is running.
+    jobs: () => fileJobLedger(jobLedgerFile(stateDir(env)), () => {}).all(),
+    connection: () => {
+      const raw = readFileOrUndefined(jsonlLogFile(env));
+      return raw ? lastConnection(parseRecords(raw)) : undefined;
+    },
+    now: () => Date.now(),
+    out: uiOut,
   };
+}
+
+/** Read a file, or undefined if it is not there / not readable. The node's log and pidfile are both
+ *  optional: a node that has never run has neither, and that is a state to report, not an error. */
+function readFileOrUndefined(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Print the canonical status block. What `start`, `stop` and `restart` all end with, so that "what
+ *  happened" and "what is true now" are the same block of text rather than three summaries that drift. */
+async function printStatus(env: NodeJS.ProcessEnv): Promise<number> {
+  return runStatus(
+    { clientVersion: CLIENT_VERSION, hubUrl: env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL },
+    statusDeps(env),
+  );
 }
 
 /** The workflows `dahrk run` can dispatch. The seam is deliberately small: `preflight` is the first
@@ -483,7 +549,8 @@ async function runWorkflow(flags: RunFlags): Promise<number> {
     return 2;
   }
   const env = applyEnvAliases(process.env);
-  const hubUrl = flags.hubUrl ?? env.DAHRK_HUB_URL;
+  // Defaulted, for the same reason `doctor` is: an unset DAHRK_HUB_URL is the NORMAL case, not a misconfig.
+  const hubUrl = flags.hubUrl ?? env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL;
   const token = flags.token ?? resolveEnrolToken(env);
   return runPreflight({
     ...(flags.repo ? { repoPath: flags.repo } : {}),
@@ -516,7 +583,10 @@ async function main(): Promise<void> {
     case "doctor": {
       const env = envWithFlags(process.env, parsed.flags);
       process.exitCode = await runDoctor({
-        hubUrl: env.DAHRK_HUB_URL,
+        // The same default the node itself dials. Without this, `dahrk doctor` on a stock install FAILED
+        // with "no hub URL configured" while the node was connected to that very hub - it was reporting
+        // that an env var was unset, not that anything was wrong.
+        hubUrl: env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL,
         // Same resolution as `start`, so doctor checks the token the node would actually present:
         // the flag/env if given, else the one cached by the last successful enrolment.
         token: resolveEnrolToken(env),
@@ -528,7 +598,11 @@ async function main(): Promise<void> {
       // Local only: no dial, no token needed. `hubUrl` is reported (what we WOULD dial), not probed.
       const env = envWithFlags(process.env, parsed.flags);
       process.exitCode = await runStatus(
-        { clientVersion: CLIENT_VERSION, hubUrl: env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL },
+        {
+          clientVersion: CLIENT_VERSION,
+          hubUrl: env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL,
+          json: parsed.flags.json,
+        },
         statusDeps(env),
       );
       break;
@@ -558,24 +632,23 @@ async function main(): Promise<void> {
     }
     case "update":
       // Self-update is issue-less and hub-less: no env/flag overlay, just current vs latest.
-      process.exitCode = await runUpdate({ currentVersion: CLIENT_VERSION, check: parsed.flags.check });
+      process.exitCode = await runUpdate({
+        currentVersion: CLIENT_VERSION,
+        check: parsed.flags.check,
+        verbose: parsed.flags.verbose,
+      });
       break;
     case "start":
       process.exitCode = await start(parsed.flags);
       break;
     case "stop":
-      process.exitCode = await stop(applyEnvAliases(process.env));
+      process.exitCode = await stop(applyEnvAliases(process.env), parsed.force);
       break;
-    case "restart": {
-      const env = envWithFlags(process.env, parsed.flags);
-      const code = await stop(env);
-      if (code !== 0) {
-        process.exitCode = code;
-        break;
-      }
-      process.exitCode = await start(parsed.flags);
+    case "restart":
+      // One act, not `stop` followed by `start`: see `restart` above for why that composition was wrong in
+      // both what it printed and what it left behind in `desired`.
+      process.exitCode = await restart(parsed.flags, parsed.force);
       break;
-    }
     case "logs": {
       const env = applyEnvAliases(process.env);
       process.exitCode = await runLogs(parsed.flags, defaultLogsDeps(logFiles(env), jsonlLogFile(env)));
@@ -592,7 +665,10 @@ async function main(): Promise<void> {
             ...(resolveEnrolToken(env) ? { token: resolveEnrolToken(env) as string } : {}),
             hubUrl: env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL,
           },
-          { out: (line: string) => void doctorLines.push(line) },
+          // Stripped: stdout is a TTY here (the operator is watching), so the doctor correctly colours its
+          // report - but this copy is going into a JSON file that someone will open in an editor and paste
+          // into an issue, and escape codes have no business being in it.
+          { out: (line: string) => void doctorLines.push(stripAnsi(line)) },
         );
         return doctorLines;
       };

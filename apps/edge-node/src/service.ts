@@ -26,8 +26,10 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform as osPlatform, userInfo } from "node:os";
 import { join } from "node:path";
+import { fileJobLedger, jobLedgerFile, type JobLedgerEntry } from "@dahrk/edge";
 import { isAlive as pidIsAlive, parseLock } from "./lock.js";
-import { lockFile as resolveLockFile, logDir as resolveLogDir } from "./state.js";
+import { lockFile as resolveLockFile, logDir as resolveLogDir, stateDir as resolveStateDir } from "./state.js";
+import { dim, hint, hints, humanDuration, kv, out as uiOut, verdict } from "./ui.js";
 
 /** The unit file carries the enrolment token in its environment block, so it is owner-only. */
 export const UNIT_FILE_MODE = 0o600;
@@ -52,6 +54,20 @@ export function detectManager(plat: NodeJS.Platform): Manager {
 export interface ServiceCommand {
   argv: string[];
   ignoreFailure?: boolean;
+}
+
+/** What running a supervisor command produced: its exit code, and whatever it wrote to stdout / stderr.
+ *
+ *  The output is CAPTURED rather than inherited, which is the whole point. `installCommands` opens with an
+ *  unconditional `launchctl unload` so that a re-install picks up a rewritten plist, and on a job launchd
+ *  does not currently have loaded that prints `Unload failed: 5: Input/output error` and exits non-zero.
+ *  The step is marked `ignoreFailure`, but that only ever suppressed the exit CODE - the message had already
+ *  gone straight to the operator's terminal through an inherited stderr, on every `start` and every
+ *  `restart`. Capturing it means `runCommands` can decide, after the fact, whether anybody needs to see it. */
+export interface RunResult {
+  code: number;
+  /** stdout and stderr, interleaved as the command wrote them. Empty when it said nothing. */
+  output: string;
 }
 
 /** The fully-resolved inputs a plan needs: the absolute node + script to run, the token and optional
@@ -340,8 +356,8 @@ export interface ServiceDeps {
   readFile: (path: string) => string | undefined;
   removeFile: (path: string) => void;
   fileExists: (path: string) => boolean;
-  /** Run a loader command; returns its exit code (0 = success). */
-  run: (argv: string[]) => number;
+  /** Run a loader command, capturing what it says. Never inherits stdio: see {@link RunResult}. */
+  run: (argv: string[]) => RunResult;
   /** Run a probe and capture its stdout (parsed, not shown) - `statusCommand`'s counterpart. */
   capture: (argv: string[]) => { code: number; stdout: string };
   /** The single-instance pidfile (`~/.dahrk/node.pid`). Held by whichever process is doing the work, no
@@ -349,6 +365,9 @@ export interface ServiceDeps {
   lockFile: string;
   /** Is a pid a live process? `lock.ts`'s liveness test, injected so `stop` tests without real processes. */
   isAlive: (pid: number) => boolean;
+  /** What the node is running right now, from its on-disk ledger (`~/.dahrk/jobs.json`). Drives the guard
+   *  that stops `stop` / `restart` silently killing a stage mid-flight. */
+  inFlightJobs: () => JobLedgerEntry[];
   out: (line: string) => void;
 }
 
@@ -360,18 +379,28 @@ export interface ServiceInstallInputs {
 
 /** The unsupported-platform message: no launchd / systemd, so point at the pm2 fallback. */
 function printUnsupported(out: (line: string) => void): number {
-  out("dahrk service is supported on macOS (launchd) and Linux (systemd) only.");
-  out("On other platforms, run the node under a process manager such as pm2 (see the README).");
+  out(verdict("fail", "dahrk service is supported on macOS (launchd) and Linux (systemd) only."));
+  out("");
+  out(hint("On other platforms, run the node under a process manager such as pm2 (see the README)."));
   return 1;
 }
 
-/** Run a plan's commands in order; a non-`ignoreFailure` command that exits non-zero aborts and returns
- *  its code. Returns 0 when every essential command succeeded. */
+/**
+ * Run a plan's commands in order; a non-`ignoreFailure` command that exits non-zero aborts and returns its
+ * code. Returns 0 when every essential command succeeded.
+ *
+ * The supervisor's own chatter is shown ONLY when a command we actually cared about failed. That is the
+ * difference between a tool and a transcript: `launchctl` complaining that it cannot unload a job it never
+ * had loaded is not news, it is an implementation detail of how we make `start` idempotent, and printing it
+ * taught the operator to distrust output that was in fact fine. When something does fail, the captured text
+ * is the most useful thing we have, so it is printed in full and indented under our own line.
+ */
 function runCommands(commands: ServiceCommand[], d: ServiceDeps): number {
   for (const cmd of commands) {
-    const code = d.run(cmd.argv);
+    const { code, output } = d.run(cmd.argv);
     if (code !== 0 && !cmd.ignoreFailure) {
-      d.out(`  command failed (${code}): ${cmd.argv.join(" ")}`);
+      d.out(verdict("fail", `command failed (${code}): ${cmd.argv.join(" ")}`));
+      for (const line of output.split("\n")) if (line.trim()) d.out(`    ${dim(line)}`);
       return code;
     }
   }
@@ -387,15 +416,15 @@ export async function runServiceInstall(
   deps: Partial<ServiceDeps> = {},
 ): Promise<number> {
   const d = { ...defaultDeps(), ...deps };
-  d.out("dahrk service install");
   d.out("");
 
   const manager = detectManager(d.platform);
   if (manager === "unsupported") return printUnsupported(d.out);
 
   if (!inputs.token) {
-    d.out("No enrolment token: pass --token <token> or set DAHRK_ENROL_TOKEN.");
-    d.out("Get one at https://app.dahrk.ai.");
+    d.out(verdict("fail", "No enrolment token."));
+    d.out("");
+    d.out(hint("Pass --token <token>, or set DAHRK_ENROL_TOKEN. Get one at https://app.dahrk.ai."));
     return 2;
   }
 
@@ -418,22 +447,24 @@ export async function runServiceInstall(
     d.mkdirp(dirOf(plan.filePath));
     d.writeFile(plan.filePath, plan.content);
   } catch (e) {
-    d.out(`Could not write the service file at ${plan.filePath}: ${(e as Error).message}`);
+    d.out(verdict("fail", `Could not write the service file at ${plan.filePath}`));
+    d.out("");
+    d.out(hint((e as Error).message));
     return 1;
   }
-  d.out(`Wrote ${plan.manager} service: ${plan.filePath}`);
 
   const code = runCommands(plan.installCommands, d);
-  d.out("");
   if (code !== 0) {
-    d.out(`The service file is in place but registering it failed (exit ${code}).`);
-    d.out("Fix the reported error and re-run `dahrk service install`, or load it yourself.");
+    d.out("");
+    d.out(hint(`The service file is in place at ${plan.filePath}. Fix the error above and re-run.`));
     return code;
   }
 
-  d.out("Installed. The node will start on boot and restart on failure.");
-  d.out(`  logs:      ${plan.logHint}`);
-  d.out("  uninstall: dahrk service uninstall");
+  d.out(verdict("ok", "Installed. The node starts on boot and restarts on failure."));
+  d.out("");
+  d.out(kv("unit", plan.filePath));
+  d.out("");
+  d.out(hints([["logs", plan.logHint], ["uninstall", "dahrk service uninstall"]]));
   return 0;
 }
 
@@ -450,11 +481,49 @@ export function availabilityCommand(manager: "launchd" | "systemd"): string[] | 
 
 /** What `dahrk start` decided to do. `foreground` is not a failure: it is every case where daemonising is
  *  impossible or unwise (no supervisor, no user session), where running the worker inline is the honest
- *  thing to do rather than pretending to install a service. */
+ *  thing to do rather than pretending to install a service.
+ *
+ *  `already` distinguishes "it was up and we left it alone" from "we started it", which is the difference
+ *  between the two sentences the caller wants to print. Neither is an error. */
 export type StartOutcome =
-  | { kind: "running"; code: 0 }
+  | { kind: "running"; code: 0; already: boolean }
   | { kind: "foreground"; reason: string }
   | { kind: "error"; code: number };
+
+/**
+ * Is a node running on this host, by any means?
+ *
+ * Two sources, because there are two ways to run one and only asking the supervisor gets the answer wrong.
+ * The launchd / systemd unit is the usual case. But `dahrk start --foreground`, a container, and pm2 all run
+ * a perfectly real node that the supervisor has never heard of - and the pidfile is what makes it visible,
+ * because the WORKER takes the lock whoever supervises it (see `lock.ts`). Asking only launchd would report
+ * a healthy foreground node as "not installed", which is how `status` has been lying about it.
+ */
+export function liveNodePid(d: ServiceDeps): number | undefined {
+  const manager = detectManager(d.platform);
+  if (manager !== "unsupported") {
+    const unit = unitPath(manager, d.homeDir);
+    if (d.fileExists(unit)) {
+      const status = parseServiceStatus(manager, true, d.capture(statusCommand(manager)));
+      if (status.running && status.pid) return status.pid;
+    }
+  }
+  // No supervised node. Is somebody else running one? The pidfile answers, and `isAlive` keeps a stale
+  // pidfile (a SIGKILLed node, a host that lost power) from being read back as a live one.
+  const held = parseLock(d.readFile(d.lockFile));
+  return held !== undefined && d.isAlive(held) ? held : undefined;
+}
+
+/** Is a node running on this host? The convenience shell over {@link liveNodePid} for callers that have no
+ *  deps of their own to inject (`dahrk update`, deciding whether a restart is even worth mentioning). */
+export const nodeIsRunning = (deps: Partial<ServiceDeps> = {}): boolean =>
+  liveNodePid({ ...defaultDeps(), ...deps }) !== undefined;
+
+/** Internal knobs on `runNodeStart`. `alwaysLoad` is `restart`'s: load the unit unconditionally rather than
+ *  short-circuiting on a supervisor that may not have caught up with the unload yet. */
+export interface StartOptions {
+  alwaysLoad?: boolean;
+}
 
 /**
  * `dahrk start` in daemon mode: make the node be running, and return. Idempotent.
@@ -468,6 +537,7 @@ export type StartOutcome =
 export async function runNodeStart(
   inputs: ServiceInstallInputs,
   deps: Partial<ServiceDeps> = {},
+  opts: StartOptions = {},
 ): Promise<StartOutcome> {
   const d = { ...defaultDeps(), ...deps };
 
@@ -486,8 +556,9 @@ export async function runNodeStart(
   // No token anywhere and no unit to fall back on: there is nothing to enrol with. Say so, exactly once,
   // with where to get one.
   if (!inputs.token && !unitExists) {
-    d.out("No enrolment token: pass --token <token> or set DAHRK_ENROL_TOKEN.");
-    d.out("Get one at https://app.dahrk.ai.");
+    d.out(verdict("fail", "No enrolment token."));
+    d.out("");
+    d.out(hint("Pass --token <token>, or set DAHRK_ENROL_TOKEN. Get one at https://app.dahrk.ai."));
     return { kind: "error", code: 2 };
   }
 
@@ -509,13 +580,18 @@ export async function runNodeStart(
   const current = canRender && unitExists && unitIsCurrent(plan, d.readFile(filePath));
 
   // Already up, on the unit we would write anyway: do nothing. `start` must be a cheap no-op when the node
-  // is healthy, not a restart in disguise.
-  const probe = unitExists ? d.capture(statusCommand(manager)) : { code: 1, stdout: "" };
-  const status = parseServiceStatus(manager, unitExists, probe);
-  if (current && status.running) {
-    d.out(`Node is already running${status.pid ? ` (pid ${status.pid})` : ""}.`);
-    d.out(`  logs: ${plan.logHint}`);
-    return { kind: "running", code: 0 };
+  // is healthy, not a restart in disguise. Nothing is printed here: the caller renders the status block,
+  // which answers "is it running, and as what" far better than the two lines this used to emit.
+  //
+  // `alwaysLoad` is what `restart` passes, and it is not an optimisation - it is a correctness fix. A
+  // restart has just unloaded the unit, but `launchctl` returns before the job has finished going away (the
+  // same race `foreignNodePid` documents), so this probe can still report the node as up. Re-deciding
+  // "is it running?" here would then make the start half a no-op and leave the node DOWN, which is the one
+  // thing a restart may never do. A restart has already decided; it does not ask again.
+  if (!opts.alwaysLoad) {
+    const probe = unitExists ? d.capture(statusCommand(manager)) : { code: 1, stdout: "" };
+    const status = parseServiceStatus(manager, unitExists, probe);
+    if (current && status.running) return { kind: "running", code: 0, already: true };
   }
 
   if (canRender && !current) {
@@ -528,19 +604,98 @@ export async function runNodeStart(
       d.out(`Could not write the service file at ${plan.filePath}: ${(e as Error).message}`);
       return { kind: "error", code: 1 };
     }
-    d.out(unitExists ? `Updated ${plan.manager} service: ${plan.filePath}` : `Installed ${plan.manager} service: ${plan.filePath}`);
+    d.out(hint(unitExists ? `Updated the ${plan.manager} service.` : `Installed the ${plan.manager} service.`));
   }
 
   const code = runCommands(plan.installCommands, d);
   if (code !== 0) {
-    d.out(`The service file is in place but starting it failed (exit ${code}).`);
+    d.out(hint(`The service file is in place at ${plan.filePath}, but starting it failed.`));
     return { kind: "error", code };
   }
-  d.out("Node is running. It will start on boot and restart on failure.");
-  d.out(`  logs:   ${plan.logHint}`);
-  d.out("  stop:   dahrk stop");
-  return { kind: "running", code: 0 };
+  return { kind: "running", code: 0, already: false };
 }
+
+/**
+ * `dahrk restart`: stop the node and start it again, as ONE act.
+ *
+ * This used to be `stop()` followed by `start()` in the caller, which is not the same thing and read like it:
+ * `stop` announces that the node "will stay stopped across reboots until you run `dahrk start`", which is
+ * simply false when the next line of the same command is going to start it. The operator was shown two
+ * unrelated commands' output glued together and left to work out that the alarming half did not apply.
+ *
+ * It also left a trap. `stop` records the operator's INTENT as "stopped" (that is what keeps `status` from
+ * reporting a deliberately-stopped node as a crash-loop), and only a successful `start` wrote it back. So a
+ * restart whose start half failed left the node down AND recorded as though the operator had wanted it that
+ * way, which is precisely the case `status` is supposed to shout about. Restart never intends "stopped", so
+ * it never writes it: `desired` is the caller's to set, once, at the end.
+ */
+export async function runNodeRestart(
+  inputs: ServiceInstallInputs & { force?: boolean },
+  deps: Partial<ServiceDeps> = {},
+): Promise<StartOutcome> {
+  const d = { ...defaultDeps(), ...deps };
+
+  const manager = detectManager(d.platform);
+  if (manager === "unsupported") {
+    return { kind: "foreground", reason: "no supported supervisor on this platform (launchd / systemd)" };
+  }
+
+  const busy = guardBusy(d, inputs.force ?? false, "restart");
+  if (busy) return { kind: "error", code: busy };
+
+  const plan = buildPlan({
+    manager,
+    nodeBin: d.nodeBin,
+    scriptPath: d.scriptPath,
+    token: "-",
+    homeDir: d.homeDir,
+    logDir: d.logDir,
+  });
+
+  // Stop, but say nothing: a restart's stop is a step, not an outcome. Best-effort, because a node that is
+  // already down is a perfectly good starting point for a restart - `dahrk restart` on a stopped node should
+  // start it, not refuse.
+  if (d.fileExists(plan.filePath)) runCommands(plan.stopCommands, d);
+
+  // `alwaysLoad`: we have just unloaded it, and we are not going to ask the supervisor whether it agrees.
+  return runNodeStart(inputs, deps, { alwaysLoad: true });
+}
+
+/**
+ * Refuse to take down a node that is in the middle of something, unless told to anyway.
+ *
+ * The job ledger is the node's own record of what it is running right now (it is what lets a crashed node
+ * recover a stage rather than re-run it from scratch), so it is exactly the right thing to consult before
+ * pulling the floor out. A stage is minutes-to-hours of agent time and real money; killing one silently,
+ * because the operator typed `restart` to pick up a client upgrade, is the kind of thing a tool should ask
+ * about first. Returns an exit code to fail with, or undefined when it is safe to proceed.
+ */
+function guardBusy(d: ServiceDeps, force: boolean, verb: string): number | undefined {
+  const live = liveNodePid(d);
+  // Only jobs owned by the node that is actually running count. An entry left behind by a process that has
+  // since died is a leftover the next boot will reconcile, not work we would be interrupting.
+  const jobs = live === undefined ? [] : d.inFlightJobs().filter((j) => j.nodePid === live);
+  if (jobs.length === 0) return undefined;
+
+  if (force) {
+    d.out(verdict("warn", `Forcing ${verb} with ${jobs.length} job(s) in flight.`));
+    return undefined;
+  }
+
+  d.out(verdict("warn", `This node is running ${jobs.length} job(s); \`${verb}\` would kill them.`));
+  d.out("");
+  for (const j of jobs) {
+    const where = j.stageId ? `${j.runId} / ${j.stageId}` : j.runId;
+    d.out(kv("", `${where}  ${dim(humanDuration(Date.now() - j.startedAt))}`));
+  }
+  d.out("");
+  d.out(hint(`Wait for them to finish, or \`dahrk ${verb} --force\` to interrupt them anyway.`));
+  return BUSY_NODE;
+}
+
+/** `dahrk stop` / `dahrk restart` refused because the node has work in flight and `--force` was not given.
+ *  Distinct from every other non-zero code here: nothing is wrong, and nothing was changed. */
+export const BUSY_NODE = 4;
 
 /** `dahrk stop` stopped the service but a node outlived it: the exit code that says so. Distinct from 1
  *  (an unsupported host, where we stopped nothing) because the service really is stopped - and distinct
@@ -574,11 +729,17 @@ export function foreignNodePid(
  * it back. Returns the process exit code (0 = stopped / nothing to stop, 1 = unsupported host,
  * 3 = the service is stopped but another supervisor's node is still running).
  */
-export async function runNodeStop(deps: Partial<ServiceDeps> = {}): Promise<number> {
+export async function runNodeStop(
+  inputs: { force?: boolean } = {},
+  deps: Partial<ServiceDeps> = {},
+): Promise<number> {
   const d = { ...defaultDeps(), ...deps };
 
   const manager = detectManager(d.platform);
   if (manager === "unsupported") return printUnsupported(d.out);
+
+  const busy = guardBusy(d, inputs.force ?? false, "stop");
+  if (busy) return busy;
 
   // Removal / stopping never needs a real token; the placeholder keeps the builder's shape.
   const plan = buildPlan({
@@ -591,8 +752,9 @@ export async function runNodeStop(deps: Partial<ServiceDeps> = {}): Promise<numb
   });
 
   if (!d.fileExists(plan.filePath)) {
-    d.out("No service installed, so there is nothing to stop.");
-    d.out("If you are running a node in a terminal (`dahrk start --foreground`), stop it with Ctrl-C.");
+    d.out(verdict("info", "No service installed, so there is nothing to stop."));
+    d.out("");
+    d.out(hint("A node running in a terminal (`dahrk start --foreground`) stops with Ctrl-C."));
     return reportForeignNode(d, undefined) ?? 0;
   }
 
@@ -602,7 +764,9 @@ export async function runNodeStop(deps: Partial<ServiceDeps> = {}): Promise<numb
   const servicePid = parseServiceStatus(manager, true, d.capture(statusCommand(manager))).pid;
 
   runCommands(plan.stopCommands, d);
-  d.out("Node stopped. It will stay stopped across reboots until you run `dahrk start`.");
+  d.out(verdict("ok", "Node stopped."));
+  d.out("");
+  d.out(hint("It stays stopped across reboots until you run `dahrk start`."));
   return reportForeignNode(d, servicePid) ?? 0;
 }
 
@@ -613,10 +777,11 @@ function reportForeignNode(d: ServiceDeps, servicePid: number | undefined): numb
   const pid = foreignNodePid(d.readFile(d.lockFile), servicePid, d.isAlive);
   if (pid === undefined) return undefined;
   d.out("");
-  d.out(`WARNING: a node is STILL RUNNING on this host (pid ${pid}). \`dahrk stop\` cannot stop it.`);
-  d.out("Something else is supervising it: pm2, a container, or `dahrk start --foreground` in a terminal.");
-  d.out("It is not a stray copy - it holds this node's identity, so it is still connected to the hub and");
-  d.out("still taking Jobs. Stop it where it was started (e.g. `pm2 delete dahrk-node`), or kill the pid.");
+  d.out(verdict("warn", `A node is STILL RUNNING on this host (pid ${pid}). \`dahrk stop\` cannot stop it.`));
+  d.out("");
+  d.out(hint("Something else supervises it: pm2, a container, or `dahrk start --foreground` in a terminal."));
+  d.out(hint("It is not a stray copy - it holds this node's identity, so it is still connected to the hub"));
+  d.out(hint("and still taking Jobs. Stop it where it was started, or kill the pid."));
   return STOP_FOREIGN_NODE;
 }
 
@@ -626,7 +791,6 @@ function reportForeignNode(d: ServiceDeps, servicePid: number | undefined): numb
  */
 export async function runServiceUninstall(deps: Partial<ServiceDeps> = {}): Promise<number> {
   const d = { ...defaultDeps(), ...deps };
-  d.out("dahrk service uninstall");
   d.out("");
 
   const manager = detectManager(d.platform);
@@ -643,7 +807,7 @@ export async function runServiceUninstall(deps: Partial<ServiceDeps> = {}): Prom
   });
 
   if (!d.fileExists(plan.filePath)) {
-    d.out(`No service installed (${plan.filePath} not found). Nothing to do.`);
+    d.out(verdict("info", "No service installed. Nothing to do."));
     return 0;
   }
 
@@ -652,10 +816,12 @@ export async function runServiceUninstall(deps: Partial<ServiceDeps> = {}): Prom
   try {
     d.removeFile(plan.filePath);
   } catch (e) {
-    d.out(`Deregistered, but could not delete ${plan.filePath}: ${(e as Error).message}`);
+    d.out(verdict("warn", `Deregistered, but could not delete ${plan.filePath}`));
+    d.out("");
+    d.out(hint((e as Error).message));
     return 1;
   }
-  d.out(`Removed ${plan.filePath}. The node will no longer start on boot.`);
+  d.out(verdict("ok", "Removed. The node will no longer start on boot."));
   return 0;
 }
 
@@ -715,6 +881,9 @@ const defaultDeps = (): ServiceDeps => ({
   logDir: resolveLogDir(process.env),
   lockFile: resolveLockFile(process.env),
   isAlive: pidIsAlive,
+  // Read-only here, and best-effort by construction: a missing or corrupt ledger reads as "no jobs", which
+  // degrades the guard to today's behaviour rather than blocking a stop the operator needs.
+  inFlightJobs: () => fileJobLedger(jobLedgerFile(resolveStateDir(process.env)), () => {}).all(),
   // Snapshot the operator's PATH at install time so the daemon finds git + the runtime CLIs (Homebrew /
   // npm-global bins) that a supervisor's minimal PATH would otherwise hide.
   pathEnv: process.env.PATH,
@@ -735,14 +904,23 @@ const defaultDeps = (): ServiceDeps => ({
   },
   removeFile: (path) => rmSync(path, { force: true }),
   fileExists: (path) => existsSync(path),
+  // Captured, never inherited. A supervisor's stderr is ours to relay when it matters, not to leak
+  // unconditionally: `runCommands` decides who needs to read it.
   run: (argv) => {
     const [cmd, ...args] = argv;
     try {
-      execFileSync(cmd as string, args, { stdio: "inherit" });
-      return 0;
+      // stderr folded into stdout so a failure's message and its context stay in the order the command
+      // wrote them; launchctl and systemctl both put the useful part on stderr.
+      const stdout = execFileSync(cmd as string, args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { code: 0, output: stdout };
     } catch (e) {
       const status = (e as { status?: unknown }).status;
-      return typeof status === "number" ? status : 1;
+      const { stdout, stderr } = e as { stdout?: string | Buffer; stderr?: string | Buffer };
+      const output = `${stdout?.toString() ?? ""}${stderr?.toString() ?? ""}`;
+      return { code: typeof status === "number" ? status : 1, output };
     }
   },
   capture: (argv) => {
@@ -760,5 +938,5 @@ const defaultDeps = (): ServiceDeps => ({
       return { code: typeof status === "number" ? status : 1, stdout: "" };
     }
   },
-  out: (line) => void process.stdout.write(`${line}\n`),
+  out: uiOut,
 });

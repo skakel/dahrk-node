@@ -37,20 +37,38 @@ test("upgradeCommand: npm/homebrew have a command, unknown has none", () => {
   assert.equal(upgradeCommand("unknown"), null);
 });
 
-/** Collect the printed lines and record whether an upgrade was spawned, so runUpdate is observable. */
-function harness(over: Partial<UpdateDeps>): { deps: Partial<UpdateDeps>; lines: string[]; ran: string[][] } {
+/** Collect the printed lines and record whether an upgrade was spawned, so runUpdate is observable.
+ *
+ *  The default host has NO node running, which is the case where the restart question never comes up at
+ *  all. The tests that care about it opt in with `nodeRunning: () => true`. */
+function harness(over: Partial<UpdateDeps>): {
+  deps: Partial<UpdateDeps>;
+  lines: string[];
+  ran: string[][];
+  counter: { restarts: number };
+} {
   const lines: string[] = [];
   const ran: string[][] = [];
+  const counter = { restarts: 0 };
   const deps: Partial<UpdateDeps> = {
     binPath: "/usr/local/lib/node_modules/dahrk-node/dist/main.js", // npm channel by default
     out: (l) => lines.push(l),
     runUpgrade: (argv) => {
       ran.push(argv);
+      return { code: 0, output: "npm warn ERESOLVE overriding peer dependency\nchanged 123 packages" };
+    },
+    nodeRunning: () => false,
+    interactive: () => false,
+    confirm: async () => true,
+    restart: async () => {
+      counter.restarts++;
       return 0;
     },
     ...over,
   };
-  return { deps, lines, ran };
+  // `counter` is returned as an object, not a number: destructuring a getter would snapshot it at zero
+  // and every "did it restart?" assertion would silently pass.
+  return { deps, lines, ran, counter };
 }
 
 test("runUpdate: already current is a no-op, exit 0, and runs nothing", async () => {
@@ -67,7 +85,7 @@ test("runUpdate --check: reports current -> latest and how to apply, but runs no
   assert.equal(code, 0);
   assert.equal(ran.length, 0);
   const out = lines.join("\n");
-  assert.match(out, /Update available: 0\.1\.3 -> 0\.2\.0/);
+  assert.match(out, /Update available: 0\.1\.3 .* 0\.2\.0/);
   assert.match(out, /npm install -g dahrk-node@latest/);
 });
 
@@ -77,15 +95,82 @@ test("runUpdate: an available update on the npm channel runs the upgrade and rep
   assert.equal(code, 0);
   assert.deepEqual(ran, [["npm", "install", "-g", "dahrk-node@latest"]]);
   const out = lines.join("\n");
-  assert.match(out, /Update available: 0\.1\.3 -> 0\.2\.0/);
+  assert.match(out, /Update available: 0\.1\.3 .* 0\.2\.0/);
   assert.match(out, /Upgraded to 0\.2\.0/);
 });
 
-test("runUpdate: a failing upgrade command surfaces its exit code", async () => {
-  const { deps, lines } = harness({ fetchLatest: async () => "0.2.0", runUpgrade: () => 7 });
+test("runUpdate: a SUCCESSFUL upgrade hides the package manager's wall of noise", async () => {
+  // npm prints a screen of ERESOLVE peer-dependency warnings about our own transitive zod on every
+  // successful global install. It is alarming, it is not actionable, and it is not a problem.
+  const { deps, lines } = harness({ fetchLatest: async () => "0.2.0" });
+  await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
+  assert.doesNotMatch(lines.join("\n"), /ERESOLVE/);
+});
+
+test("runUpdate --verbose: ...but shows it when asked", async () => {
+  const { deps, lines } = harness({ fetchLatest: async () => "0.2.0" });
+  await runUpdate({ currentVersion: "0.1.3", check: false, verbose: true }, deps);
+  assert.match(lines.join("\n"), /ERESOLVE/);
+});
+
+test("runUpdate: a failing upgrade surfaces its exit code AND its output, verbose or not", async () => {
+  const { deps, lines } = harness({
+    fetchLatest: async () => "0.2.0",
+    runUpgrade: () => ({ code: 7, output: "EACCES: permission denied" }),
+  });
   const code = await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
   assert.equal(code, 7);
-  assert.match(lines.join("\n"), /exited with code 7/);
+  const out = lines.join("\n");
+  assert.match(out, /Upgrade failed \(exit 7\)/);
+  assert.match(out, /EACCES: permission denied/, "on failure the output is the whole point");
+});
+
+// --- The restart question: `dahrk start` never picked up an upgrade, and used to say it would ---
+
+test("runUpdate: a running node is offered a restart, and `dahrk start` is NEVER the advice", async () => {
+  const { deps, lines, counter } = harness({
+    fetchLatest: async () => "0.2.0",
+    nodeRunning: () => true,
+    interactive: () => true,
+    confirm: async () => true,
+  });
+  await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
+  const out = lines.join("\n");
+  assert.equal(counter.restarts, 1, "saying yes restarts the node");
+  assert.match(out, /Node restarted on the new build/);
+  // The old bug: it told you to run `dahrk start`, which no-ops on a running node and picks up nothing.
+  assert.doesNotMatch(out, /`dahrk start`/);
+});
+
+test("runUpdate: declining the restart says how to do it later, and does not restart", async () => {
+  const { deps, lines, counter } = harness({
+    fetchLatest: async () => "0.2.0",
+    nodeRunning: () => true,
+    interactive: () => true,
+    confirm: async () => false,
+  });
+  await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
+  assert.equal(counter.restarts, 0);
+  assert.match(lines.join("\n"), /Run `dahrk restart` when you are ready/);
+});
+
+test("runUpdate: a non-interactive caller is told to restart, never prompted", async () => {
+  const { deps, lines, counter } = harness({
+    fetchLatest: async () => "0.2.0",
+    nodeRunning: () => true,
+    interactive: () => false,
+    confirm: async () => assert.fail("must not prompt when nobody is there to answer"),
+  });
+  await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
+  assert.equal(counter.restarts, 0);
+  assert.match(lines.join("\n"), /Run `dahrk restart` to pick this up/);
+});
+
+test("runUpdate: with NO node running there is nothing to restart, so nothing is said about it", async () => {
+  const { deps, lines, counter } = harness({ fetchLatest: async () => "0.2.0", nodeRunning: () => false });
+  await runUpdate({ currentVersion: "0.1.3", check: false }, deps);
+  assert.equal(counter.restarts, 0);
+  assert.doesNotMatch(lines.join("\n"), /restart/i, "advice about a problem nobody has is just noise");
 });
 
 test("runUpdate: an unknown channel prints the per-channel commands instead of running", async () => {
