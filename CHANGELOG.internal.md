@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-07-13
+
 ### Changed
 
 - **New `apps/edge-node/src/ui.ts`: the client's one presentation layer.** Colour, status symbols, the
