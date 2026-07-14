@@ -26,7 +26,7 @@
 import type { JobLedgerEntry, RuntimeStatus } from "@dahrk/edge";
 import { detectManager, parseServiceStatus, statusCommand, unitPath, type ServiceStatus } from "./service.js";
 import { readState, stateFile, type NodeState } from "./state.js";
-import { ago, arrow, dim, hints, humanDuration, kv, symbol, verdict, type Level } from "./ui.js";
+import { ago, arrow, dim, hint, hints, humanDuration, kv, symbol, verdict, type Level } from "./ui.js";
 import {
   cachedUpdate,
   checkIntervalMs,
@@ -196,6 +196,18 @@ export function renderStatus(f: StatusFacts): string[] {
     for (const j of rest) lines.push(kv("", jobLine(j, f.now)));
   }
 
+  // A rejected/parked node is RUNNING and USELESS - the worst state `status` can be quiet about, and the
+  // one it WAS quiet about for the whole of this incident (it read the `EDGE_CONNECTED` the socket writes
+  // before the hub has even looked at the token, and reported a happily connected node). It goes after the
+  // facts, in the same voice as any other failure, with the one command that fixes it - not as a
+  // parenthetical next to the hub URL that the eye slides straight past.
+  if (isEnrolmentBlocked(f.connection)) {
+    lines.push("");
+    lines.push(verdict("fail", "The hub rejected this node's enrolment token; it is serving no Jobs."));
+    lines.push("");
+    lines.push(hint("Re-enrol with `dahrk start --token <token>`. Get one at https://app.dahrk.ai."));
+  }
+
   lines.push(...presenceHints(f).flatMap((h) => ["", h]));
   lines.push("", dim(`  State file: ${f.stateFile}`));
   return lines;
@@ -237,11 +249,15 @@ function jobLine(j: JobLedgerEntry, now: number): string {
   return `${where}  ${dim(humanDuration(now - j.startedAt))}`;
 }
 
-/** Is anything actually wrong? Only the crash-loop is: a node nobody has installed yet, and a node the
- *  operator deliberately stopped, are both working as intended. This is what makes `dahrk status` usable as
- *  a health check in a script - it must not cry wolf over a node someone stopped on purpose. */
-export function isUnhealthy(f: Pick<StatusFacts, "presence">): boolean {
-  return f.presence.kind === "crashed";
+/** Is anything actually wrong? A node nobody has installed yet, and a node the operator deliberately
+ *  stopped, are both working as intended - this is what makes `dahrk status` usable as a health check in a
+ *  script, and it must not cry wolf over a node someone stopped on purpose.
+ *
+ *  Two things are wrong. The crash-loop, and a node whose enrolment the hub has REJECTED: it is up, it is
+ *  parked, and it will serve nothing until a human re-enrols it. A health check that passes on that is
+ *  worse than no health check, and it is what let this node sit dead for hours. */
+export function isUnhealthy(f: Pick<StatusFacts, "presence" | "connection">): boolean {
+  return f.presence.kind === "crashed" || isEnrolmentBlocked(f.connection);
 }
 
 /** Injectable IO so the shell tests without a host, a supervisor, or a real state file. */
@@ -346,10 +362,26 @@ export async function gatherFacts(
  *  which is already on the lines above and would swamp the line it sits on. */
 const CONNECTION_MARKERS: ReadonlyArray<{ prefix: string; event: string; detail: boolean }> = [
   { prefix: "EDGE_WELCOMED", event: "welcomed", detail: false },
+  // The two markers whose absence here was itself the bug. `EDGE_CONNECTED` is written when the SOCKET
+  // opens, which is before the hub has looked at our token - so a node whose enrolment was rejected has
+  // `EDGE_CONNECTED` as its last marker, and `status` used to read that and cheerfully report a connected
+  // node while it served nothing. The rejection is the newer marker, and it is the true one.
+  { prefix: "EDGE_REJECTED", event: "rejected", detail: true },
+  { prefix: "EDGE_PARKED", event: "parked", detail: false },
+  { prefix: "EDGE_UNPARKED", event: "reconnecting", detail: false },
   { prefix: "EDGE_CONNECTED", event: "connected", detail: false },
   { prefix: "EDGE_DISCONNECTED", event: "disconnected", detail: true },
   { prefix: "EDGE_STALE", event: "went stale", detail: false },
 ];
+
+/** Connection events that mean the node is up but will serve no Jobs until a human acts. `status` exists
+ *  to shout about exactly this state, so it must not render as a dim aside next to the hub URL. */
+const BLOCKED_EVENTS: ReadonlySet<string> = new Set(["rejected", "parked"]);
+
+/** Is the node's last known connection state one that needs an operator? */
+export function isEnrolmentBlocked(connection: ConnectionFact | undefined): boolean {
+  return connection !== undefined && BLOCKED_EVENTS.has(connection.event);
+}
 
 /** Find the most recent connection marker in a parsed log. Pure, so it tests without a log file. */
 export function lastConnection(

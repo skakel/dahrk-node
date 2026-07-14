@@ -46,6 +46,37 @@ test("an explicit token wins over the cached one, and re-enrolling overwrites th
   });
 });
 
+test("a SUPERVISED node reads its token from disk, so a stale unit cannot shadow a re-enrolment", () => {
+  withStateDir((env) => {
+    // The incident, exactly. A unit written by an older client bakes the token into its env block. The
+    // operator later re-enrols; that rewrites `node.json` and nothing rewrites the unit. Under the old
+    // precedence the daemon presented the unit's revoked token on every boot, forever, while the working
+    // one sat unread on disk - and launchd cheerfully respawned it each time it exited.
+    persistEnrolment(env, { token: "sket_fresh" });
+    const supervised = { ...env, DAHRK_SUPERVISED: "1", DAHRK_ENROL_TOKEN: "sket_revoked_in_old_unit" };
+
+    assert.equal(resolveEnrolToken(supervised, { supervised: true }), "sket_fresh");
+  });
+});
+
+test("a supervised node with nothing cached still falls back to the unit's token", () => {
+  withStateDir((env) => {
+    // Nothing on disk yet: the unit's token is the only credential in existence, so it must be used.
+    const supervised = { ...env, DAHRK_SUPERVISED: "1", DAHRK_ENROL_TOKEN: "sket_from_unit" };
+    assert.equal(resolveEnrolToken(supervised, { supervised: true }), "sket_from_unit");
+  });
+});
+
+test("an operator's own DAHRK_ENROL_TOKEN still wins when nothing is supervising (Docker, pm2, a shell)", () => {
+  withStateDir((env) => {
+    // `DAHRK_SUPERVISED` is set by the units WE generate and by nothing else, so an env var an operator
+    // exported by hand is a deliberate override and keeps its old precedence.
+    persistEnrolment(env, { token: "sket_cached" });
+    const exported = { ...env, DAHRK_ENROL_TOKEN: "sket_explicit" };
+    assert.equal(resolveEnrolToken(exported), "sket_explicit");
+  });
+});
+
 test("persisting a token preserves the node id (and vice versa)", () => {
   withStateDir((env, dir) => {
     writeState(env, { nodeId: "node-1" });

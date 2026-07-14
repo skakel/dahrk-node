@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JobLedgerEntry } from "@dahrk/edge";
 import {
+  isUnhealthy,
   lastConnection,
   renderStatus,
   resolvePresence,
@@ -194,6 +195,37 @@ test("lastConnection: reads the most recent EDGE_ marker, with its detail", () =
 
 test("lastConnection: a log with no connection markers yields nothing to claim", () => {
   assert.equal(lastConnection([{ msg: "JOB_STARTED:j1", time: "2026-07-13T10:00:00Z" }]), undefined);
+});
+
+test("lastConnection: a REJECTED node reads as rejected, not as the EDGE_CONNECTED that precedes it", () => {
+  // The exact log the incident produced, and the exact reason `status` lied about it. `EDGE_CONNECTED` is
+  // written when the socket opens - BEFORE the hub has looked at the token, which rides in the `hello` body
+  // rather than a header - so every rejected connection has a `connected` marker sitting right in front of
+  // the rejection. `status` only knew the first of those two, and duly reported a healthy connected node
+  // that was in fact dying six times a minute.
+  const at = "2026-07-13T11:00:02Z";
+  const c = lastConnection([
+    { msg: "RUNTIMES_DETECTED:claude-code", time: "2026-07-13T11:00:00Z" },
+    { msg: "EDGE_CONNECTED", time: "2026-07-13T11:00:01Z" },
+    { msg: "EDGE_REJECTED:4401 invalid or expired enrolment token", time: at },
+  ]);
+  assert.deepEqual(c, { event: "rejected", at: Date.parse(at), detail: "4401" });
+});
+
+test("a parked node is UNHEALTHY, and status says what to do about it", () => {
+  const connection = { event: "parked", at: NOW - 60_000 };
+  assert.equal(isUnhealthy({ presence: { kind: "running", pid: 1 }, connection }), true);
+
+  const out = report({ connection });
+  assert.match(out, /serving no Jobs/);
+  assert.match(out, /dahrk start --token/);
+});
+
+test("a welcomed node is healthy: status must not cry wolf over a node that is simply working", () => {
+  assert.equal(
+    isUnhealthy({ presence: { kind: "running", pid: 1 }, connection: { event: "welcomed", at: NOW } }),
+    false,
+  );
 });
 
 test("the hub line says when it was LAST known connected, and never claims it is connected NOW", () => {

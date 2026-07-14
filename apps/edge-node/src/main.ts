@@ -39,6 +39,7 @@ import {
   fileJobLedger,
   jobLedgerFile,
   LogShipper,
+  probeHub,
   probeRuntimeStatuses,
   shipperStream,
   startEdgeNode,
@@ -80,6 +81,7 @@ import {
   logDir,
   logFiles,
   persistEnrolment,
+  readPersistedToken,
   readState,
   resolveEnrolToken,
   setDesired,
@@ -247,6 +249,11 @@ async function start(flags: StartFlags): Promise<number> {
   const env = envWithFlags(process.env, flags);
   if (wantsForeground(env, flags)) return startForeground(env, flags);
 
+  // The unit we are about to write carries no token, so the daemon will read it from `node.json`. Getting
+  // it there is therefore part of starting, not a side effect of the first successful connect.
+  const enrolled = await enrolToDisk(env);
+  if (enrolled !== 0) return enrolled;
+
   // Interactive only: the operator is here, at a prompt, about to commit to running this version for
   // months. It is the one good moment to mention there is a newer one.
   await offerUpdate(env);
@@ -271,12 +278,53 @@ async function start(flags: StartFlags): Promise<number> {
 }
 
 /** The connection / identity inputs the service commands bake into the unit, resolved once from the env
- *  (which the caller has already overlaid the flags onto). */
+ *  (which the caller has already overlaid the flags onto). The token is NOT baked in - see `service.ts` -
+ *  but it is still resolved here, because "is there a token at all?" is the one thing `install` refuses
+ *  to proceed without. */
 const serviceInputs = (env: NodeJS.ProcessEnv): { token?: string; name?: string; hubUrl?: string } => ({
   ...(resolveEnrolToken(env) ? { token: resolveEnrolToken(env) as string } : {}),
   ...(env.DAHRK_NODE_NAME ? { name: env.DAHRK_NODE_NAME } : {}),
   ...(env.DAHRK_HUB_URL ? { hubUrl: env.DAHRK_HUB_URL } : {}),
 });
+
+/**
+ * Put the token the operator just gave us on disk, where the daemon will look for it.
+ *
+ * The daemon no longer inherits a token from its unit, so `dahrk start --token <t>` has to write it down
+ * itself - it cannot wait for `onEnrolled` to cache it after a successful `welcome` the way a foreground
+ * node does, because the process that connects is a different one that has already read the file.
+ *
+ * We keep the old guarantee that a token the hub would reject never reaches the disk, by asking the hub
+ * first (the same probe `dahrk doctor` runs). Only an outright REJECTION blocks the write: a hub we cannot
+ * reach is not evidence about the token, and refusing to install a service because the network is down
+ * would be its own kind of wrong. Nothing to do when the token is the one already on disk - that is the
+ * ordinary `dahrk start` / reboot path, and it must not need the network at all.
+ *
+ * Returns a process exit code: 0 = the disk is good, 2 = the hub rejected the token.
+ */
+async function enrolToDisk(env: NodeJS.ProcessEnv): Promise<number> {
+  const token = resolveEnrolToken(env);
+  if (!token || token === readPersistedToken(env)) return 0;
+
+  const hubUrl = env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL;
+  const probe = await probeHub({ hubUrl, enrolToken: token, clientVersion: CLIENT_VERSION });
+  if (!probe.ok && probe.reason === "rejected") {
+    uiOut("");
+    uiOut(verdict("fail", `The hub rejected that enrolment token: ${probe.detail}`));
+    uiOut("");
+    uiOut(hint("Get a fresh token at https://app.dahrk.ai, then run `dahrk start --token <token>` again."));
+    return 2;
+  }
+  if (!probe.ok) {
+    uiOut("");
+    uiOut(verdict("warn", `Could not reach ${hubUrl} to check the token (${probe.detail}); using it anyway.`));
+  }
+  persistEnrolment(env, {
+    token,
+    ...(probe.ok ? { name: probe.name, tenantId: probe.tenantId } : {}),
+  });
+  return 0;
+}
 
 /**
  * `dahrk restart`: stop the node and start it again, as one act.
@@ -355,7 +403,13 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
     clientVersion: CLIENT_VERSION,
     ...(env.DAHRK_CRASH_EXIT === "1" ? { exitOnCrash: true } : {}),
   });
-  const token = resolveEnrolToken(env, { ephemeral: flags.ephemeral });
+  // `supervised` makes the disk outrank the unit's env - see `resolveEnrolToken`. It is what stops a unit
+  // written by an older client (which baked the token in) from shadowing a token the operator has since
+  // re-enrolled with, on every boot, forever.
+  const token = resolveEnrolToken(env, {
+    ephemeral: flags.ephemeral,
+    supervised: env.DAHRK_SUPERVISED === "1",
+  });
   if (token) env.DAHRK_ENROL_TOKEN = token;
   const runtimes = await resolveRuntimes(env);
   // Compare against the set advertised on the previous boot (persisted in node.json). A runtime that
@@ -409,6 +463,14 @@ async function startForeground(env: NodeJS.ProcessEnv, flags: StartFlags): Promi
             persistEnrolment(env, { token, name: welcome.name, tenantId: welcome.tenantId }),
         }
       : {}),
+    // How a rejected node heals. Reads `node.json` DIRECTLY rather than going through
+    // `resolveEnrolToken`, and that is the whole point: the disk is where re-enrolment writes, so it is
+    // the only place a *newer* token can appear. (Deliberately narrower than boot-time resolution, which
+    // still lets an explicit `DAHRK_ENROL_TOKEN` win - but a stale env var must never be able to shadow
+    // the fresh token on disk forever, which is precisely how a node used to wedge.)
+    //
+    // Only for a persistent node: an ephemeral one has no disk to heal from and must still fail fast.
+    ...(flags.ephemeral ? {} : { refreshEnrolToken: () => readPersistedToken(env) }),
   });
   // startEdgeNode blocks for the life of the node; reaching here is a clean shutdown.
   return 0;

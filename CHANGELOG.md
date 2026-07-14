@@ -6,6 +6,37 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A node whose enrolment token is rejected no longer restarts forever; it parks and heals itself.** A
+  revoked or expired token made the node exit with a distinct code (78) and rely on its supervisor to stop
+  it. systemd and pm2 honour that, but launchd's `KeepAlive` takes no exit code, so on macOS the node was
+  simply respawned every 10 seconds, dialling the hub around the clock and never serving a Job. The node now
+  stops dialling in-process instead: it stays up, parks, logs `EDGE_PARKED` once with what to do about it,
+  and re-reads `~/.dahrk/node.json` on a slow poll. Re-enrolling with `dahrk start --token <token>`
+  reconnects it in place, with no restart. A node with no token source to heal from (`--ephemeral`, CI)
+  still fails fast with exit 78.
+
+- **The enrolment token now lives in exactly one place, so re-enrolling actually takes effect.** The launchd
+  plist and systemd unit used to carry a copy of the token in their environment block, and that copy
+  outranked the one on disk. Re-enrolling rewrote `~/.dahrk/node.json` but nothing rewrote the unit, so a
+  supervised node went on presenting its old, revoked token on every boot while the working one sat unread
+  on disk. The unit no longer carries a token at all; `dahrk start --token <token>` validates it against the
+  hub and writes it to `~/.dahrk/node.json` (0600), and the daemon reads it from there. Existing units are
+  rewritten without the token on the next `dahrk start`, and a supervised node prefers the disk in the
+  meantime, so an upgrade needs no manual repair.
+
+- **`dahrk status` now reports a node the hub has rejected.** It scanned for `EDGE_CONNECTED` but not
+  `EDGE_REJECTED`, and the connected marker is written when the socket opens, which is before the hub has
+  looked at the token. A node being rejected on every attempt therefore reported as happily connected.
+  `status` now reads the rejection, says the node is serving no Jobs, points at `dahrk start --token`, and
+  exits non-zero so it is usable as a health check for this.
+
+- **A hub outage no longer produces a reconnect storm.** The reconnect was a flat 500ms retry despite
+  claiming to be a backoff, so every node in a fleet re-dialled twice a second for as long as the hub was
+  away. It is now exponential from 500ms to a 30s ceiling, jittered so nodes do not come back in lockstep,
+  and reset only by an accepted enrolment.
+
 ## [0.1.17] - 2026-07-14
 
 ### Fixed

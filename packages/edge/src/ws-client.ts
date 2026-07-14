@@ -32,8 +32,22 @@ import {
 
 /** Process exit code for a fatal enrolment rejection (EX_CONFIG): the token/config is wrong,
  *  not a transient failure. Distinct so a supervisor stops the node (pm2 `stop_exit_codes: [78]`)
- *  instead of crash-looping; any other non-zero exit still means "restart me". */
+ *  instead of crash-looping; any other non-zero exit still means "restart me".
+ *
+ *  Only reached when no `refreshEnrolToken` was supplied. A node that HAS a durable token source parks
+ *  instead of exiting - because exiting was never a reliable way to stop a loop: launchd's `KeepAlive`
+ *  takes no exit code, so on macOS a rejected token respawned every `ThrottleInterval` forever. */
 export const ENROLMENT_REJECTED_EXIT_CODE = 78;
+
+/** Reconnect backoff for a TRANSIENT drop: exponential from 500ms, capped at 30s, jittered so a fleet
+ *  coming back from a hub outage does not re-dial in lockstep. Reset on `welcome` - a socket that opens
+ *  and is closed again has not succeeded at anything, so only an accepted enrolment clears the backoff. */
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 30_000;
+
+/** How often a PARKED node re-reads its token. Slow on purpose: nothing is dialled and no socket is held
+ *  while parked, so this is the whole cost of waiting, and re-enrolment is a human-speed act. */
+const PARK_POLL_MS = 60_000;
 
 /**
  * Bucket a stage failure into a class for the health report.
@@ -81,6 +95,17 @@ export interface EdgeOptions {
   /** Pool-scoped enrolment token (minted by the portal). Presented on connect so the hub binds this
    *  node to its pool/tenant. Omitted for a legacy ambient edge. */
   enrolToken?: string;
+  /** Re-read the operator's current enrolment token from wherever it durably lives (`main.ts` reads
+   *  `~/.dahrk/node.json`). Supplying it changes what an enrolment rejection MEANS: instead of a fatal
+   *  exit, the node PARKS - it stops dialling, stays alive, and polls this for a token different from
+   *  the one that was just rejected, reconnecting the moment one appears. That is what lets a rotated
+   *  token heal a running node without a restart, and it is why a supervised node can no longer
+   *  crash-loop on a stale credential (launchd has no exit-code filter, so exiting was never enough).
+   *  Omitted (ephemeral / CI / an operator watching a foreground run) = the old fatal exit 78, which is
+   *  the right answer when there is no durable token source to heal from. */
+  refreshEnrolToken?: () => string | undefined;
+  /** How often a parked node re-reads its token (ms). Default 60000; tests turn it down. */
+  parkPollMs?: number;
   /** The tenant this node is bound to. Set by a managed node so the stage runner refuses a Job
    *  for another tenant as defence in depth. Omitted for a legacy ambient edge (no tenant guard). */
   tenantId?: string;
@@ -168,9 +193,22 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   /** How many times we have connected. A flapping node (DHK-109/DHK-216) is one whose count climbs
    *  while its uptime does not; without it, a reconnect storm leaves no trace. */
   let connectCount = 0;
+  /** The token we present in `hello`. Mutable because a parked node swaps in a freshly-enrolled one and
+   *  reconnects; the alternative was making the operator bounce the service to change a credential. */
+  let enrolToken = opts.enrolToken;
+  /** Consecutive failed reconnects, i.e. the exponent of the backoff. Cleared by a `welcome`. */
+  let reconnectAttempts = 0;
+  /** The poll a parked node runs. Deliberately NOT unref'd: while parked there is no socket and no
+   *  heartbeat, so this timer is the only thing holding the event loop open, and it holding the process
+   *  alive is the point - an exited node cannot notice that its token was replaced. */
+  let parkTimer: ReturnType<typeof setInterval> | undefined;
   // Set once the startup promise is wired; called on a fatal hub rejection so a pre-connect failure
   // rejects `startEdgeNode` (main.ts then exits non-zero) and a post-connect one stops the poll.
   let onFatal: ((err: Error) => void) | undefined;
+  // Set alongside `onFatal`. Parking counts as a successful start: the process must stay up (parked) for
+  // the token poll to ever run, so this settles the startup promise instead of leaving `main` awaiting a
+  // connection that will not come until a human re-enrols.
+  let onParked: (() => void) | undefined;
 
   const send = (msg: EdgeToHub): void => {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(encode(msg));
@@ -383,7 +421,7 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   const sendHello = (): void => {
     send({
       type: "hello",
-      enrolToken: opts.enrolToken ?? "",
+      enrolToken: enrolToken ?? "",
       detectedRuntimes: currentRuntimes,
       servesRepoIds: opts.servesRepoIds ?? [],
       ...(opts.credentialModeExplicit && opts.credentialMode ? { credentialMode: opts.credentialMode } : {}),
@@ -472,6 +510,10 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       // override locally: the tenant guard, worktree retention, and the heartbeat interval. The stage
       // runner reads deps.tenantId/deps.retention at call time, and Jobs only arrive after this point.
       stageDeps.tenantId = msg.tenantId;
+      // An ACCEPTED enrolment is the only evidence the connection actually works, so it is the only thing
+      // that clears the backoff. Resetting on `open` instead would mean a hub that accepts sockets and
+      // immediately closes them gets dialled at full speed forever.
+      reconnectAttempts = 0;
       if (opts.retention === undefined && msg.retention) stageDeps.retention = msg.retention;
       if (opts.heartbeatMs === undefined && msg.heartbeatMs > 0 && ws) {
         startHeartbeat(ws, msg.heartbeatMs);
@@ -689,25 +731,84 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     sock.on("close", (code: number, reason: Buffer) => {
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = undefined;
-      // A hub enrolment rejection is fatal: the token/config is wrong, not a transient drop.
-      // Do NOT reconnect (that would loop silently). Exit with EX_CONFIG (78) - a DISTINCT
-      // code so a supervisor (pm2 `stop_exit_codes`) can stop the node on a bad/missing token instead
-      // of crash-looping, while still restarting on a transient (non-78) crash.
+      // An enrolment rejection is never transient: re-presenting the same token gets the same answer, so
+      // reconnecting on it is a pure hot loop. Either heal (park and wait for a new token) or stop.
       if (isEnrolmentRejection(code)) {
-        shuttingDown = true;
         const detail = reason.toString() || "enrolment rejected";
-        log.error({ closeCode: code, detail, fatal: true }, `EDGE_REJECTED:${code} ${detail}`);
-        process.exitCode = ENROLMENT_REJECTED_EXIT_CODE;
-        onFatal?.(new Error(`hub rejected edge enrolment (${code}): ${detail}`));
+        const refresh = opts.refreshEnrolToken;
+        log.error({ closeCode: code, detail, fatal: !refresh }, `EDGE_REJECTED:${code} ${detail}`);
+        if (!refresh) {
+          // Nowhere to heal from: this node was handed its token directly (CI, `--ephemeral`, a
+          // foreground `--token` run with a human watching). The config is wrong and only they can fix
+          // it, so fail fast and loudly with EX_CONFIG.
+          shuttingDown = true;
+          process.exitCode = ENROLMENT_REJECTED_EXIT_CODE;
+          onFatal?.(new Error(`hub rejected edge enrolment (${code}): ${detail}`));
+          return;
+        }
+        park(refresh);
         return;
       }
       if (!shuttingDown) {
+        const delay = reconnectDelay();
         // Every reconnect is a datapoint: a node that flaps (DHK-109/DHK-216) shows up here as a
         // climbing `connectCount` against a steady uptime, which is otherwise invisible.
-        log.warn({ closeCode: code, reason: reason.toString(), connectCount }, `EDGE_DISCONNECTED:${code} reconnecting in 500ms`);
-        reconnectTimer = setTimeout(connect, 500); // reconnect with a small backoff
+        log.warn(
+          { closeCode: code, reason: reason.toString(), connectCount, delayMs: delay, attempt: reconnectAttempts },
+          `EDGE_DISCONNECTED:${code} reconnecting in ${delay}ms`,
+        );
+        reconnectTimer = setTimeout(connect, delay);
       }
     });
+  };
+
+  /** The next reconnect delay, and the cost of having asked: exponential, capped, and jittered across
+   *  [half, full] so a fleet that lost the hub together does not come back in lockstep. */
+  const reconnectDelay = (): number => {
+    const ceiling = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
+    reconnectAttempts++;
+    return Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
+  };
+
+  /**
+   * Park: the hub rejected our token, and we have somewhere to read a better one from.
+   *
+   * We stop dialling entirely - the node stays up, serves nothing, and says so - and poll the durable
+   * token source. A token DIFFERENT from the one just rejected means a human has re-enrolled us, so we
+   * adopt it and reconnect in place, with no restart and no supervisor involvement. The same token means
+   * nothing has changed and re-presenting it would just be the loop we are here to delete.
+   */
+  const park = (refresh: () => string | undefined): void => {
+    const rejected = enrolToken;
+    if (parkTimer) return; // already parked; a second rejection must not stack a second poll
+    const pollMs = opts.parkPollMs ?? PARK_POLL_MS;
+    log.error(
+      { pollMs },
+      "EDGE_PARKED:enrolment rejected - the node is up but serving nothing. Re-enrol with " +
+        "`dahrk start --token <token>` (get one at https://app.dahrk.ai); it will reconnect on its own.",
+    );
+    parkTimer = setInterval(() => {
+      let fresh: string | undefined;
+      try {
+        fresh = refresh();
+      } catch (e) {
+        // A token source we cannot read is not a reason to die - the next tick may well succeed, and a
+        // node that gave up here would need the restart this whole path exists to avoid.
+        log.warn({ err: e }, `EDGE_PARK_REFRESH_FAILED ${(e as Error).message}`);
+        return;
+      }
+      if (!fresh || fresh === rejected) return;
+      if (parkTimer) clearInterval(parkTimer);
+      parkTimer = undefined;
+      enrolToken = fresh;
+      reconnectAttempts = 0;
+      log.info({}, "EDGE_UNPARKED:a new enrolment token was found, reconnecting");
+      connect();
+    }, pollMs);
+    // Parked IS started, as far as the caller is concerned: `main` must return to the event loop for the
+    // poll above to ever tick. Without this a rejection that lands before the startup poll observes an
+    // OPEN socket would leave `startEdgeNode` awaiting a connection that cannot arrive.
+    onParked?.();
   };
 
   opts.signal?.addEventListener(
@@ -720,14 +821,19 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       reconnectTimer = undefined;
       if (reprobeTimer) clearInterval(reprobeTimer);
       reprobeTimer = undefined;
+      // The park poll is the one timer that is holding the process alive on purpose, so it is the one
+      // that most needs clearing here: leave it and `dahrk stop` cannot stop a parked node.
+      if (parkTimer) clearInterval(parkTimer);
+      parkTimer = undefined;
       ws?.close(1000, "shutting down");
     },
     { once: true },
   );
 
   connect();
-  // Resolve once connected; the open socket + heartbeat keep the process alive. Reject instead if the
-  // hub fatally rejects enrolment before we ever connect, so `main` exits non-zero.
+  // Resolve once connected (the open socket + heartbeat keep the process alive) or once parked (the park
+  // poll does). Reject instead if the hub fatally rejects enrolment and we have no token source to heal
+  // from, so `main` exits non-zero.
   await new Promise<void>((resolve, reject) => {
     const t = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -738,6 +844,10 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     onFatal = (err: Error): void => {
       clearInterval(t);
       reject(err); // a no-op if we already resolved (post-connect rejection); exitCode is set regardless
+    };
+    onParked = (): void => {
+      clearInterval(t);
+      resolve(); // a no-op if we already resolved; the node is up, parked, and waiting for a new token
     };
   });
 }

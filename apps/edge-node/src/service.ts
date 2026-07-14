@@ -10,13 +10,18 @@
  *  - We register a *user* service, not a system one, so `install` needs no root. On Linux that means the
  *    service is tied to the user's login session, so we also enable *linger* (`loginctl enable-linger`)
  *    so it starts at boot and keeps running after logout - the thing a headless VPS needs.
- *  - The enrolment token is written into the service's *environment block*, not its argv, so it never
- *    shows up in `ps`. `dahrk start` reads `DAHRK_ENROL_TOKEN`; the unit passes it (plus any hub-url /
- *    name override) that way. The service invokes `node <this client's main.js> start` by absolute path,
- *    because launchd/systemd run with a minimal PATH where a bare `dahrk` may not resolve. For the same
- *    reason we snapshot the operator's PATH at install time into the env block, so once running the node
- *    resolves `git` and the runtime CLIs (claude / codex / pi) the same way their interactive shell does
- *    - otherwise the daemon would connect but detect no runtimes and serve no Jobs.
+ *  - The enrolment token is NOT in the unit - not in its argv, and not in its environment block. It lives
+ *    in exactly one place, `~/.dahrk/node.json` (0600, in a 0700 dir), and the daemon reads it from there.
+ *    It used to be baked into the env block, which quietly made the unit a SECOND source of truth that
+ *    outranked the disk (`resolveEnrolToken` prefers `DAHRK_ENROL_TOKEN`): re-enrolling updated the disk,
+ *    the unit kept presenting the dead token, and the node was rejected on every boot forever with the
+ *    working credential sitting on disk the whole time. One copy of a secret, in the place re-enrolment
+ *    writes to, is the only arrangement in which that cannot happen. `install` therefore persists the
+ *    token before it renders anything. The service still invokes `node <this client's main.js> start` by
+ *    absolute path, because launchd/systemd run with a minimal PATH where a bare `dahrk` may not resolve.
+ *    For the same reason we snapshot the operator's PATH at install time into the env block, so once
+ *    running the node resolves `git` and the runtime CLIs (claude / codex / pi) the same way their
+ *    interactive shell does - otherwise the daemon would connect but detect no runtimes and serve no Jobs.
  *
  * The plan builders (which manager, which file, what content, which loader commands) are pure so they
  * unit-test without a host or a real supervisor; `runServiceInstall` / `runServiceUninstall` are the thin
@@ -31,7 +36,8 @@ import { isAlive as pidIsAlive, parseLock } from "./lock.js";
 import { lockFile as resolveLockFile, logDir as resolveLogDir, stateDir as resolveStateDir } from "./state.js";
 import { dim, hint, hints, humanDuration, kv, out as uiOut, verdict } from "./ui.js";
 
-/** The unit file carries the enrolment token in its environment block, so it is owner-only. */
+/** The unit file names host paths (and, in units written by older clients, carried the enrolment token
+ *  itself), so it is owner-only. */
 export const UNIT_FILE_MODE = 0o600;
 
 /** The native supervisor we target for a given OS. `unsupported` covers Windows and anything else - we
@@ -78,8 +84,6 @@ export interface PlanInputs {
   nodeBin: string;
   /** This client's entry script, resolved through any symlink (`realpath(process.argv[1])`). */
   scriptPath: string;
-  /** Enrolment token, written into the service environment (not argv). */
-  token: string;
   /** Optional display-name override (DAHRK_NODE_NAME). */
   name?: string;
   /** Optional hub URL override (DAHRK_HUB_URL); unset lets the client default to wss://api.dahrk.ai. */
@@ -119,16 +123,18 @@ export function serviceArgv(inputs: PlanInputs): string[] {
   return [inputs.nodeBin, inputs.scriptPath, "start", "--foreground"];
 }
 
-/** The environment the service exports: the token, any explicit hub-url / name overrides, and the
- *  operator's PATH (so the node finds git + the runtime CLIs under a supervisor's minimal PATH). Kept
- *  out of argv so the token never leaks through `ps`.
+/** The environment the service exports: any explicit hub-url / name overrides, and the operator's PATH
+ *  (so the node finds git + the runtime CLIs under a supervisor's minimal PATH).
+ *
+ *  Note what is NOT here: `DAHRK_ENROL_TOKEN`. The daemon reads its token from `~/.dahrk/node.json`, which
+ *  is the only place re-enrolment can write to. See the header - a token in here outranks the disk and can
+ *  strand a node on a revoked credential that no re-enrolment is able to replace.
  *
  *  `DAHRK_SUPERVISED=1` is belt-and-braces with the `--foreground` argv above: either one alone is enough
  *  to keep a supervised process out of daemon mode, and having both means a hand-edited unit that drops
  *  one still cannot produce the restart loop. */
 function serviceEnv(inputs: PlanInputs): Record<string, string> {
   return {
-    DAHRK_ENROL_TOKEN: inputs.token,
     DAHRK_SUPERVISED: "1",
     ...(inputs.hubUrl ? { DAHRK_HUB_URL: inputs.hubUrl } : {}),
     ...(inputs.name ? { DAHRK_NODE_NAME: inputs.name } : {}),
@@ -147,7 +153,13 @@ function xmlEscape(s: string): string {
 }
 
 /** Render the launchd LaunchAgent plist. RunAtLoad starts it now and on login; KeepAlive restarts it if
- *  it exits; ThrottleInterval slows a crash-loop (e.g. a bad token that exits 78) to one try / 10s. */
+ *  it exits; ThrottleInterval bounds how fast it may be respawned.
+ *
+ *  `KeepAlive` takes no exit code - launchd cannot be told "stop on 78" the way systemd (below) and pm2
+ *  can. So the node must never rely on EXITING to stop a hopeless retry: a rejected token used to exit 78
+ *  here and simply be respawned every ThrottleInterval, forever. It now parks in-process instead (see
+ *  `refreshEnrolToken` in the edge client), which is the only thing that actually stops the loop on macOS
+ *  and, as a bonus, lets a re-enrolment heal the node without touching this file. */
 export function renderLaunchdPlist(inputs: PlanInputs): string {
   const argv = serviceArgv(inputs);
   const env = serviceEnv(inputs);
@@ -192,9 +204,11 @@ function systemdEnvValue(v: string): string {
   return /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v;
 }
 
-/** Render the systemd *user* unit. Restart=on-failure with a short backoff keeps it up; a bad token
- *  exits 78 (EX_CONFIG), which RestartPreventExitStatus pins as "stop, don't crash-loop" so a misconfig
- *  is visible rather than hammering. network-online ordering avoids a boot-race on the first dial. */
+/** Render the systemd *user* unit. Restart=on-failure with a short backoff keeps it up.
+ *  `RestartPreventExitStatus=78` (EX_CONFIG) stays as a backstop for any config error fatal enough to
+ *  exit - a rejected token no longer is one, because the node parks in-process rather than exiting, which
+ *  is what it has to do to be safe under launchd too. network-online ordering avoids a boot-race on the
+ *  first dial. */
 export function renderSystemdUnit(inputs: PlanInputs): string {
   const exec = serviceArgv(inputs)
     .map((a) => (/\s/.test(a) ? `"${a}"` : a))
@@ -432,7 +446,6 @@ export async function runServiceInstall(
     manager,
     nodeBin: d.nodeBin,
     scriptPath: d.scriptPath,
-    token: inputs.token,
     ...(inputs.name ? { name: inputs.name } : {}),
     ...(inputs.hubUrl ? { hubUrl: inputs.hubUrl } : {}),
     ...(d.pathEnv ? { pathEnv: d.pathEnv } : {}),
@@ -562,22 +575,22 @@ export async function runNodeStart(
     return { kind: "error", code: 2 };
   }
 
-  // The plan's COMMANDS and filePath do not depend on the token - only its rendered content does. So when
-  // there is no token we can still load the existing unit (which carries its own token in its env block);
-  // we simply must not re-render it. The placeholder never reaches disk on that path.
+  // Nothing in the unit depends on the token any more, so there is no longer a "cannot render without one"
+  // case: we can always write the unit we mean, and always compare it against the one on disk. That also
+  // makes this the seam that RETIRES a unit written by an older client - one that still carries a
+  // `DAHRK_ENROL_TOKEN` in its env block will not match what we render, so it gets rewritten without one,
+  // and the stale token it was shadowing the disk with goes away with it.
   const plan = buildPlan({
     manager,
     nodeBin: d.nodeBin,
     scriptPath: d.scriptPath,
-    token: inputs.token ?? "-",
     ...(inputs.name ? { name: inputs.name } : {}),
     ...(inputs.hubUrl ? { hubUrl: inputs.hubUrl } : {}),
     ...(d.pathEnv ? { pathEnv: d.pathEnv } : {}),
     homeDir: d.homeDir,
     logDir: d.logDir,
   });
-  const canRender = inputs.token !== undefined;
-  const current = canRender && unitExists && unitIsCurrent(plan, d.readFile(filePath));
+  const current = unitExists && unitIsCurrent(plan, d.readFile(filePath));
 
   // Already up, on the unit we would write anyway: do nothing. `start` must be a cheap no-op when the node
   // is healthy, not a restart in disguise. Nothing is printed here: the caller renders the status block,
@@ -594,7 +607,7 @@ export async function runNodeStart(
     if (current && status.running) return { kind: "running", code: 0, already: true };
   }
 
-  if (canRender && !current) {
+  if (!current) {
     try {
       // systemd's `append:` will not start a unit whose log directory is missing.
       d.mkdirp(d.logDir);
@@ -647,7 +660,6 @@ export async function runNodeRestart(
     manager,
     nodeBin: d.nodeBin,
     scriptPath: d.scriptPath,
-    token: "-",
     homeDir: d.homeDir,
     logDir: d.logDir,
   });
@@ -741,12 +753,10 @@ export async function runNodeStop(
   const busy = guardBusy(d, inputs.force ?? false, "stop");
   if (busy) return busy;
 
-  // Removal / stopping never needs a real token; the placeholder keeps the builder's shape.
   const plan = buildPlan({
     manager,
     nodeBin: d.nodeBin,
     scriptPath: d.scriptPath,
-    token: "-",
     homeDir: d.homeDir,
     logDir: d.logDir,
   });
@@ -801,7 +811,6 @@ export async function runServiceUninstall(deps: Partial<ServiceDeps> = {}): Prom
     manager,
     nodeBin: d.nodeBin,
     scriptPath: d.scriptPath,
-    token: "-",
     homeDir: d.homeDir,
     logDir: d.logDir,
   });
@@ -888,9 +897,9 @@ const defaultDeps = (): ServiceDeps => ({
   // npm-global bins) that a supervisor's minimal PATH would otherwise hide.
   pathEnv: process.env.PATH,
   mkdirp: (dir) => void mkdirSync(dir, { recursive: true }),
-  // The unit's environment block carries the enrolment token, so the file is a secret: write it
-  // owner-only. `writeFileSync`'s `mode` applies only when it CREATES the file, so chmod explicitly
-  // too - re-installing over a unit an older client left at 0644 must tighten it, not keep it.
+  // The unit holds no secret any more, but it stays owner-only: it names paths on this host, and there is
+  // no reason for it to be world-readable. `writeFileSync`'s `mode` applies only when it CREATES the file,
+  // so chmod explicitly too - re-installing over a unit an older client left at 0644 must tighten it.
   writeFile: (path, content) => {
     writeFileSync(path, content, { mode: UNIT_FILE_MODE });
     chmodSync(path, UNIT_FILE_MODE);

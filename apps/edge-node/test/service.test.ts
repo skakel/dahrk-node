@@ -32,7 +32,6 @@ const BASE: PlanInputs = {
   manager: "launchd",
   nodeBin: "/usr/local/bin/node",
   scriptPath: "/usr/local/lib/node_modules/dahrk-node/dist/main.js",
-  token: "sket_abc",
   homeDir: "/Users/me",
   logDir: "/Users/me/.dahrk/logs",
 };
@@ -43,15 +42,18 @@ test("detectManager: darwin->launchd, linux->systemd, else unsupported", () => {
   assert.equal(detectManager("win32"), "unsupported");
 });
 
-test("renderLaunchdPlist: runs node+script start, token in the env block (not argv), keep-alive + logs", () => {
+test("renderLaunchdPlist: runs node+script start, carries NO token anywhere, keep-alive + logs", () => {
   const plist = renderLaunchdPlist(BASE);
   assert.match(plist, new RegExp(`<string>${LAUNCHD_LABEL}</string>`));
-  // ProgramArguments is node + the resolved script + `start` - the token is NOT an argument.
+  // ProgramArguments is node + the resolved script + `start`.
   assert.match(plist, /<string>\/usr\/local\/bin\/node<\/string>/);
   assert.match(plist, /<string>start<\/string>/);
-  assert.doesNotMatch(plist, /<string>sket_abc<\/string>\s*<\/array>/);
-  // Token rides in EnvironmentVariables instead.
-  assert.match(plist, /<key>DAHRK_ENROL_TOKEN<\/key>\s*<string>sket_abc<\/string>/);
+  // The token is in NEITHER argv nor the env block. It lives only in ~/.dahrk/node.json, because a copy
+  // in here outranks the disk (`resolveEnrolToken`) and cannot be updated by re-enrolling - which is how
+  // a node ends up presenting a revoked token on every boot forever.
+  assert.doesNotMatch(plist, /DAHRK_ENROL_TOKEN/);
+  assert.doesNotMatch(plist, /sket_/);
+  assert.match(plist, /<key>DAHRK_SUPERVISED<\/key>\s*<string>1<\/string>/);
   assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
   assert.match(plist, /<key>KeepAlive<\/key>\s*<true\/>/);
   assert.match(plist, /node\.err\.log/);
@@ -67,10 +69,12 @@ test("renderLaunchdPlist: only sets hub-url / name env when provided, and XML-es
   assert.match(full, /<key>DAHRK_NODE_NAME<\/key>\s*<string>a &amp; b<\/string>/);
 });
 
-test("renderSystemdUnit: on-failure restart, 78 pinned as stop, token via Environment, network ordering", () => {
+test("renderSystemdUnit: on-failure restart, 78 pinned as stop, no token anywhere, network ordering", () => {
   const unit = renderSystemdUnit({ ...BASE, manager: "systemd" });
   assert.match(unit, /ExecStart=\/usr\/local\/bin\/node \/usr\/local\/lib\/node_modules\/dahrk-node\/dist\/main\.js start/);
-  assert.match(unit, /Environment=DAHRK_ENROL_TOKEN=sket_abc/);
+  // Same rule as the plist: the unit is not a second home for the token.
+  assert.doesNotMatch(unit, /DAHRK_ENROL_TOKEN/);
+  assert.match(unit, /Environment=DAHRK_SUPERVISED=1/);
   assert.match(unit, /Restart=on-failure/);
   assert.match(unit, /RestartPreventExitStatus=78/);
   assert.match(unit, /Wants=network-online\.target/);
@@ -157,7 +161,8 @@ test("install: writes the plist and runs the loader; exit 0", async () => {
   assert.equal(code, 0);
   assert.equal(writes.length, 1);
   assert.match(writes[0]!.path, /Library\/LaunchAgents\/ai\.dahrk\.node\.plist$/);
-  assert.match(writes[0]!.content, /DAHRK_ENROL_TOKEN<\/key>\s*<string>sket_abc/);
+  // The token was supplied, and is still not written into the unit: `dahrk start` puts it on disk instead.
+  assert.doesNotMatch(writes[0]!.content, /sket_abc/);
   // The harness's PATH is snapshotted into the unit so the daemon resolves git + runtime CLIs.
   assert.match(writes[0]!.content, /<key>PATH<\/key>\s*<string>\/opt\/homebrew\/bin/);
   assert.ok(ran.some((c) => c[0] === "launchctl" && c[1] === "load"));
@@ -330,6 +335,19 @@ test("the render is DETERMINISTIC - the self-heal compares content, so drift her
   assert.equal(unitIsCurrent(plan, a), true);
   assert.equal(unitIsCurrent(plan, undefined), false, "no unit on disk is not current");
   assert.equal(unitIsCurrent(plan, a.replace("--foreground", "")), false, "a pre-upgrade unit is stale");
+});
+
+test("a unit from an older client, with the token baked in, is stale - so `start` rewrites it without one", () => {
+  // This is the migration, and it needs no migration code. A unit written before the token moved to disk
+  // carries `DAHRK_ENROL_TOKEN` in its env block; what we render today does not; so they differ, so the
+  // ordinary "is the unit on disk the one I would write?" self-heal rewrites it and the stale token - the
+  // copy that was shadowing the disk and stranding the node on a revoked credential - goes away with it.
+  const legacy = renderLaunchdPlist(BASE).replace(
+    "<key>DAHRK_SUPERVISED</key>",
+    "<key>DAHRK_ENROL_TOKEN</key>\n    <string>sket_revoked</string>\n    <key>DAHRK_SUPERVISED</key>",
+  );
+  assert.match(legacy, /DAHRK_ENROL_TOKEN/); // the unit we are migrating FROM
+  assert.equal(unitIsCurrent(buildPlan(BASE), legacy), false);
 });
 
 test("stopCommands make a stop STICK - a stop that undid itself at the next boot is not a stop", () => {

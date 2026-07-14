@@ -201,11 +201,21 @@ export function persistEnrolment(
 
 /** Resolve the enrolment token to present to the hub: an explicit `--token` / `DAHRK_ENROL_TOKEN`
  *  wins, otherwise fall back to the token cached by the last successful enrolment. `ephemeral` skips
- *  the disk entirely (CI / one-shot nodes bring their own token or none). */
+ *  the disk entirely (CI / one-shot nodes bring their own token or none).
+ *
+ *  `supervised` INVERTS that precedence, and the inversion is the point. A supervised node's env comes
+ *  from the unit we generated, and units we generate no longer carry a token - so a `DAHRK_ENROL_TOKEN`
+ *  in a supervised env can only have come from a unit written by an older client, which is exactly the
+ *  copy that goes stale: re-enrolling rewrites `node.json`, nothing rewrites the unit, and the daemon
+ *  presents a revoked token on every boot forever while the working one sits unread on disk. Under
+ *  supervision the disk therefore wins, and the unit's token is only a fallback for a node that somehow
+ *  has none cached. An operator exporting `DAHRK_ENROL_TOKEN` by hand (Docker, pm2) is NOT supervised in
+ *  this sense - `DAHRK_SUPERVISED` is set by our units and nothing else - so their override still wins. */
 export function resolveEnrolToken(
   env: NodeJS.ProcessEnv,
-  opts: { ephemeral?: boolean } = {},
+  opts: { ephemeral?: boolean; supervised?: boolean } = {},
 ): string | undefined {
+  if (opts.supervised && !opts.ephemeral) return readPersistedToken(env) ?? env.DAHRK_ENROL_TOKEN;
   if (env.DAHRK_ENROL_TOKEN) return env.DAHRK_ENROL_TOKEN;
   if (opts.ephemeral) return undefined;
   return readPersistedToken(env);
