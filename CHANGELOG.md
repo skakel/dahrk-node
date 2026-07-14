@@ -6,6 +6,21 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pi stages now report their real dollar cost, so a `cost_budget` can actually fire on them.** Only the
+  Claude adapter was capturing a cost; a `pi` stage always reported `$0`, which is indistinguishable from
+  "free" and left the `cost_budget` policy silently inert - the accumulated spend never reached `maxUsd`, so
+  a cap declared in a workflow did nothing and a runaway diagnostic run had no ceiling. The Pi adapter now
+  reads the aggregate cost Pi's own session already computes and returns it as the stage's `costUsd`, across
+  the batch, interactive, and summarise turns alike. Managed-node runs on the platform pool - the tier billed
+  directly - stop reporting blind `$0` and show real spend.
+
+- **A Codex stage no longer masquerades as free.** The Codex SDK reports tokens but no price, so the adapter
+  genuinely cannot compute a dollar cost. Rather than leave `costUsd` silently unset - which the hub cannot
+  tell from `$0`/"free" - it now states the gap explicitly as a runtime known-unknown and never fabricates a
+  price, so a Codex stage reads as "not priced" rather than "cost nothing".
+
 ## [0.1.16] - 2026-07-13
 
 ### Added
