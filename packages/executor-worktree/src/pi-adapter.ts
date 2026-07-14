@@ -57,6 +57,13 @@ export interface PiSessionLike {
   abort(): Promise<void>;
   /** Release session resources. */
   dispose(): void;
+  /**
+   * Aggregate stats over ALL session entries. Pi computes the dollar figure actually billed
+   * (`SessionStats.cost`), so the adapter reports it as the stage's `costUsd` rather than the
+   * silent `$0` that leaves the hub's `cost_budget` policy inert (DHK-434). Optional: a minimal
+   * or older session may omit it, in which case no cost is reported (never a fabricated `0`).
+   */
+  getSessionStats?(): { cost?: number } | undefined;
   /** Live agent state; `state.tools` is replaced to deny tools for the summarise turn. */
   readonly agent?: { readonly state: { tools: unknown[] } };
 }
@@ -87,6 +94,18 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
     if (s.sessionId) sessionId = s.sessionId;
   };
 
+  /**
+   * The stage's dollar cost from Pi's aggregate session stats (DHK-434). `getSessionStats()` sums
+   * every entry in the session, so a single read at settle covers the whole run (batch, all
+   * interactive turns, and the engine-owned summarise turn on the warm session). Returns `undefined`
+   * when the session cannot price the run, so the caller omits `costUsd` rather than reporting a
+   * fabricated `$0` - which the hub cannot tell from "free" and which silently disables `cost_budget`.
+   */
+  const readSessionCost = (s: PiSessionLike): number | undefined => {
+    const cost = s.getSessionStats?.()?.cost;
+    return typeof cost === "number" ? cost : undefined;
+  };
+
   return {
     runtime: "pi",
 
@@ -111,7 +130,8 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
       }
       captureSessionId(s);
       if (cancelled) status = "fail";
-      return { status, ...(sessionId ? { sessionId } : {}) };
+      const costUsd = readSessionCost(s);
+      return { status, ...(sessionId ? { sessionId } : {}), ...(costUsd !== undefined ? { costUsd } : {}) };
     },
 
     async runInteractive(ctx, turns, onTrace) {
@@ -225,7 +245,13 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
 
       unsub();
       captureSessionId(s);
-      return { status, summary, ...(sessionId ? { sessionId } : {}) } as Omit<JobResult, "jobId">;
+      const costUsd = readSessionCost(s);
+      return {
+        status,
+        summary,
+        ...(sessionId ? { sessionId } : {}),
+        ...(costUsd !== undefined ? { costUsd } : {}),
+      } as Omit<JobResult, "jobId">;
     },
 
     async summarise(ctx) {

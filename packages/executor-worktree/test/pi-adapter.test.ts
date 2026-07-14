@@ -40,8 +40,15 @@ class FakePiSession implements PiSessionLike {
   prompts: string[] = [];
   aborted = false;
   disposed = false;
+  /** The aggregate session cost Pi would report; `undefined` models a session that cannot price a run. */
+  cost: number | undefined;
   private listeners: Array<(e: PiEvent) => void> = [];
-  constructor(private readonly scripts: PiEvent[][]) {}
+  constructor(private readonly scripts: PiEvent[][], cost?: number) {
+    this.cost = cost;
+  }
+  getSessionStats(): { cost?: number } {
+    return { cost: this.cost };
+  }
   subscribe(listener: (e: PiEvent) => void): () => void {
     this.listeners.push(listener);
     return () => {
@@ -115,6 +122,37 @@ test("ACCEPTANCE runBatch: the emitted trace matches the Claude/Codex envelope (
   assert.equal(result.status, "ok");
   assert.equal(result.sessionId, "pi-sess-1");
   assert.match(fake.prompts[0] ?? "", /Fix the failing tests\./, "resolveStagePrompt folds in the ticket brief");
+});
+
+test("DHK-434 runBatch: reports the session's real dollar cost as costUsd", async () => {
+  const fake = new FakePiSession([STAGE_SCRIPT], 0.0421);
+  const result = await createPiRunner({ createSession: async () => fake }).runBatch(ctx(), () => {});
+  assert.equal(result.status, "ok");
+  assert.equal(result.costUsd, 0.0421, "Pi's aggregate session cost is surfaced, not a silent $0");
+  assert.ok((result.costUsd ?? 0) > 0);
+});
+
+test("DHK-434 runInteractive: reports the session's real dollar cost as costUsd", async () => {
+  const fake = new FakePiSession(
+    [
+      [pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "What is the objective?" } }),
+       pe({ type: "turn_end", message: { stopReason: "stop" } })],
+      [pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Explained the fix." } }),
+       pe({ type: "agent_end", messages: [{ stopReason: "stop" }] })],
+    ],
+    0.19,
+  );
+  const result = await createPiRunner({ createSession: async () => fake }).runInteractive(ctx(), turnsFrom([]), () => {});
+  assert.equal(result.status, "ok");
+  assert.equal(result.costUsd, 0.19, "cost aggregates across all interactive turns incl. the summarise turn");
+});
+
+test("DHK-434 runBatch: a session that cannot price a run omits costUsd (never a fabricated $0)", async () => {
+  const fake = new FakePiSession([STAGE_SCRIPT]); // cost undefined
+  const result = await createPiRunner({ createSession: async () => fake }).runBatch(ctx(), () => {});
+  assert.equal(result.status, "ok");
+  assert.equal(result.costUsd, undefined, "no cost is reported rather than a misleading 0");
+  assert.ok(!("costUsd" in result), "the key is omitted entirely, so the hub reads 'not reported', not '$0'");
 });
 
 test("runBatch: a runtime failure settles status fail with an error event", async () => {

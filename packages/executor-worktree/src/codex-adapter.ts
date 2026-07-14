@@ -16,6 +16,24 @@ import { makeEmit, raceNextTurn, interactiveIdleWindows, resolveStagePrompt, int
 const COALESCE_MS = Number(process.env.DAHRK_COALESCE_MS ?? process.env.SKAKEL_COALESCE_MS ?? 40);
 
 /**
+ * Codex's known-unknown for cost (DHK-434). Unlike Pi and Claude, the Codex SDK's `Usage` is
+ * token-only (`input_tokens` / `cached_input_tokens` / `output_tokens` / `reasoning_output_tokens`);
+ * there is no price or cost field on `turn.completed` or anywhere in its types, and a real dollar
+ * figure would need a pricing table the client does not carry. So the adapter leaves `costUsd`
+ * unset and never fabricates a `$0` - which the hub cannot tell from "free" and which silently
+ * disables the `cost_budget` policy. It states the gap explicitly, in the same stderr channel the
+ * adapter already uses for its other runtime known-unknowns (MCP, interactive tool-exit), so a
+ * `$0`-costing Codex stage reads as "not priced", not "cost nothing".
+ */
+export const CODEX_COST_UNAVAILABLE_NOTE =
+  "codex-adapter: cost reporting unavailable for the Codex runtime (the SDK reports tokens, not price); costUsd left unset, not $0\n";
+
+/** Emit the cost known-unknown once per run. Injectable `write` for tests; defaults to stderr. */
+export function warnCostUnavailable(write: (s: string) => void = (s) => void process.stderr.write(s)): void {
+  write(CODEX_COST_UNAVAILABLE_NOTE);
+}
+
+/**
  * Brokered inference for a credential-less node (DHK-89). A managed / Docker-isolated node has no
  * ambient `codex` login, so the hub mints the provider key into `runtimeEnv` (codex -> OPENAI_API_KEY)
  * and delivers it on the Job; the edge threads it onto the RunnerContext. Returns the Codex SDK's
@@ -100,6 +118,8 @@ export function createCodexRunner(): Runner {
       }
       captureThreadId(t);
       if (cancelled) status = "fail";
+      // The Codex SDK cannot price a run; surface that as an explicit known-unknown (DHK-434).
+      warnCostUnavailable();
       return { status, ...(sessionId ? { sessionId } : {}) };
     },
 
@@ -184,6 +204,8 @@ export function createCodexRunner(): Runner {
         summary = "(stage cancelled)";
       }
       captureThreadId(t);
+      // The Codex SDK cannot price a run; surface that as an explicit known-unknown (DHK-434).
+      warnCostUnavailable();
       return { status, summary, ...(sessionId ? { sessionId } : {}) } as Omit<JobResult, "jobId">;
     },
 
