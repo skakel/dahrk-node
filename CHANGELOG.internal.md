@@ -19,6 +19,37 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-07-14
+
+### Added
+
+- **`release.yml` now tells dahrk-harness when a client is published** (DHK-437, #69). A `repository_dispatch`
+  carrying the new version fires at the end of the publish job and triggers the harness's
+  `update-platform-node` workflow, so the platform edge node tracks the latest published client instead of a
+  hand-maintained pin in the harness Dockerfile. That stale pin is what shipped a client which could not
+  authenticate (#63) and silently stopped the harness's admin loop. Guarded like the Homebrew tap bump
+  directly above it: last in the job, `continue-on-error: true`, and skipped entirely when
+  `HARNESS_DISPATCH_PAT` is absent - npm and the GitHub release *are* the release, so an unreachable
+  downstream must never fail a publish. Needs a new **optional** repo secret `HARNESS_DISPATCH_PAT` (a
+  fine-grained PAT on `dahrkai/dahrk-harness`, Contents: read and write); without it the step no-ops and the
+  harness is updated by hand with `gh workflow run update-platform-node.yml`.
+
+### Changed
+
+- **A rejected node now parks in-process rather than trusting its supervisor to stop it** (DHK-436, #68). The
+  exit-78 contract only ever held on systemd (`RestartPreventExitStatus`) and pm2 (`stop_exit_codes`);
+  launchd's `KeepAlive` takes no exit code, so macOS respawned the process forever. Parking is the only
+  mechanism that actually stops the loop on all three, and it buys a rotated token healing a live node with no
+  restart. The exit-78 path survives only for a node with no durable token source (`--ephemeral`, CI), which
+  has nothing to re-read and so must fail fast.
+
+- **`serviceEnv` no longer bakes `DAHRK_ENROL_TOKEN` into the unit; `~/.dahrk/node.json` is the single home**
+  (DHK-436, #68). Two homes plus an env-over-disk preference is what made re-enrolment a no-op. No migration
+  shim was written: a unit from an older client differs from what we render today, so the existing "is the unit
+  on disk the one I would write?" self-heal rewrites it, and a supervised node prefers the disk in the
+  meantime. `dahrk start --token` validates against the hub before writing, but only an outright rejection
+  blocks the write - an unreachable hub is not evidence about the token.
+
 ## [0.1.17] - 2026-07-14
 
 ### Changed
