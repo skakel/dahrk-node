@@ -19,6 +19,23 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-07-14
+
+### Changed
+
+- **Cost capture is now per-adapter, and only Claude and Pi can actually price a run** (DHK-434, #66). Pi reads
+  the aggregate `getSessionStats().cost` its own session already computes, so a single read at settle covers the
+  batch turn, every interactive turn, and the engine-owned summarise turn on the warm session. `getSessionStats`
+  is declared **optional** on `PiSessionLike`: an older or minimal session omits it, and the adapter then reports
+  no cost rather than a fabricated `0`. Any new fake session in a test that asserts on `costUsd` has to supply it.
+
+- **Codex's cost gap is a deliberate known-unknown, not an oversight** (DHK-434, #66). The Codex SDK's `Usage` is
+  token-only (`input_tokens` / `cached_input_tokens` / `output_tokens` / `reasoning_output_tokens`); there is no
+  price field anywhere in its types, and a real figure would need a pricing table the client does not carry. So
+  `codex-adapter.ts` leaves `costUsd` unset and emits `CODEX_COST_UNAVAILABLE_NOTE` on stderr, the same channel
+  the adapter already uses for its other known-unknowns (MCP, interactive tool-exit). If a pricing table ever
+  lands, that note is the thing to delete. Do not "fix" the $0 by writing a zero.
+
 ## [0.1.16] - 2026-07-13
 
 ### Changed

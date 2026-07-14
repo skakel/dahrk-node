@@ -6,9 +6,11 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-07-14
+
 ### Fixed
 
-- **Pi stages now report their real dollar cost, so a `cost_budget` can actually fire on them.** Only the
+- **Pi stages now report their real dollar cost, so a `cost_budget` can actually fire on them.** (#66) Only the
   Claude adapter was capturing a cost; a `pi` stage always reported `$0`, which is indistinguishable from
   "free" and left the `cost_budget` policy silently inert - the accumulated spend never reached `maxUsd`, so
   a cap declared in a workflow did nothing and a runaway diagnostic run had no ceiling. The Pi adapter now
@@ -16,7 +18,7 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   the batch, interactive, and summarise turns alike. Managed-node runs on the platform pool - the tier billed
   directly - stop reporting blind `$0` and show real spend.
 
-- **A Codex stage no longer masquerades as free.** The Codex SDK reports tokens but no price, so the adapter
+- **A Codex stage no longer masquerades as free.** (#66) The Codex SDK reports tokens but no price, so the adapter
   genuinely cannot compute a dollar cost. Rather than leave `costUsd` silently unset - which the hub cannot
   tell from `$0`/"free" - it now states the gap explicitly as a runtime known-unknown and never fabricates a
   price, so a Codex stage reads as "not priced" rather than "cost nothing".
@@ -623,7 +625,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/dahrkai/dahrk-node/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/dahrkai/dahrk-node/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/dahrkai/dahrk-node/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/dahrkai/dahrk-node/compare/v0.1.13...v0.1.14
