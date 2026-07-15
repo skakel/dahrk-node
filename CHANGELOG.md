@@ -6,11 +6,13 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-07-15
+
 ### Fixed
 
 - **Worktree confinement no longer falsely denies heredoc scripts or relative paths issued after a `cd`.**
-  Two normal shapes were being blocked by the filesystem guard shipped in 0.1.11. First, a `cat > file
-  <<'EOF' ... EOF` heredoc had its body scanned as if it were shell arguments, so a `//` JS comment read
+  (#71) Two normal shapes were being blocked by the filesystem guard shipped in 0.1.11. First, a `cat > file
+  <<'EOF'... EOF` heredoc had its body scanned as if it were shell arguments, so a `//` JS comment read
   as an absolute path and a `../..` import specifier read as climbing out of the worktree - both denied
   over inline data that names no path at all. The scanner now recognises `<<` / `<<-` heredocs (quoted or
   bare delimiter) and skips the body entirely. Second, Claude's Bash tool keeps its working directory
@@ -670,7 +672,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/dahrkai/dahrk-node/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/dahrkai/dahrk-node/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/dahrkai/dahrk-node/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/dahrkai/dahrk-node/compare/v0.1.15...v0.1.16
