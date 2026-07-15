@@ -152,6 +152,11 @@ function pathsIn(input: unknown): string[] {
  * machines we cannot hot-patch needs a valve an operator can reach without waiting for a release.
  */
 export function fsConfineRule(roots: FsRoots): PolicyRule {
+  // Claude's Bash tool persists its working directory ACROSS tool calls, so a `cd` in one call moves
+  // where the next call's relative paths resolve from. `scanCommand` tracks a `cd` within a single
+  // string; this carries it between calls (DHK-394). Seeded at the worktree root - where the shell
+  // starts - and advanced whenever a scanned command settles somewhere new.
+  let sessionCwd = roots.cwd;
   return {
     name: "fs_confine",
     evaluate(event) {
@@ -164,8 +169,13 @@ export function fsConfineRule(roots: FsRoots): PolicyRule {
       });
 
       if (SHELL_TOOLS.has(event.tool)) {
-        const result = scanCommand(commandOf(event.input), roots);
+        const result = scanCommand(commandOf(event.input), roots, sessionCwd);
         if (result.kind === "escape") return deny(result.path, result.need);
+        if (result.kind === "ok") {
+          // The command stayed in bounds; remember any `cd` it ended on for the next call.
+          if (result.cwd) sessionCwd = result.cwd;
+          return null;
+        }
         if (result.kind === "unparseable") {
           return {
             verdict: "deny",

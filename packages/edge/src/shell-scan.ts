@@ -15,7 +15,10 @@
 import { expandPath, withinRoots, type Access, type FsRoots } from "./fs-roots.js";
 
 export type ScanResult =
-  | { kind: "ok" }
+  // `cwd` is the working directory the shell stands in AFTER the command (a `cd` moves it). The
+  // caller threads it into the next call so a relative path issued after a `cd` in an earlier Bash
+  // call is judged from where the shell actually stands, not the worktree root (DHK-394).
+  | { kind: "ok"; cwd?: string }
   | { kind: "escape"; path: string; need: Access }
   | { kind: "unparseable"; reason: string };
 
@@ -76,12 +79,38 @@ function tokenise(cmd: string): { tokens: Token[]; subshells: string[] } | null 
   let quoted = false;
   let started = false;
   let quote: '"' | "'" | null = null;
+  // Pending `<<`/`<<-` heredocs whose bodies we must skip when the current line ends. A heredoc body
+  // is DATA, not shell tokens - a `//` JS comment or a `../..` import specifier inside it must never
+  // be path-scanned (DHK-394).
+  const pendingHeredocs: Array<{ delim: string; dash: boolean }> = [];
 
   const push = () => {
     if (started) tokens.push({ value: cur, quoted });
     cur = "";
     quoted = false;
     started = false;
+  };
+
+  // Skip every line from `s` up to (and including) the terminator of each pending heredoc, emitting
+  // no tokens. Returns the index to resume lexing from, or -1 if the input ends before a terminator
+  // is found (a malformed heredoc, which the caller then treats as unparseable and denies).
+  const consumeHeredocs = (s: number): number => {
+    let p = s;
+    for (;;) {
+      let lineEnd = p;
+      while (lineEnd < cmd.length && cmd[lineEnd] !== "\n") lineEnd++;
+      const line = cmd.slice(p, lineEnd);
+      const { delim, dash } = pendingHeredocs[0] as { delim: string; dash: boolean };
+      // `<<-` lets the terminator be indented with tabs; a plain `<<` requires it flush-left.
+      const terminator = dash ? line.replace(/^\t+/, "") : line;
+      const atEnd = lineEnd >= cmd.length;
+      if (terminator === delim) {
+        pendingHeredocs.shift();
+        if (pendingHeredocs.length === 0) return atEnd ? lineEnd : lineEnd + 1;
+      }
+      if (atEnd) return -1; // ran out of input before every delimiter matched
+      p = lineEnd + 1;
+    }
   };
 
   for (let i = 0; i < cmd.length; i++) {
@@ -135,6 +164,14 @@ function tokenise(cmd: string): { tokens: Token[]; subshells: string[] } | null 
       i = j;
       continue;
     }
+    // A newline that ends a line carrying a heredoc operator: the body begins here. Skip it whole.
+    if (c === "\n" && pendingHeredocs.length > 0) {
+      push();
+      const resume = consumeHeredocs(i + 1);
+      if (resume < 0) return null; // unterminated heredoc: fail closed
+      i = resume - 1;
+      continue;
+    }
     if (/\s/.test(c)) {
       push();
       continue;
@@ -146,6 +183,42 @@ function tokenise(cmd: string): { tokens: Token[]; subshells: string[] } | null 
       push();
       tokens.push({ value: three, quoted: false, operator: three });
       i += 2;
+      continue;
+    }
+    // A `<<` / `<<-` heredoc: capture the delimiter word (quoted, backslash-escaped, or bare) and
+    // record it; the body is skipped when this line's newline is reached (see above). Emits no
+    // operator or body tokens - the redirection is stdin from inline data, no path to check. Placed
+    // after the `<<<` here-string, which is a different operator and stays a normal token.
+    if (two === "<<" && cmd[i + 2] !== "<") {
+      push();
+      let k = i + 2;
+      const dash = cmd[k] === "-";
+      if (dash) k++;
+      while (k < cmd.length && (cmd[k] === " " || cmd[k] === "\t")) k++;
+      let delim = "";
+      let dq: '"' | "'" | null = null;
+      for (; k < cmd.length; k++) {
+        const d = cmd[k] as string;
+        if (dq) {
+          if (d === dq) dq = null;
+          else delim += d;
+          continue;
+        }
+        if (d === '"' || d === "'") {
+          dq = d;
+          continue;
+        }
+        if (d === "\\" && k + 1 < cmd.length) {
+          delim += cmd[++k];
+          continue;
+        }
+        if (/[\s;&|<>]/.test(d)) break;
+        delim += d;
+      }
+      if (dq) return null; // unterminated quote in the delimiter word
+      if (!delim) return null; // `<<` with no delimiter: malformed, fail closed
+      pendingHeredocs.push({ delim, dash });
+      i = k - 1;
       continue;
     }
     if (["&&", "||", ">>", "2>", "&>"].includes(two)) {
@@ -163,6 +236,7 @@ function tokenise(cmd: string): { tokens: Token[]; subshells: string[] } | null 
     started = true;
   }
   if (quote) return null; // unbalanced quote
+  if (pendingHeredocs.length > 0) return null; // a heredoc operator whose body never arrived
   push();
   return { tokens, subshells };
 }
@@ -328,5 +402,6 @@ export function scanCommand(cmd: string, roots: FsRoots, cwd: string = roots.cwd
     }
     if (out.kind !== "ok") return out;
   }
-  return { kind: "ok" };
+  // Hand back where the shell now stands, so the caller can carry it into the next Bash call.
+  return { kind: "ok", cwd: cwdNow };
 }

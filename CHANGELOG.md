@@ -6,6 +6,18 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **Worktree confinement no longer falsely denies heredoc scripts or relative paths issued after a `cd`.**
+  Two normal shapes were being blocked by the filesystem guard shipped in 0.1.11. First, a `cat > file
+  <<'EOF' ... EOF` heredoc had its body scanned as if it were shell arguments, so a `//` JS comment read
+  as an absolute path and a `../..` import specifier read as climbing out of the worktree - both denied
+  over inline data that names no path at all. The scanner now recognises `<<` / `<<-` heredocs (quoted or
+  bare delimiter) and skips the body entirely. Second, Claude's Bash tool keeps its working directory
+  between calls, but the guard reset to the worktree root every call, so any relative path issued after a
+  `cd` in an earlier call was judged from the wrong base and read as an escape. The shell's working
+  directory is now carried across calls. A genuine whole-disk `find /` is still denied.
+
 ## [0.1.18] - 2026-07-14
 
 ### Fixed

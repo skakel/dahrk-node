@@ -108,6 +108,62 @@ test("the ordinary commands a build stage runs are NOT mistaken for escapes", ()
   }
 });
 
+test("a heredoc body is data, not shell tokens - it is not path-scanned (DHK-394)", () => {
+  // A `//` JS comment reads as an absolute path, and a `../..` import as climbing out of the worktree,
+  // but ONLY if the body is tokenised. It is inline data: skip it. The write target (/tmp, an allowed
+  // root) is the only real path here, and the write itself was always permitted.
+  const heredoc = [
+    "cat > /tmp/prove.mjs <<'EOF'",
+    "// Repro: a runtime whose CLI is INSTALLED",
+    "import { detect } from '../../packages/edge/src/detect-runtimes.ts'",
+    "console.log(detect())",
+    "EOF",
+  ].join("\n");
+  assert.equal(sh(heredoc).verdict, "allow", "heredoc with // comment and ../.. import");
+
+  // Minimal shape: a body that is nothing but a `//` comment.
+  assert.equal(sh("cat > /tmp/prove.mjs <<'EOF'\n// a comment\nEOF").verdict, "allow");
+
+  // `<<-` with a tab-indented terminator, and a bare (unquoted) delimiter.
+  assert.equal(sh("cat > /tmp/x.txt <<-END\n\t// body climbing ../../out\n\tEND").verdict, "allow");
+
+  // The redirection target is still real: a heredoc WRITING outside the worktree is still denied.
+  assert.equal(sh("cat > ~/.ssh/evil <<'EOF'\nhi\nEOF").verdict, "deny");
+
+  // An unterminated heredoc fails closed - it would error in the shell anyway.
+  const bad = sh("cat <<'EOF'\nno terminator ever arrives");
+  assert.equal(bad.verdict, "deny");
+  assert.match(bad.reason ?? "", /could not be parsed/);
+
+  // The `<<<` here-string is a different operator and stays checked: its operand is read data, but a
+  // command around it that reaches out is still denied.
+  assert.equal(sh("cat ../../etc/passwd <<< hello").verdict, "deny");
+});
+
+test("a relative path is judged from the shell's cwd persisted across Bash calls (DHK-394)", () => {
+  // Claude's Bash tool keeps its cwd between calls, so a `cd` in call N moves where call N+1 resolves
+  // relative paths from. One rule instance, driven with two commands, is how that state is exercised.
+  const persistent = buildRules([], ctx());
+  const run = (command: string) =>
+    evaluatePolicies({ kind: "action", stageId: "build", tool: "Bash", input: { command } }, persistent);
+
+  // From the worktree root, `../../.skakel/scratch` climbs out - correctly denied.
+  const fresh = buildRules([], ctx());
+  assert.equal(
+    evaluatePolicies(
+      { kind: "action", stageId: "build", tool: "Bash", input: { command: "node ../../.skakel/scratch/repro.mjs" } },
+      fresh,
+    ).verdict,
+    "deny",
+    "from the worktree root the path really does escape",
+  );
+
+  // But after a `cd` into packages/edge in an earlier call, `../../.skakel/scratch` is the worktree's
+  // own scratch dir - in scope. Same command, different (correct) base.
+  assert.equal(run("cd packages/edge").verdict, "allow");
+  assert.equal(run("node --import tsx ../../.skakel/scratch/repro.mjs").verdict, "allow");
+});
+
 test("the safe /dev sinks are writable; a raw device is not", () => {
   assert.equal(sh("echo hi > /dev/null").verdict, "allow");
   assert.equal(sh("echo hi > /dev/sda").verdict, "deny");
