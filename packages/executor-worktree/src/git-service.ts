@@ -415,6 +415,26 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
   const withTokenUser = (gitUrl: string): string =>
     /^https:\/\/[^@/]+@/.test(gitUrl) ? gitUrl : gitUrl.replace(/^https:\/\//, "https://x-access-token@");
 
+  /**
+   * Resolve the remote URL and credentials for a network op against the REAL remote (the deliver,
+   * backup, and reconcile push paths). A brokered token gets a transient `GIT_ASKPASS` helper (torn
+   * down by `cleanup`) plus an `x-access-token@` remote so the askpass password is used; an ambient
+   * node gets the plain URL and relies on host credentials (git config helper, `gh`, SSH). `authEnv`
+   * is the raw askpass env, undefined when ambient - callers wrap it in {@link netEnv} for the network
+   * ops and pass it as-is to the local merge. Consolidates the credential setup those paths repeat.
+   */
+  const resolveRemoteAuth = (
+    gitUrl: string,
+    credentialToken?: string,
+  ): { remote: string; authEnv?: NodeJS.ProcessEnv; cleanup: () => void } => {
+    const auth = credentialToken ? setupAuth(credentialToken) : undefined;
+    return {
+      remote: credentialToken ? withTokenUser(gitUrl) : gitUrl,
+      authEnv: auth?.env,
+      cleanup: () => auth?.cleanup(),
+    };
+  };
+
   /** The per-repo bare mirror path, keyed by repoId (sanitised so a slashy id is one dir). */
   const mirrorPathFor = (repoId: string): string => join(mirrorsDir, sanitizeBranchName(repoId));
 
@@ -738,8 +758,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       // local branch name. The brokered token (when given) authorises BOTH the base fetch below and the
       // push, so its askpass helper is set up once here and torn down in the finally; else ambient host
       // credentials are used.
-      const auth = opts.credentialToken ? setupAuth(opts.credentialToken) : undefined;
-      const remote = opts.credentialToken ? withTokenUser(ref.gitUrl) : ref.gitUrl;
+      const { remote, authEnv, cleanup } = resolveRemoteAuth(ref.gitUrl, opts.credentialToken);
       let pushed = false;
       let integration: "clean" | "conflict" | undefined;
       try {
@@ -754,7 +773,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
         let fetched = false;
         if (opts.base) {
           try {
-            git(worktreePath, ["fetch", remote, opts.base], netEnv(auth?.env));
+            git(worktreePath, ["fetch", remote, opts.base], netEnv(authEnv));
             fetched = true;
           } catch (e) {
             // Best-effort: an offline/transient fetch failure must not fabricate a conflict. Skip
@@ -801,7 +820,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
               "merge",
               "--no-edit",
               "FETCH_HEAD",
-            ], auth?.env);
+            ], authEnv);
             integration = "clean";
             headSha = git(worktreePath, ["rev-parse", "HEAD"]).trim();
           } catch (mergeErr) {
@@ -834,10 +853,10 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
             throw mergeErr;
           }
         }
-        git(worktreePath, ["push", remote, `HEAD:refs/heads/${branch}`], netEnv(auth?.env));
+        git(worktreePath, ["push", remote, `HEAD:refs/heads/${branch}`], netEnv(authEnv));
         pushed = true;
       } finally {
-        auth?.cleanup();
+        cleanup();
       }
       return { headSha, pushed, nothingToCommit: !dirty, commitsAhead, ...(integration ? { integration } : {}) };
     },
@@ -856,12 +875,11 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       // integration that `commitAndPush` does (which would abort on the very conflict that triggered this
       // backup) is skipped. The ref is disposable, so `--force` overwrites any prior WIP tip. The brokered
       // token (when given) authorises the push via its askpass helper; else ambient host credentials.
-      const auth = opts.credentialToken ? setupAuth(opts.credentialToken) : undefined;
-      const remote = opts.credentialToken ? withTokenUser(ref.gitUrl) : ref.gitUrl;
+      const { remote, authEnv, cleanup } = resolveRemoteAuth(ref.gitUrl, opts.credentialToken);
       try {
-        git(worktreePath, ["push", "--force", remote, `HEAD:refs/heads/${wipRef}`], netEnv(auth?.env));
+        git(worktreePath, ["push", "--force", remote, `HEAD:refs/heads/${wipRef}`], netEnv(authEnv));
       } finally {
-        auth?.cleanup();
+        cleanup();
       }
       return { headSha, pushed: true, nothingToCommit: !dirty, wipRef };
     },
@@ -890,15 +908,14 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       // Now try to get it off the box too. Best-effort by design: a node that cannot reach the remote
       // still has to end this function with a clean tree, and the tail is already safe on the local ref.
       let pushed = false;
-      const auth = opts.credentialToken ? setupAuth(opts.credentialToken) : undefined;
-      const remote = opts.credentialToken ? withTokenUser(ref.gitUrl) : ref.gitUrl;
+      const { remote, authEnv, cleanup } = resolveRemoteAuth(ref.gitUrl, opts.credentialToken);
       try {
-        git(worktreePath, ["push", "--force", remote, `${tailSha}:refs/heads/${wipRef}`], netEnv(auth?.env));
+        git(worktreePath, ["push", "--force", remote, `${tailSha}:refs/heads/${wipRef}`], netEnv(authEnv));
         pushed = true;
       } catch (e) {
         log.warn(`could not push the preserved tail to ${wipRef}: ${(e as Error).message}`);
       } finally {
-        auth?.cleanup();
+        cleanup();
       }
 
       // Back to the last good commit, and drop the untracked debris the agent left with it. Without the

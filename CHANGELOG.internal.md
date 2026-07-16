@@ -31,6 +31,18 @@ this file is left verbatim.
   unset the step is skipped and the page can be refreshed by hand
   (`gh workflow run deploy.yml --repo dahrkai/dahrk-web`).
 
+### Changed
+
+- **`GitService`: fold the repeated brokered-or-ambient credential setup into one `resolveRemoteAuth`
+  helper** (DHK-252). The three real-remote network paths (`commitAndPush`, `backupPush`,
+  `reconcileInterrupted`) each open-coded the same two lines - `setupAuth(token)` for the transient
+  `GIT_ASKPASS` helper and `withTokenUser(url)` for the `x-access-token@` remote - so the shared
+  credential plumbing the DHK-252 clean-up will build on now lives in one named place. Pure refactor:
+  the helper returns the same `{ remote, authEnv, cleanup }` each site used before (raw `authEnv` so
+  `commitAndPush`'s local merge still gets the exact env it did), so behaviour is byte-for-byte
+  unchanged. `createWorktree` keeps its own auth handling: it drives the mirror through `ensureMirror`
+  (which owns URL rewriting) and needs no real-remote URL.
+
 ## [0.1.19] - 2026-07-15
 
 ## [0.1.18] - 2026-07-14
