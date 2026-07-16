@@ -46,13 +46,22 @@ import {
   type EdgeOptions,
 } from "@dahrk/edge";
 import type { CredentialMode, Runtime } from "@dahrk/contracts";
-import { parseCli, usage, type RunFlags, type StartFlags } from "./cli.js";
+import { parseCli, usage, type RepoAddFlags, type RunFlags, type StartFlags } from "./cli.js";
 import { runDiagnose, defaultDiagnoseDeps, defaultBundlePath } from "./diagnose.js";
 import { runDoctor } from "./doctor.js";
+import {
+  chooseGitUrl,
+  deriveRepoId,
+  deriveRepoName,
+  hubHttpBase,
+  parseGitRemote,
+  registerRepo,
+  type RepoFacts,
+} from "./repo-add.js";
 import { defaultLockDeps, acquireLock, isAlive, parseLock } from "./lock.js";
 import { defaultLogsDeps, parseRecords, rotateIfLarge, runLogs } from "./logs.js";
 import { installProcessSafetyNet, writeCrashRecord } from "./process-safety.js";
-import { runPreflight } from "./preflight.js";
+import { probeRepo, runPreflight, sshKeyPresent } from "./preflight.js";
 import {
   runNodeRestart,
   runNodeStart,
@@ -62,7 +71,7 @@ import {
   STOP_FOREIGN_NODE,
 } from "./service.js";
 import { fetchLatestVersion, runUpdate, type UpdateDeps } from "./update.js";
-import { confirm, hint, isInteractive, out as uiOut, stripAnsi, verdict } from "./ui.js";
+import { confirm, hint, isInteractive, kv, out as uiOut, stripAnsi, verdict } from "./ui.js";
 import {
   checkForUpdate,
   checkIntervalMs,
@@ -632,6 +641,85 @@ async function runWorkflow(flags: RunFlags): Promise<number> {
   });
 }
 
+/**
+ * `dahrk repo add`: register the current git repository with the hub. Everything is derived from the cwd
+ * (the node already sits next to the code): the git URL from `origin` - in the form the host can actually
+ * authenticate (SSH kept when there is a key, else normalised to HTTPS with a warning) - the default branch
+ * from HEAD, a display name from the slug, and a deterministic id so re-runs dedupe rather than duplicate.
+ *
+ * It authenticates with the node's existing enrolment token and dials the hub's HTTP config surface
+ * itself, so the daemon need not be running. Fails actionably outside a repo, with no `origin`, or when the
+ * node is not yet enrolled; is an idempotent no-op on a repo that is already registered.
+ */
+async function runRepoAdd(flags: RepoAddFlags): Promise<number> {
+  const env = applyEnvAliases(process.env);
+  if (flags.hubUrl) env.DAHRK_HUB_URL = flags.hubUrl;
+  if (flags.token) env.DAHRK_ENROL_TOKEN = flags.token;
+
+  const cwd = process.cwd();
+  const probe = probeRepo(cwd);
+  if (!probe.isGitRepo) {
+    uiOut("");
+    uiOut(verdict("fail", `${cwd} is not a git repository.`));
+    uiOut(hint("Run `dahrk repo add` from inside the repository you want to register."));
+    return 1;
+  }
+  if (!probe.remoteUrl) {
+    uiOut("");
+    uiOut(verdict("fail", "This repository has no `origin` remote, so there is nothing to register."));
+    uiOut(hint("Add one with `git remote add origin <url>`, then run `dahrk repo add` again."));
+    return 1;
+  }
+  const token = resolveEnrolToken(env);
+  if (!token) {
+    uiOut("");
+    uiOut(verdict("fail", "This node is not enrolled, so it cannot register a repository."));
+    uiOut(hint("Enrol it first with `dahrk start --token <token>`."));
+    return 1;
+  }
+
+  // Choose the URL form the host can authenticate, warning when an SSH remote had to become HTTPS.
+  const { gitUrl, converted } = chooseGitUrl({ originUrl: probe.remoteUrl, sshKeyPresent: sshKeyPresent() });
+  if (converted) {
+    uiOut("");
+    uiOut(verdict("warn", `No SSH key found on this host, so the SSH remote was registered as HTTPS: ${gitUrl}`));
+    uiOut(hint("Add an SSH key (or set up brokered credentials) if this repo must be cloned over SSH - see DHK-252."));
+  }
+  const parsed = parseGitRemote(gitUrl);
+  const name = flags.name ?? (parsed ? deriveRepoName(parsed) : "repo");
+  const repo: RepoFacts = {
+    id: deriveRepoId(gitUrl),
+    name,
+    gitUrl,
+    // HEAD's branch is the run's base. An empty repo (no commits) has none yet; default to `main`.
+    defaultBranch: probe.baseBranch ?? "main",
+  };
+
+  const base = hubHttpBase(env.DAHRK_HUB_URL ?? DEFAULT_HUB_URL);
+  const result = await registerRepo({ fetch }, { base, token, repo });
+
+  uiOut("");
+  switch (result.kind) {
+    case "registered":
+      uiOut(verdict("ok", `Registered ${name} with the hub.`));
+      uiOut(kv("URL", gitUrl));
+      uiOut(kv("Branch", repo.defaultBranch));
+      return 0;
+    case "already":
+      uiOut(verdict("ok", `${name} is already registered - nothing to do.`));
+      if (result.drift) {
+        const bits: string[] = [];
+        if (result.drift.branch) bits.push(`branch ${result.drift.branch} (this repo is on ${repo.defaultBranch})`);
+        if (result.drift.name) bits.push(`name ${result.drift.name}`);
+        uiOut(hint(`The hub's stored record differs - ${bits.join(", ")} - and was left unchanged.`));
+      }
+      return 0;
+    case "error":
+      uiOut(verdict("fail", `Could not register the repository: ${result.message}`));
+      return 1;
+  }
+}
+
 /** Dispatch the CLI: `start` (default), `run`, `doctor`, `help`, `version`. Returns nothing for `start`
  *  (it blocks on the socket); the others print and let the caller exit. */
 async function main(): Promise<void> {
@@ -681,6 +769,9 @@ async function main(): Promise<void> {
     }
     case "run":
       process.exitCode = await runWorkflow(parsed.flags);
+      break;
+    case "repo":
+      process.exitCode = await runRepoAdd(parsed.flags);
       break;
     case "service": {
       if (parsed.flags.action === "uninstall") {

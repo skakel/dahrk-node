@@ -6,6 +6,18 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`dahrk repo add` registers the current repository with the hub, from the client side.** Run it from
+  inside a repo - `cd your-repo && dahrk repo add` - and the node reads the `origin` remote and the current
+  branch itself, so the git URL and default branch are derived from the working directory and you are never
+  asked to paste a URL. The URL is registered in the form the host can authenticate: an HTTPS origin is kept
+  as-is, an SSH origin is kept when this host has an SSH key, and otherwise normalised to HTTPS with a
+  warning. It authenticates with the node's existing enrolment token and dials the hub itself, so the daemon
+  need not be running. Re-running on an already-registered repo is a clear no-op, not an error or a
+  duplicate; running outside a git repo, in one with no `origin`, or on a node that is not yet enrolled
+  fails with an actionable message.
+
 ## [0.1.19] - 2026-07-15
 
 ### Fixed

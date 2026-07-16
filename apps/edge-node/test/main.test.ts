@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { createServer, type Server } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildEdgeOptions, resolveNodeId, resolveRuntimes, DEFAULT_HUB_URL } from "../src/main.ts";
@@ -159,5 +162,185 @@ test("a start refused by the lock exits NON-ZERO, so a supervisor does not read 
     assert.doesNotMatch(run.stdout, /EDGE_CONNECTED|EDGE_ERROR/, "it must refuse BEFORE it dials anything");
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// -- `dahrk repo add` end-to-end (spawned CLI against a fake HTTP hub) --------
+
+/** A fake hub config surface: records POSTs to the repositories endpoint, dedupes by id, and answers
+ *  201 for a fresh id / 200 for a repeat - the idempotency contract `registerRepo` reads. */
+function fakeHub(): Promise<{ server: Server; port: number; creates: () => number; posts: () => number }> {
+  const seen = new Set<string>();
+  let posts = 0;
+  const server = createServer((req, res) => {
+    if (req.method !== "POST" || !req.url?.startsWith("/config/api/repositories")) {
+      res.statusCode = 404;
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      posts += 1;
+      const repo = JSON.parse(body) as { id: string };
+      const fresh = !seen.has(repo.id);
+      seen.add(repo.id);
+      res.statusCode = fresh ? 201 : 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(repo));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve({ server, port, creates: () => seen.size, posts: () => posts });
+    });
+  });
+}
+
+/** A throwaway git repo with a commit, an origin remote, and a known branch. */
+function repoWithOrigin(origin: string, branch = "main"): string {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-repoadd-"));
+  const git = (...args: string[]): void => void execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
+  git("init", "-q");
+  git("config", "user.email", "t@example.com");
+  git("config", "user.name", "T");
+  git("checkout", "-q", "-b", branch);
+  git("commit", "-q", "--allow-empty", "-m", "init");
+  git("remote", "add", "origin", origin);
+  return dir;
+}
+
+// `dahrk repo add` runs against `process.cwd()`, so the spawned CLI's cwd is the repo under test - which
+// is a temp dir with no node_modules. Resolve tsx's loader to an absolute path so `--import` still finds
+// it from there (a bare `tsx` specifier would resolve relative to the temp cwd and fail).
+const tsxLoader = createRequire(import.meta.url).resolve("tsx");
+
+/** Spawn `dahrk repo add` in `cwd`, with an isolated HOME/state and no ambient SSH agent.
+ *
+ *  Async (not spawnSync): the fake hub runs in THIS process, so a synchronous spawn would block the event
+ *  loop and the child's POST would never be answered - a deadlock. */
+function spawnRepoAdd(
+  cwd: string,
+  home: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  // Strip any inherited DAHRK_*/SKAKEL_* config (this suite may itself run inside an enrolled node), so the
+  // child's only enrolment/hub state is what the test sets - otherwise an ambient DAHRK_ENROL_TOKEN would
+  // make an "un-enrolled" node look enrolled.
+  const clean: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!k.startsWith("DAHRK_") && !k.startsWith("SKAKEL_")) clean[k] = v;
+  }
+  const env: NodeJS.ProcessEnv = {
+    ...clean,
+    HOME: home,
+    DAHRK_STATE_DIR: join(home, ".dahrk"),
+    ...extraEnv,
+  };
+  delete env.SSH_AUTH_SOCK; // so sshKeyPresent() is deterministic (no key -> HTTPS conversion)
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      ["--import", tsxLoader, join(import.meta.dirname, "../src/main.ts"), "repo", "add"],
+      { cwd, env, timeout: 15_000 },
+      (err, stdout, stderr) => {
+        const status = err && typeof (err as { code?: unknown }).code === "number" ? ((err as { code: number }).code) : err ? 1 : 0;
+        resolve({ status, stdout, stderr });
+      },
+    );
+  });
+}
+
+/** Cache an enrolment token in node.json so the node counts as enrolled. */
+function enrol(home: string, token = "sket_test"): void {
+  const state = join(home, ".dahrk");
+  mkdirSync(state, { recursive: true });
+  writeFileSync(join(state, "node.json"), JSON.stringify({ nodeId: "n", enrolToken: token }));
+}
+
+test("repo add: registers the cwd repo once, and a re-run is a no-op with no duplicate", async () => {
+  const hub = await fakeHub();
+  const home = mkdtempSync(join(tmpdir(), "dahrk-home-"));
+  const repo = repoWithOrigin("https://github.com/org/repo.git", "trunk");
+  try {
+    enrol(home);
+    const hubUrl = `ws://127.0.0.1:${hub.port}`;
+
+    const first = await spawnRepoAdd(repo, home, { DAHRK_HUB_URL: hubUrl });
+    assert.equal(first.status, 0, `first run failed: ${first.stdout}${first.stderr}`);
+    assert.match(first.stdout, /[Rr]egistered/);
+
+    const second = await spawnRepoAdd(repo, home, { DAHRK_HUB_URL: hubUrl });
+    assert.equal(second.status, 0, `second run failed: ${second.stdout}${second.stderr}`);
+    assert.match(second.stdout, /already registered/i);
+
+    assert.equal(hub.posts(), 2, "both runs POST");
+    assert.equal(hub.creates(), 1, "but only one repo is ever created - the id deduped");
+  } finally {
+    hub.server.close();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("repo add: outside a git repo fails with an actionable message", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dahrk-home-"));
+  const notARepo = mkdtempSync(join(tmpdir(), "dahrk-notrepo-"));
+  try {
+    enrol(home);
+    const run = await spawnRepoAdd(notARepo, home, { DAHRK_HUB_URL: "ws://127.0.0.1:1" });
+    assert.notEqual(run.status, 0);
+    assert.match(run.stdout + run.stderr, /not a git repository/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(notARepo, { recursive: true, force: true });
+  }
+});
+
+test("repo add: a repo with no origin fails and says to add one", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dahrk-home-"));
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-noorigin-"));
+  try {
+    enrol(home);
+    execFileSync("git", ["-C", dir, "init", "-q"], { stdio: "ignore" });
+    const run = await spawnRepoAdd(dir, home, { DAHRK_HUB_URL: "ws://127.0.0.1:1" });
+    assert.notEqual(run.status, 0);
+    assert.match(run.stdout + run.stderr, /origin/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repo add: an un-enrolled node fails telling you to enrol first", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dahrk-home-"));
+  const repo = repoWithOrigin("https://github.com/org/repo.git");
+  try {
+    // No enrol() call: there is no cached token.
+    const run = await spawnRepoAdd(repo, home, { DAHRK_HUB_URL: "ws://127.0.0.1:1" });
+    assert.notEqual(run.status, 0);
+    assert.match(run.stdout + run.stderr, /enrol/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("repo add: an SSH origin with no key is converted to HTTPS with a warning, and still registers", async () => {
+  const hub = await fakeHub();
+  const home = mkdtempSync(join(tmpdir(), "dahrk-home-"));
+  const repo = repoWithOrigin("git@github.com:org/repo.git");
+  try {
+    enrol(home);
+    const run = await spawnRepoAdd(repo, home, { DAHRK_HUB_URL: `ws://127.0.0.1:${hub.port}` });
+    assert.equal(run.status, 0, `run failed: ${run.stdout}${run.stderr}`);
+    assert.match(run.stdout, /HTTPS/);
+    assert.equal(hub.creates(), 1);
+  } finally {
+    hub.server.close();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
   }
 });

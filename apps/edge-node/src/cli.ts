@@ -31,6 +31,7 @@ export type Command =
   | "logs"
   | "diagnose"
   | "run"
+  | "repo"
   | "service"
   | "doctor"
   | "status"
@@ -38,6 +39,10 @@ export type Command =
 
 /** The two things `dahrk service` can do: register the always-on service, or remove it. */
 export type ServiceAction = "install" | "uninstall";
+
+/** What `dahrk repo` can do. One action today - `add` registers the current repo - but structured as an
+ *  action positional so `list`/`remove` can grow here later without another top-level command. */
+export type RepoAction = "add";
 
 /** Connection + identity flags shared by `start`, `restart`, `stop` and `doctor` (which ignore the ones
  *  that do not apply to them). */
@@ -102,6 +107,15 @@ export interface RunFlags {
   hubUrl?: string;
 }
 
+/** `dahrk repo add` flags: everything is optional because the command operates on the current working
+ *  directory. `--name` overrides the slug derived from the origin URL; `--hub-url`/`--token` override
+ *  the configured hub and the cached enrolment token for talking to the hub. */
+export interface RepoAddFlags {
+  name?: string;
+  hubUrl?: string;
+  token?: string;
+}
+
 /** `dahrk service <action>` flags: which action, plus the connection/identity flags baked into the
  *  generated unit (uninstall ignores them). */
 export interface ServiceFlags {
@@ -131,6 +145,7 @@ export type ParsedCli =
   | { kind: "logs"; flags: LogsFlags }
   | { kind: "diagnose"; flags: DiagnoseFlags }
   | { kind: "run"; flags: RunFlags }
+  | { kind: "repo"; flags: RepoAddFlags }
   | { kind: "service"; flags: ServiceFlags }
   | { kind: "doctor"; flags: StartFlags }
   | { kind: "status"; flags: StatusFlags }
@@ -146,6 +161,7 @@ const COMMANDS = new Set<Command>([
   "logs",
   "diagnose",
   "run",
+  "repo",
   "service",
   "doctor",
   "status",
@@ -179,6 +195,8 @@ export function parseCli(argv: string[]): ParsedCli {
   // `run` takes a required `<workflow>` positional plus repo/hub/token flags, so it parses on its own
   // path (the other commands forbid positionals).
   if (command === "run") return parseRun(flagArgs);
+  // `repo` takes a required `add` action positional plus the name/connection flags.
+  if (command === "repo") return parseRepo(flagArgs);
   // `service` takes a required `install`/`uninstall` action positional plus the connection flags.
   if (command === "service") return parseService(flagArgs);
   // `update` has its own tiny flag set (`--check`), distinct from the connection flags below.
@@ -369,6 +387,48 @@ function parseService(flagArgs: string[]): ParsedCli {
   return { kind: "service", flags };
 }
 
+const REPO_ACTIONS = new Set<RepoAction>(["add"]);
+const isRepoAction = (s: string): s is RepoAction => (REPO_ACTIONS as Set<string>).has(s);
+
+/** Parse the tail of `dahrk repo add [flags]`: a required `add` action positional plus the optional
+ *  name/hub/token flags. A `--help` scopes help to `repo`; a missing/unknown/extra action is an error.
+ *  Mirrors `parseService`, since `repo` is the same shape (action positional + flags). */
+function parseRepo(flagArgs: string[]): ParsedCli {
+  let values;
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: flagArgs,
+      options: {
+        name: { type: "string" },
+        "hub-url": { type: "string" },
+        token: { type: "string" },
+        help: { type: "boolean", default: false },
+      },
+      allowPositionals: true,
+    }));
+  } catch (e) {
+    return { kind: "error", message: (e as Error).message };
+  }
+  if (values.help) return { kind: "help", command: "repo" };
+  if (positionals.length === 0) {
+    return { kind: "error", message: "repo: missing action (`dahrk repo add`)" };
+  }
+  if (positionals.length > 1) {
+    return { kind: "error", message: `repo: unexpected argument "${positionals[1]}" (one action at a time)` };
+  }
+  const action = positionals[0] as string;
+  if (!isRepoAction(action)) {
+    return { kind: "error", message: `repo: unknown action "${action}" (expected add)` };
+  }
+  const flags: RepoAddFlags = {
+    ...(values.name ? { name: values.name } : {}),
+    ...(values["hub-url"] ? { hubUrl: values["hub-url"] } : {}),
+    ...(values.token ? { token: values.token } : {}),
+  };
+  return { kind: "repo", flags };
+}
+
 /** Parse the tail of `dahrk update [--check]`: a single optional boolean flag, no positionals. A
  *  `--help` scopes help to `update`. */
 function parseUpdate(flagArgs: string[]): ParsedCli {
@@ -517,6 +577,30 @@ export function usage(bin: string, command?: Command): string {
       "  --token <token>    Enrolment token to verify against the hub (or set DAHRK_ENROL_TOKEN).",
     ].join("\n");
   }
+  if (command === "repo") {
+    return [
+      `Usage: ${bin} repo add [options]`,
+      "",
+      "Register the current git repository with the hub, so it can run workflows. Run it from inside the",
+      "repo - `cd your-repo && dahrk repo add` - and the node reads the `origin` remote and the current",
+      "branch itself: no form, no pasted git URL, because the node already sits next to the code.",
+      "",
+      "The git URL is registered in the form the host can authenticate. An HTTPS origin is kept as-is; an",
+      "SSH origin is kept when this host has an SSH key, and otherwise normalised to HTTPS with a warning.",
+      "Re-running on an already-registered repo is a no-op, not an error or a duplicate.",
+      "",
+      "This uses the node's existing enrolment - run `dahrk start --token <token>` first if it is not yet",
+      "enrolled. It dials the hub itself, so the daemon need not be running.",
+      "",
+      "Actions:",
+      "  add          Register the repository in the current directory.",
+      "",
+      "Options:",
+      "  --name <name>      Display name for the repo (default: the slug from the origin URL).",
+      "  --hub-url <url>    Hub URL to register with (or set DAHRK_HUB_URL).",
+      "  --token <token>    Enrolment token to authenticate with (default: the cached one).",
+    ].join("\n");
+  }
   if (command === "service") {
     return [
       `Usage: ${bin} service install|uninstall [options]`,
@@ -593,6 +677,7 @@ export function usage(bin: string, command?: Command): string {
     "  diagnose  Write a support bundle you can read, and send on if you choose. Uploads nothing.",
     "  status    Is it up, is it enrolled, what is it working on? (local, dials nothing)",
     "  run       Run a workflow locally (engine-backed), e.g. `run preflight`.",
+    "  repo      Register the current repository with the hub (`repo add`).",
     "  doctor    Preflight checks: Node, runtimes, hub reachability, token validity.",
     "  service   Install/uninstall the always-on service by hand (`start` does this for you).",
     "  update    Update the client to the latest release (or print how for your channel).",

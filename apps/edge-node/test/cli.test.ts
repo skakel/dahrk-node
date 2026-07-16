@@ -110,6 +110,46 @@ test("an `update` subcommand's --help scopes to `update`", () => {
   assert.deepEqual(parseCli(["help", "update"]), { kind: "help", command: "update" });
 });
 
+test("`repo add` parses with no flags, operating on the cwd", () => {
+  const p = parseCli(["repo", "add"]);
+  assert.equal(p.kind, "repo");
+  if (p.kind === "repo") assert.deepEqual(p.flags, {});
+});
+
+test("`repo add` parses --name/--hub-url/--token", () => {
+  const p = parseCli(["repo", "add", "--name", "x", "--hub-url", "wss://h", "--token", "t"]);
+  assert.equal(p.kind, "repo");
+  if (p.kind === "repo") assert.deepEqual(p.flags, { name: "x", hubUrl: "wss://h", token: "t" });
+});
+
+test("`repo` needs an action: bare `repo` is an error", () => {
+  const p = parseCli(["repo"]);
+  assert.equal(p.kind, "error");
+  assert.equal(p.kind === "error" && /missing action/.test(p.message), true);
+});
+
+test("`repo` rejects an unknown action", () => {
+  const p = parseCli(["repo", "bogus"]);
+  assert.equal(p.kind, "error");
+  assert.equal(p.kind === "error" && /unknown action "bogus"/.test(p.message), true);
+});
+
+test("`repo add` takes no positional: an extra argument is an error", () => {
+  const p = parseCli(["repo", "add", "x"]);
+  assert.equal(p.kind, "error");
+});
+
+test("a `repo` subcommand's --help scopes to `repo`", () => {
+  assert.deepEqual(parseCli(["repo", "--help"]), { kind: "help", command: "repo" });
+  assert.deepEqual(parseCli(["help", "repo"]), { kind: "help", command: "repo" });
+});
+
+test("usage documents `repo add` and lists `repo` at the top level", () => {
+  assert.match(usage("dahrk"), /^\s+repo\s+\S/m);
+  assert.match(usage("dahrk", "repo"), /repo add/);
+  assert.match(usage("dahrk", "repo"), /--name/);
+});
+
 test("help spellings: `help`, `--help`, and scoped `help <command>`", () => {
   assert.deepEqual(parseCli(["help"]), { kind: "help" });
   assert.deepEqual(parseCli(["--help"]), { kind: "help" });

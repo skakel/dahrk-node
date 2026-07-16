@@ -56,6 +56,10 @@ export interface RepoProbe {
   baseBranch?: string;
   /** HEAD resolves to a commit (a fresh `git init` with no commits does not). */
   headResolves: boolean;
+  /** The `origin` remote URL, when the repo has one. This is what `dahrk repo add` registers with the
+   *  hub - read here because the node already sits next to the code, so no URL need ever be pasted.
+   *  Best-effort: a repo with no `origin` leaves it undefined. */
+  remoteUrl?: string;
   /** Why the path is not a usable git repo, for the finding text. */
   detail?: string;
 }
@@ -316,8 +320,9 @@ function commandPresent(cmd: string): boolean {
   }
 }
 
-/** A pushable SSH identity exists: a `*.pub` under `~/.ssh`, or a key loaded in the running ssh-agent. */
-function sshKeyPresent(): boolean {
+/** A pushable SSH identity exists: a `*.pub` under `~/.ssh`, or a key loaded in the running ssh-agent.
+ *  Exported so `dahrk repo add` can make the SSH-vs-HTTPS choice from the same signal preflight uses. */
+export function sshKeyPresent(): boolean {
   try {
     const dir = join(homedir(), ".ssh");
     if (existsSync(dir) && readdirSync(dir).some((f) => f.endsWith(".pub"))) return true;
@@ -368,9 +373,10 @@ function freeDiskBytes(dir: string): number | undefined {
   }
 }
 
-/** Probe a git repo: is it a work tree, does HEAD resolve, and to which branch. Best-effort - any
- *  failure surfaces as `isGitRepo: false` with a detail, never a throw. */
-function probeRepo(repoPath: string): RepoProbe {
+/** Probe a git repo: is it a work tree, does HEAD resolve, to which branch, and what is its `origin`
+ *  remote. Best-effort - any failure surfaces as `isGitRepo: false` with a detail, never a throw.
+ *  Exported so `dahrk repo add` reuses the same cwd probe rather than growing a second `git -C` site. */
+export function probeRepo(repoPath: string): RepoProbe {
   const git = (args: string[]): string =>
     execFileSync("git", ["-C", repoPath, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   try {
@@ -391,7 +397,21 @@ function probeRepo(repoPath: string): RepoProbe {
   } catch {
     /* a fresh repo with no commits: git repo, but HEAD does not resolve yet */
   }
-  return { path: repoPath, isGitRepo: true, headResolves, ...(baseBranch ? { baseBranch } : {}) };
+  // The origin remote, when the repo has one. A repo with no `origin` (or a bare `git init`) exits
+  // non-zero here; that is a finding for `repo add`, not a probe failure, so it stays undefined.
+  let remoteUrl: string | undefined;
+  try {
+    remoteUrl = git(["remote", "get-url", "origin"]) || undefined;
+  } catch {
+    /* no origin remote configured */
+  }
+  return {
+    path: repoPath,
+    isGitRepo: true,
+    headResolves,
+    ...(baseBranch ? { baseBranch } : {}),
+    ...(remoteUrl ? { remoteUrl } : {}),
+  };
 }
 
 /** Gather all host facts for the preflight against `repoPath`. */

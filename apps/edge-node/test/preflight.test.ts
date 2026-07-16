@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { HostFacts, PreflightDeps, RepoProbe, ToolPresence } from "../src/preflight.ts";
 import {
   checkDiskSpace,
@@ -7,10 +11,58 @@ import {
   checkTools,
   checkWorktreeRoot,
   PREFLIGHT_STAGES,
+  probeRepo,
   REPORT_BASE_URL,
   runPreflight,
   synthesise,
 } from "../src/preflight.ts";
+
+// -- probeRepo (real git, temp repos) ----------------------------------------
+
+/** Make a throwaway git repo with one commit, returning its path. The caller removes it. */
+function tempGitRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-probe-"));
+  const git = (...args: string[]): void => void execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
+  git("init", "-q");
+  git("config", "user.email", "t@example.com");
+  git("config", "user.name", "T");
+  git("commit", "-q", "--allow-empty", "-m", "init");
+  return dir;
+}
+
+test("probeRepo: a repo with an origin returns its remoteUrl", () => {
+  const dir = tempGitRepo();
+  try {
+    execFileSync("git", ["-C", dir, "remote", "add", "origin", "git@github.com:org/repo.git"], { stdio: "ignore" });
+    const probe = probeRepo(dir);
+    assert.equal(probe.isGitRepo, true);
+    assert.equal(probe.remoteUrl, "git@github.com:org/repo.git");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("probeRepo: a repo with no origin omits remoteUrl and does not throw", () => {
+  const dir = tempGitRepo();
+  try {
+    const probe = probeRepo(dir);
+    assert.equal(probe.isGitRepo, true);
+    assert.equal(probe.remoteUrl, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("probeRepo: a path that is not a git repo is reported, not thrown", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dahrk-nonrepo-"));
+  try {
+    const probe = probeRepo(dir);
+    assert.equal(probe.isGitRepo, false);
+    assert.equal(probe.remoteUrl, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // -- pure sub-checks ---------------------------------------------------------
 
