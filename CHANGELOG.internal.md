@@ -19,6 +19,18 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Added
+
+- **`release.yml` now tells dahrk-web when a client is published.** A second `repository_dispatch`
+  (`dahrk-node-released`, gated on a `WEB_DISPATCH_PAT` secret) fires alongside the existing harness
+  notify, triggering the marketing site's deploy. `dahrk.ai/changelog` is generated from this repo's
+  GitHub Releases feed, so a release changes that site without any commit landing there and nothing
+  would otherwise rebuild it: the page would lag every release until an unrelated push happened to
+  refresh it. Non-fatal and last, like the tap bump and the harness notify: npm and the GitHub release
+  are the release, and an unreachable downstream repo must never fail a publish. If the secret is
+  unset the step is skipped and the page can be refreshed by hand
+  (`gh workflow run deploy.yml --repo dahrkai/dahrk-web`).
+
 ## [0.1.19] - 2026-07-15
 
 ## [0.1.18] - 2026-07-14

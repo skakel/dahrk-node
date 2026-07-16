@@ -25,6 +25,10 @@ name: Release
 #                     write`, used to tell the harness a new client is out so its platform edge node
 #                     updates itself. Optional: if unset, the notify step is skipped and the harness can
 #                     be updated by hand (`gh workflow run update-platform-node.yml`).
+#   WEB_DISPATCH_PAT - a fine-grained PAT on github.com/dahrkai/dahrk-web with `Contents: read and
+#                     write`, used to rebuild dahrk.ai/changelog, which is generated from this repo's
+#                     GitHub Releases feed. Optional: if unset, the notify step is skipped and the page
+#                     can be refreshed by hand (`gh workflow run deploy.yml --repo dahrkai/dahrk-web`).
 
 on:
   push:
@@ -43,6 +47,7 @@ jobs:
     env:
       TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
       HARNESS_DISPATCH_PAT: ${{ secrets.HARNESS_DISPATCH_PAT }}
+      WEB_DISPATCH_PAT: ${{ secrets.WEB_DISPATCH_PAT }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -170,4 +175,28 @@ jobs:
             echo "notified dahrk-harness: dahrk-node ${VERSION} released"
           else
             echo "::warning::could not notify dahrk-harness of ${VERSION}; update the platform node manually (gh workflow run update-platform-node.yml)"
+          fi
+
+      # Tell the marketing site a new client is out, so dahrk.ai/changelog rebuilds. That page is built
+      # from this repo's GitHub Releases feed (dahrk-web src/changelog.ts), so a release changes the
+      # site without any commit landing there: nothing would trigger a deploy, and the changelog would
+      # lag every release until an unrelated push happened to rebuild it. This is what refreshes it.
+      #
+      # NON-FATAL and LAST, exactly like the tap bump and the harness notify above: npm + the GitHub
+      # release are the release. If it is skipped, refresh the page by hand with
+      # `gh workflow run deploy.yml --repo dahrkai/dahrk-web`.
+      - name: Notify dahrk-web of the new client
+        if: env.WEB_DISPATCH_PAT != ''
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.WEB_DISPATCH_PAT }}
+        run: |
+          set -uo pipefail
+          if gh api /repos/dahrkai/dahrk-web/dispatches \
+               -f event_type=dahrk-node-released \
+               -F "client_payload[version]=${VERSION}"; then
+            echo "notified dahrk-web: dahrk-node ${VERSION} released"
+          else
+            echo "::warning::could not refresh the dahrk.ai changelog for ${VERSION}; rerun it by hand (gh workflow run deploy.yml --repo dahrkai/dahrk-web)"
           fi
