@@ -21,6 +21,12 @@ this file is left verbatim.
 
 ### Added
 
+- **CI: smoke-test `scripts/release.mjs` on every PR** (DHK-393). A new `smoke-release-script` job
+  in `ci.yml` runs `node scripts/release.mjs <next-patch> --dry-run --no-ai` on every push to main
+  and every pull request. Exercises `sanitizeNotes`, `rewriteChangelog`, `rollInternalChangelog`, and
+  `bumpPackage` — the code paths that failed in the 0.1.11 incident — without writing files or
+  touching git. Also catches changelog edits that would choke the rewriter.
+
 - **`release.yml` now tells dahrk-web when a client is published.** A second `repository_dispatch`
   (`dahrk-node-released`, gated on a `WEB_DISPATCH_PAT` secret) fires alongside the existing harness
   notify, triggering the marketing site's deploy. `dahrk.ai/changelog` is generated from this repo's

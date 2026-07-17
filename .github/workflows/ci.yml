@@ -34,6 +34,27 @@ jobs:
       - name: Lint changelog for internal keys
         run: node scripts/lint-changelog.mjs
 
+  smoke-release-script:
+    # Exercises scripts/release.mjs in dry-run on every PR so a breakage is caught before the script
+    # is needed for real. Mirrors the 0.1.11 incident where a TDZ bug in top-level code went undetected
+    # until the first actual release attempt. Also catches changelog edits the rewriter would choke on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so git-log ranges in the script resolve
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Dry-run release script
+        run: |
+          PREV=$(node -p "require('./apps/edge-node/package.json').version")
+          NEXT=$(PREV="$PREV" node -e "const v=process.env.PREV.split('.'); v[2]=+v[2]+1; process.stdout.write(v.join('.'))")
+          node scripts/release.mjs "$NEXT" --dry-run --no-ai
+
   changelog:
     # A source change must carry a CHANGELOG note, so the release PR is only ever a version bump and no
     # shipped feature goes undocumented. Override on a genuinely note-less PR with the 'no-changelog' label.
