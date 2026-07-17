@@ -165,6 +165,45 @@ test("a start refused by the lock exits NON-ZERO, so a supervisor does not read 
   }
 });
 
+/**
+ * `--no-service` is the opt-out for users who supervise the node themselves (the `install.sh` flag of
+ * the same name forwards to it). It must enrol - leave the token on disk - but stop short of installing
+ * the always-on service, and it must not dial the hub. Driven end-to-end because "did it install a
+ * service / dial out?" is a property of main's glue, not of any pure function.
+ */
+test("`start --no-service` enrols without installing a service and without dialling the hub", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dahrk-noservice-"));
+  try {
+    const state = join(home, ".dahrk");
+    mkdirSync(state, { recursive: true });
+    // The token already on disk, so enrolment is a no-op that needs no network.
+    writeFileSync(join(state, "node.json"), JSON.stringify({ nodeId: "n", enrolToken: "sket_here" }));
+
+    const clean: NodeJS.ProcessEnv = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (!k.startsWith("DAHRK_") && !k.startsWith("SKAKEL_")) clean[k] = v;
+    }
+    const run = spawnSync(
+      process.execPath,
+      ["--import", "tsx", join(import.meta.dirname, "../src/main.ts"), "start", "--token", "sket_here", "--no-service"],
+      {
+        encoding: "utf8",
+        // An unreachable hub, so a bug that tried to dial or install a service fails loudly rather than
+        // touching the real one.
+        env: { ...clean, HOME: home, DAHRK_STATE_DIR: state, DAHRK_HUB_URL: "ws://127.0.0.1:1" },
+        timeout: 15_000,
+      },
+    );
+
+    assert.equal(run.status, 0, `expected a clean enrol-only exit, got ${run.status}: ${run.stdout}${run.stderr}`);
+    assert.match(run.stdout, /not installing a service|no service/i);
+    assert.doesNotMatch(run.stdout + run.stderr, /EDGE_CONNECTED|EDGE_ERROR/, "it must not dial the hub");
+    assert.ok(!existsSync(join(home, "Library", "LaunchAgents", "ai.dahrk.node.plist")), "no launchd unit written");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // -- `dahrk repo add` end-to-end (spawned CLI against a fake HTTP hub) --------
 
 /** A fake hub config surface: records POSTs to the repositories endpoint, dedupes by id, and answers

@@ -30,6 +30,10 @@ jobs:
       # PUBLISHED graph (e.g. a dependency shipping uncompiled source) fails here, not in the field.
       - name: Smoke-test the packaged client
         run: bash scripts/smoke-pack.sh
+      # Exercise install.sh against stub node/npm/dahrk so every branch (bad OS, missing/old Node, npm
+      # failure, good/bad/no token, --no-service) is regression-guarded without a network or a real hub.
+      - name: Test install.sh
+        run: bash scripts/test-install.sh
       # Reject internal tracker keys in the changelog before they can reach a release.
       - name: Lint changelog for internal keys
         run: node scripts/lint-changelog.mjs

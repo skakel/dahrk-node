@@ -221,6 +221,20 @@ test("--ephemeral implies --foreground: a node with no persistent id has nothing
   if (p.kind === "start") assert.equal(p.flags.foreground, true);
 });
 
+test("--no-service enrols without installing the daemon; it is absent by default", () => {
+  const p = parseCli(["start", "--token", "t", "--no-service"]);
+  assert.equal(p.kind, "start");
+  if (p.kind === "start") assert.equal(p.flags.noService, true);
+  const plain = parseCli(["start", "--token", "t"]);
+  if (plain.kind === "start") assert.equal(plain.flags.noService, undefined, "the default installs the service");
+});
+
+test("--no-service appears in `start` help so a user can discover it", () => {
+  const startHelp = usage("dahrk", "start");
+  assert.match(startHelp, /--no-service/, "--no-service must be in `start` help");
+  assert.match(startHelp, /service/, "the flag description must mention the service");
+});
+
 test("logs: -f follows, -n sets the history, and a nonsense -n is a usage error not a NaN", () => {
   const followed = parseCli(["logs", "-f"]);
   assert.equal(followed.kind, "logs");

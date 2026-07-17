@@ -38,7 +38,22 @@ brew install dahrkai/tap/dahrk                     # Homebrew
 curl -fsSL https://dahrk.ai/install.sh | sh        # curl
 ```
 
-Get an enrolment token from [app.dahrk.ai](https://app.dahrk.ai), preflight, then start the node:
+The curl channel can also **install and enrol in one step**: pass a connect token from
+[app.dahrk.ai](https://app.dahrk.ai) and it installs the client, preflights the token, and starts the
+node for you - no second command:
+
+```bash
+curl -fsSL https://dahrk.ai/install.sh | sh -s -- --token <connect-token>
+```
+
+`DAHRK_TOKEN=<connect-token>` is the same instruction as an environment variable. Add `--no-service`
+to enrol without installing the always-on service (for a node you supervise yourself), or `--hub-url`
+/ `DAHRK_HUB_URL` to point at a self-hosted hub. It needs **Node 22+** already on PATH (it does not
+install a runtime) and supports macOS and Linux. Re-running it upgrades the client and re-attaches as
+the same node rather than creating a duplicate.
+
+Or get an enrolment token from [app.dahrk.ai](https://app.dahrk.ai), preflight, then start the node by
+hand:
 
 ```bash
 dahrk doctor --token <enrolment-token>   # checks Node, runtimes, hub reachability, and the token

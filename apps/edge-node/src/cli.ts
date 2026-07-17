@@ -52,6 +52,9 @@ export interface StartFlags {
   hubUrl?: string;
   /** Do not read or persist a node id: mint a throwaway one for this run (CI / one-shot nodes). */
   ephemeral: boolean;
+  /** `start` only: enrol (leave the token on disk) but do not install the always-on service, for a
+   *  node the operator supervises themselves. Absent unless `--no-service` was passed. */
+  noService?: boolean;
   /** Run the node in THIS process and block, instead of handing it to a supervisor.
    *
    *  This is what `dahrk start` used to do, and it is still a first-class way to run a node: in a
@@ -216,6 +219,8 @@ export function parseCli(argv: string[]): ParsedCli {
         "hub-url": { type: "string" },
         ephemeral: { type: "boolean", default: false },
         foreground: { type: "boolean", default: false },
+        // `start`: enrol but do not install the service (the operator supervises the node themselves).
+        "no-service": { type: "boolean", default: false },
         // `stop` / `restart`: take the node down even though it has work in flight.
         force: { type: "boolean", default: false },
         // `status`: machine-readable output.
@@ -240,6 +245,7 @@ export function parseCli(argv: string[]): ParsedCli {
     // An ephemeral node mints a throwaway id and persists nothing, so there is nothing coherent to hand to
     // a supervisor that restarts it on boot. It is a foreground node by definition.
     foreground: (values.foreground ?? false) || ephemeral,
+    ...(values["no-service"] ? { noService: true } : {}),
   };
   if (command === "stop") return { kind: "stop", force };
   if (command === "restart") return { kind: "restart", flags, force };
@@ -477,6 +483,8 @@ export function usage(bin: string, command?: Command): string {
       "                     setting DAHRK_FOREGROUND=1, which is easier to set in a Dockerfile or pm2 config.",
       "  --ephemeral        Do not persist (or read) node id and token; mint a throwaway id (CI / one-shot).",
       "                     Implies --foreground: a node with no persistent identity has nothing to daemonise.",
+      "  --no-service       Enrol (cache the token) but do not install the always-on service, for a node you",
+      "                     supervise yourself. Run it later with `dahrk start --foreground` (or your own supervisor).",
       "",
       "Only one node may run at a time on a host - they would share this machine's node id and race each",
       "other for Jobs - so a second `start` refuses rather than dialling the hub twice.",

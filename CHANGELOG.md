@@ -8,6 +8,21 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- **`install.sh` installs the client and enrols the node in one copy-paste.** The curl one-liner the
+  docs and dashboard advertise now exists in the repo and is served at `https://dahrk.ai/install.sh`.
+  Passed a connect token - `curl -fsSL https://dahrk.ai/install.sh | sh -s -- --token <token>`, or the
+  `DAHRK_TOKEN` environment variable - it installs `dahrk-node` from npm, preflights the token with
+  `dahrk doctor`, then enrols and starts the node with `dahrk start`, with no manual second step. A
+  bad, expired, or already-consumed token stops at the preflight with a clear message and a non-zero
+  exit, leaving the client installed so a re-run with a fresh token just works. Run without a token it
+  installs the client and prints the next step, keeping the plain install channel working. It requires
+  Node 22+ (it does not install a runtime) and supports macOS and Linux; an unsupported OS or a
+  missing or too-old Node fails loudly. Re-running on an already-enrolled machine re-attaches as the
+  same node rather than creating a duplicate. `--hub-url` / `DAHRK_HUB_URL` override the hub for
+  self-hosters.
+- **`dahrk start --no-service` enrols without installing the always-on service.** For a node you
+  supervise yourself (a container, pm2, your own unit), it caches the enrolment token and returns
+  without registering the launchd / systemd service. `install.sh --no-service` forwards to it.
 - **`dahrk repo add` registers the current repository with the hub, from the client side.** Run it from
   inside a repo - `cd your-repo && dahrk repo add` - and the node reads the `origin` remote and the current
   branch itself, so the git URL and default branch are derived from the working directory and you are never

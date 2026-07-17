@@ -263,6 +263,16 @@ async function start(flags: StartFlags): Promise<number> {
   const enrolled = await enrolToDisk(env);
   if (enrolled !== 0) return enrolled;
 
+  // `--no-service`: the operator supervises the node themselves (a container, pm2, their own unit), so we
+  // enrol - the token is now on disk - but stop short of installing the always-on service. This is the
+  // opt-out `install.sh --no-service` forwards to.
+  if (flags.noService) {
+    uiOut("");
+    uiOut(verdict("ok", "Enrolled. Not installing a service (--no-service)."));
+    uiOut(hint("Run the node with `dahrk start --foreground` (or your own supervisor), or `dahrk start` to install the service."));
+    return 0;
+  }
+
   // Interactive only: the operator is here, at a prompt, about to commit to running this version for
   // months. It is the one good moment to mention there is a newer one.
   await offerUpdate(env);
