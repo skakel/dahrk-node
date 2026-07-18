@@ -193,6 +193,47 @@ test("a hub that stops answering pings is terminated and reconnected, not left a
   );
 });
 
+// --- cancel is a durable, acked ledger item (DHK-421) ---------------------------------------------
+
+/** Cancel-ack frames the hub received, filtered off the untyped inbound list (the published 0.3.0
+ *  `EdgeToHub` type predates `cancel-ack`, so this rides through as an extra JSON member). */
+const cancelAcks = (inbound: EdgeToHub[]): Array<{ type: string; jobId: string }> =>
+  inbound.filter((m) => (m as { type?: string }).type === "cancel-ack") as unknown as Array<{
+    type: string;
+    jobId: string;
+  }>;
+
+test("a cancel frame is acknowledged, even for a job the node is not running (a harmless settle)", async () => {
+  await withEdge(async (ctx) => {
+    // No such job is in flight (nothing was dispatched): the runner-abort is a no-op, but the ack MUST
+    // still be sent so the hub settles its durable `${jobId}-cancel` row rather than dead-lettering it.
+    ctx.toEdge({ type: "cancel", jobId: "job-x" });
+    await waitFor(() => cancelAcks(ctx.inbound).length === 1);
+    assert.equal(cancelAcks(ctx.inbound)[0]!.jobId, "job-x");
+    assert.equal(marker(ctx.lines, "JOB_CANCEL:"), 1);
+  });
+});
+
+test("a cancel-ack is cached and re-sent on reconnect, so a hub roll still settles the cancel", async () => {
+  await withEdge(
+    async (ctx) => {
+      ctx.toEdge({ type: "cancel", jobId: "job-c" });
+      await waitFor(() => cancelAcks(ctx.inbound).length === 1);
+
+      // The hub stops answering pings: the edge terminates the zombie socket and redials. On the new
+      // connection it replays every cached cancel-ack, so a cancel the hub is still trying to settle
+      // (its row leased/queued because the first ack was lost to the roll) is acked again.
+      await waitFor(() => ctx.connections >= 2, 3000);
+      await waitFor(() => cancelAcks(ctx.inbound).length >= 2, 3000);
+      assert.ok(
+        cancelAcks(ctx.inbound).every((f) => f.jobId === "job-c"),
+        "every replayed ack is for the cancelled job",
+      );
+    },
+    { autoPong: false, heartbeatMs: 100 },
+  );
+});
+
 // --- announcing in-flight jobs on hello (DHK-416) --------------------------------------------------
 
 test("an idle node announces an EMPTY in-flight list, not an absent one", async () => {

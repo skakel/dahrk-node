@@ -283,6 +283,29 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     }
   };
 
+  // DHK-421: cancel is a DURABLE, ACKED ledger item on the hub, not a fire-and-forget push. For every
+  // `cancel` frame we abort the runner AND send a `cancel-ack` so the hub settles its `${jobId}-cancel`
+  // row; we ack even a cancel for a job we no longer run (finished/unknown) - a harmless no-op that still
+  // settles the row. We retain the ack per job and re-send it on every (re)connect, so a hub that rolled
+  // mid-cancel still settles the row (idempotent: `ackDispatch` on the hub is a no-op on an acked row).
+  // Bounded exactly like `lastResults`.
+  //
+  // Forward-compat shim until the `@dahrk/contracts` bump (harness DHK-421 publishes `cancel-ack` in the
+  // `EdgeToHub` union at 0.4.0). `encode` on the wire is a plain `JSON.stringify`, so the extra member
+  // rides through intact even though the published 0.3.0 type omits it - mirrors the `PushMode` shim in
+  // `stage-runner.ts`. Drop the cast and bump the dependency once 0.4.0 is released.
+  const ackedCancels = new Map<string, EdgeToHub>();
+  const ackCancel = (jobId: string): void => {
+    const frame = { type: "cancel-ack", jobId } as unknown as EdgeToHub;
+    ackedCancels.delete(jobId); // re-key to most-recent insertion order
+    ackedCancels.set(jobId, frame);
+    if (ackedCancels.size > MAX_RESEND) {
+      const oldest = ackedCancels.keys().next().value;
+      if (oldest !== undefined) ackedCancels.delete(oldest);
+    }
+    send(frame);
+  };
+
   // Pending presigned-URL requests, resolved when the hub replies with `blob-put-url`.
   const pendingBlob = new Map<string, (r: { key: string; url?: string }) => void>();
   let blobReqCounter = 0;
@@ -565,6 +588,9 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
     if (msg.type === "cancel") {
       log.info({ jobId: msg.jobId }, `JOB_CANCEL:${msg.jobId}`);
       stageRunner.cancel(msg.jobId);
+      // DHK-421: acknowledge the cancel so the hub settles its durable `${jobId}-cancel` row. `cancel` is
+      // no longer fire-and-forget; the ack is what lets a cancel survive a hub roll / reconnect.
+      ackCancel(msg.jobId);
       return;
     }
     if (msg.type === "turn") {
@@ -721,6 +747,9 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       // bridge now resolves it idempotently, so this re-send is what un-wedges the run. A no-op when the
       // hub already has the result (4xx on the duplicate resolve).
       for (const frame of lastResults.values()) send(frame);
+      // DHK-421: also re-send every cancel-ack, so a cancel the hub is still trying to settle (its row is
+      // leased/queued because the previous ack was lost to a roll) is acked again. Idempotent on the hub.
+      for (const frame of ackedCancels.values()) send(frame);
       startHeartbeat(sock, opts.heartbeatMs ?? 5000);
     });
     sock.on("message", (raw) => void onMessage(raw.toString()));

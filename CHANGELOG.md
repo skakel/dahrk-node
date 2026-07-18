@@ -6,6 +6,16 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Changed
+
+- **The node now acknowledges cancels, so a cancel survives a hub restart or a dropped connection.**
+  A `cancel` used to be handled and forgotten: the node aborted the stage but told the hub nothing, so
+  a cancel that arrived while the node was momentarily disconnected, or was in flight across a hub
+  restart, could be lost and the runner kept working on a run nobody was waiting for. The node now
+  replies with a `cancel-ack` for every cancel it receives (even one for a stage it has already
+  finished, which is a harmless no-op) and re-sends that acknowledgement on every reconnect, so the hub
+  can treat cancel as a durable, acknowledged item and settle it exactly once.
+
 ### Fixed
 
 - **A pinned component is no longer written into a worktree the runtime cannot read.** The component
