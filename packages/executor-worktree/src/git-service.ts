@@ -60,6 +60,32 @@ export interface WorktreeSpec {
   credentialToken?: string;
 }
 
+/**
+ * How to deterministically resolve one explicitly-safe path when the push-time base merge conflicts
+ * on it (DHK-553). `ours`/`theirs` keep one side wholesale (`git checkout --ours/--theirs`); `union`
+ * keeps BOTH sides' additions (`git merge-file --union`, lossless) for append-only files. `path` is
+ * matched against the conflicted path AND its basename, so a bare `pnpm-lock.yaml` matches at any depth.
+ */
+export interface MergeResolveRule {
+  path: string;
+  strategy: "ours" | "theirs" | "union";
+}
+
+/**
+ * The default safe paths the edge resolves mechanically before parking a base-merge conflict - only
+ * paths where a deterministic resolution cannot silently corrupt intent (never a hand-mergeable source
+ * file). Lockfiles are generated, so taking the base side (`theirs`) and letting `install` regenerate
+ * is safe; CHANGELOGs are append-only under `[Unreleased]`, so a `union` keeps both sides' entries.
+ * Anything not listed stays a residual conflict and parks as before.
+ */
+export const DEFAULT_MERGE_RESOLVE_RULES: MergeResolveRule[] = [
+  { path: "pnpm-lock.yaml", strategy: "theirs" },
+  { path: "package-lock.json", strategy: "theirs" },
+  { path: "yarn.lock", strategy: "theirs" },
+  { path: "CHANGELOG.md", strategy: "union" },
+  { path: "CHANGELOG.internal.md", strategy: "union" },
+];
+
 /** Options for {@link GitService.commitAndPush}. */
 export interface CommitPushOpts {
   /** The commit message (composed deterministically by the hub from stage summaries). */
@@ -70,6 +96,9 @@ export interface CommitPushOpts {
   base: string;
   /** Brokered HTTPS push token; absent = ambient host credentials are used. */
   credentialToken?: string;
+  /** Per-repo safe paths to resolve deterministically at push-time base merge before parking a
+   *  conflict; defaults to {@link DEFAULT_MERGE_RESOLVE_RULES} when omitted. */
+  mergeResolve?: MergeResolveRule[];
 }
 
 /** Outcome of {@link GitService.commitAndPush}. */
@@ -378,6 +407,72 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       ]);
     }
     return { headSha: git(worktreePath, ["rev-parse", "HEAD"]).trim(), dirty };
+  };
+
+  /** The still-unmerged paths of an in-progress merge (`git diff --name-only --diff-filter=U`). */
+  const unmergedPaths = (worktreePath: string): string[] =>
+    git(worktreePath, ["diff", "--name-only", "--diff-filter=U"])
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+  /**
+   * Union-merge one conflicted path from its three merge stages (base/ours/theirs), keeping BOTH sides'
+   * additions and writing the result back into the worktree (the caller stages it). `merge-file --union`
+   * never conflicts, so it always exits 0; an add/add path with no common ancestor uses an empty base.
+   */
+  const unionMerge = (worktreePath: string, p: string): void => {
+    const stage = (n: number): string => {
+      try {
+        return git(worktreePath, ["show", `:${n}:${p}`]);
+      } catch {
+        return ""; // stage absent (e.g. add/add has no :1 ancestor) - treat as empty
+      }
+    };
+    const dir = mkdtempSync(join(tmpdir(), "dahrk-union-"));
+    try {
+      const ours = join(dir, "ours");
+      const base = join(dir, "base");
+      const theirs = join(dir, "theirs");
+      writeFileSync(ours, stage(2));
+      writeFileSync(base, stage(1));
+      writeFileSync(theirs, stage(3));
+      const merged = git(worktreePath, ["merge-file", "-p", "--union", ours, base, theirs]);
+      writeFileSync(join(worktreePath, p), merged);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  /**
+   * Deterministic, no-LLM pre-resolve of a conflicted push-time base merge (DHK-553), staying inside
+   * git's determinism boundary - no inference, no file contents invented. Attempts, in order:
+   *   1. rerere replays any recorded human resolution (the merge already ran with rerere enabled, so a
+   *      recorded hunk is staged; a best-effort `git rerere` re-applies belt-and-braces);
+   *   2. each still-unmerged path matching a safe {@link MergeResolveRule} is resolved mechanically
+   *      (`ours`/`theirs` keep one side; `union` keeps both) and staged.
+   * Mutates the index only - it does NOT complete or abort the merge. The caller re-checks
+   * {@link unmergedPaths} for the residual set and commits the merge (clean) or aborts and parks.
+   */
+  const preResolveConflicts = (worktreePath: string, rules: MergeResolveRule[]): void => {
+    // rerere: reuse recorded resolutions. Best-effort - a no-op when no record matches a hunk.
+    gitOk(worktreePath, ["rerere"]);
+    for (const p of unmergedPaths(worktreePath)) {
+      const rule = rules.find((r) => r.path === p || basename(p) === r.path);
+      if (!rule) continue;
+      try {
+        if (rule.strategy === "union") {
+          unionMerge(worktreePath, p);
+        } else {
+          // --ours = our run branch (HEAD); --theirs = the base being merged in (MERGE_HEAD).
+          git(worktreePath, ["checkout", `--${rule.strategy}`, "--", p]);
+        }
+        git(worktreePath, ["add", "--", p]);
+      } catch (e) {
+        // A path we cannot resolve mechanically simply stays a residual conflict and parks.
+        log.warn(`pre-resolve of ${p} (${rule.strategy}) failed: ${(e as Error).message}`);
+      }
+    }
   };
 
   /**
@@ -811,12 +906,18 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
             return { headSha, pushed: false, nothingToCommit: true, commitsAhead, integration: "noop" };
           }
           try {
-            // A non-fast-forward merge writes a commit, so pass the same committer identity as the commit.
+            // A non-fast-forward merge writes a commit, so pass the same committer identity as the
+            // commit. Enable rerere so a recorded human resolution auto-applies (and is re-recorded)
+            // for these hunks - the first rung of the DHK-553 deterministic pre-resolve below.
             git(worktreePath, [
               "-c",
               `user.name=${authorName}`,
               "-c",
               `user.email=${authorEmail}`,
+              "-c",
+              "rerere.enabled=true",
+              "-c",
+              "rerere.autoupdate=true",
               "merge",
               "--no-edit",
               "FETCH_HEAD",
@@ -826,31 +927,48 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
           } catch (mergeErr) {
             // A merge can fail two very different ways, and they need different recovery:
             //  (1) it STARTED and hit content conflicts - MERGE_HEAD exists and there are unmerged
-            //      paths. Capture them, `merge --abort` (leaves the worktree clean), push nothing; the
-            //      hub turns `integration: "conflict"` into a manual-merge elicitation.
+            //      paths. Try a deterministic (no-LLM) pre-resolve first (DHK-553); only a GENUINE
+            //      residual conflict then `merge --abort`s (leaves the worktree clean) and pushes
+            //      nothing, so the hub turns `integration: "conflict"` into a manual-merge elicitation.
             //  (2) it FAILED TO START - no MERGE_HEAD (e.g. `refusing to merge unrelated histories`, an
             //      unborn HEAD). Here `git merge --abort` would itself throw ("no merge to abort") and
             //      MASK the real error as an opaque `push failed: Command failed: git merge --abort`.
             //      So we must NOT abort a merge that never began; distinguish the two by MERGE_HEAD.
             const inMerge = gitOk(worktreePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"]);
             if (inMerge) {
-              const conflictFiles = git(worktreePath, ["diff", "--name-only", "--diff-filter=U"])
-                .split("\n")
-                .map((l) => l.trim())
-                .filter(Boolean);
-              git(worktreePath, ["merge", "--abort"]);
-              return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "conflict", conflictFiles };
+              // Before giving up: rerere replay + safe path-scoped resolution (lockfiles, CHANGELOG),
+              // then re-check for the RESIDUAL conflict set. A base-advanced conflict with no genuine
+              // content overlap clears here and integrates clean, needing no agent stage and no park.
+              preResolveConflicts(worktreePath, opts.mergeResolve ?? DEFAULT_MERGE_RESOLVE_RULES);
+              const conflictFiles = unmergedPaths(worktreePath);
+              if (conflictFiles.length === 0) {
+                // Every conflict cleared deterministically: complete the merge and fall through to push.
+                git(worktreePath, [
+                  "-c",
+                  `user.name=${authorName}`,
+                  "-c",
+                  `user.email=${authorEmail}`,
+                  "commit",
+                  "--no-edit",
+                ]);
+                integration = "clean";
+                headSha = git(worktreePath, ["rev-parse", "HEAD"]).trim();
+              } else {
+                git(worktreePath, ["merge", "--abort"]);
+                return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "conflict", conflictFiles };
+              }
+            } else {
+              // Unrelated/diverged histories: no shared ancestor, so the base can never auto-integrate.
+              // Report it as its own outcome (nothing pushed) rather than a content conflict - a
+              // `--allow-unrelated-histories` merge would only splice a garbage tree, so an agent cannot
+              // resolve it; the branch needs rebuilding from base.
+              const msg = (mergeErr as Error).message;
+              if (/unrelated histories|refusing to merge/i.test(msg)) {
+                return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "diverged" };
+              }
+              // Any other merge-start failure: surface the REAL git error truthfully, don't mask it.
+              throw mergeErr;
             }
-            // Unrelated/diverged histories: no shared ancestor, so the base can never auto-integrate.
-            // Report it as its own outcome (nothing pushed) rather than a content conflict - a
-            // `--allow-unrelated-histories` merge would only splice a garbage tree, so an agent cannot
-            // resolve it; the branch needs rebuilding from base.
-            const msg = (mergeErr as Error).message;
-            if (/unrelated histories|refusing to merge/i.test(msg)) {
-              return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "diverged" };
-            }
-            // Any other merge-start failure: surface the REAL git error truthfully instead of masking it.
-            throw mergeErr;
           }
         }
         git(worktreePath, ["push", remote, `HEAD:refs/heads/${branch}`], netEnv(authEnv));
