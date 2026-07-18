@@ -18,8 +18,17 @@
  * (mirroring how the pure mappers are unit-tested). The real SDK is loaded via a lazy dynamic
  * import so the build does not hard-depend on a live Pi install.
  */
+import { join } from "node:path";
 import type { ElicitQuestion, HumanTurn, JobResult, JobStatus, PolicyOutcome, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumePiEvent, newPiBufferState, type PiEvent } from "./pi-mappers.js";
+import {
+  readAuthHint,
+  applyApiKeyAuth,
+  createStageConfigDir,
+  cleanupStageConfigDir,
+  writeStageAuthFile,
+  writeStageCustomProviders,
+} from "./pi-auth.js";
 import {
   makeEmit,
   raceNextTurn,
@@ -176,6 +185,25 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
   };
 
   /**
+   * Release the session exactly once (DHK-511). The live factory decorates `dispose()` to also tear
+   * down the stage's hermetic config dir (its `auth.json` / `models.json`), so this is the single seam
+   * that guarantees the per-stage credentials are cleaned up. It must fire on EVERY terminus - a failed
+   * batch, the summarise turn that ends an ok batch, an interactive settle, and cancel - not only on
+   * cancel (where `dispose()` historically ran). Idempotent: the guard means a later cancel after a
+   * normal settle is a no-op.
+   */
+  let sessionDisposed = false;
+  const disposeSession = (): void => {
+    if (sessionDisposed || !session) return;
+    sessionDisposed = true;
+    try {
+      session.dispose();
+    } catch {
+      /* best effort */
+    }
+  };
+
+  /**
    * The stage's dollar cost from Pi's aggregate session stats (DHK-434). `getSessionStats()` sums
    * every entry in the session, so a single read at settle covers the whole run (batch, all
    * interactive turns, and the engine-owned summarise turn on the warm session). Returns `undefined`
@@ -213,6 +241,10 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
       captureSessionId(s);
       if (cancelled) status = "fail";
       const costUsd = readSessionCost(s);
+      // An ok batch keeps the session warm for the engine-owned summarise turn (its true terminus, which
+      // disposes then). A batch that did not settle ok gets no summarise, so runBatch IS the terminus:
+      // tear the session (and its hermetic config dir) down here.
+      if (status !== "ok") disposeSession();
       return { status, ...(sessionId ? { sessionId } : {}), ...(costUsd !== undefined ? { costUsd } : {}) };
     },
 
@@ -362,6 +394,9 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
       unsub();
       captureSessionId(s);
       const costUsd = readSessionCost(s);
+      // An interactive stage produces its own summary inline (no follow-up summarise turn), so this is
+      // its terminus: dispose the session and tear down its hermetic config dir.
+      disposeSession();
       return {
         status,
         summary,
@@ -391,6 +426,9 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
         return `(summary unavailable: ${(e as Error).message})`;
       } finally {
         unsub();
+        // The summarise turn is the terminus of an ok batch stage (runBatch kept the session warm for
+        // it): dispose here so the hermetic config dir is torn down on the normal batch path too.
+        disposeSession();
       }
       // ctx is unused: the warm session already carries the worktree + model.
     },
@@ -404,23 +442,28 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
       } catch {
         /* best effort: suppress a late abort error */
       }
-      try {
-        session?.dispose();
-      } catch {
-        /* best effort */
-      }
+      disposeSession();
     },
   };
 }
 
 /**
- * The live session factory: embed Pi via `createAgentSession` bound to the stage worktree, with
- * brokered inference creds applied as runtime API-key overrides (never persisted). The SDK is a pinned
+ * The live session factory: embed Pi via `createAgentSession` bound to the stage worktree, with the
+ * selected auth profile's providers resolved from the broker hint (DHK-511). The SDK is a pinned
  * dependency (`@earendil-works/pi-coding-agent@0.80.6`, published on npm) but is still loaded through a
  * variable-specifier dynamic import as `any` so `tsc` does not resolve its types at build time: the
  * package is loaded lazily only on the live path, so typecheck and the injected-fake tests never need
  * it resolved. This is the live path exercised end-to-end under a managed node and refined by container
  * isolation; the adapter orchestration itself is covered by tests through the injected factory.
+ *
+ * Provider identity comes solely from the hint (`readAuthHint`), never from inferring it out of an
+ * env-var name (the old `PROVIDER_BY_ENV` table is gone). The pure resolution/file-writing logic lives
+ * in `pi-auth.ts` and is unit-tested there; this factory is a thin caller:
+ *   - API-key providers apply as runtime overrides (`applyApiKeyAuth`); a provider Pi ships no built-in
+ *     for gets a `models.json` custom-provider entry from the hint's base URL.
+ *   - OAuth-subscription providers persist an `auth.json`, both written into a fresh hermetic per-stage
+ *     config dir (never the machine-global `~/.pi`). `AuthStorage`/`ModelRegistry` are pointed at that
+ *     dir, and `dispose()` is decorated to tear the whole dir down on teardown.
  */
 async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike> {
   const spec = "@earendil-works/pi-coding-agent";
@@ -438,16 +481,21 @@ async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike
     resolveCliModel,
   } = mod;
 
-  const authStorage = AuthStorage.create();
-  // Brokered inference creds: the hub injects provider keys via `runtimeEnv`; apply them as
-  // runtime overrides (AuthStorage's highest-priority, non-persisted source) so Pi resolves them as if
-  // set by the operator and the agent never sees the raw secret. Keep the adapter hermetic: do not
-  // inherit machine-global ~/.pi config. Env var -> provider mapping follows Pi's provider ids.
-  for (const [key, value] of Object.entries(ctx.runtimeEnv ?? {})) {
-    const provider = PROVIDER_BY_ENV[key];
-    if (provider) authStorage.setRuntimeApiKey(provider, value);
-  }
-  const modelRegistry = ModelRegistry.create(authStorage);
+  // The auth-profile hint (DHK-509) is the sole source of provider identity; absent on ambient nodes.
+  const hint = readAuthHint(ctx);
+  // A fresh per-stage config dir keeps the stage hermetic - Pi never inherits machine-global ~/.pi auth
+  // or models config. The OAuth `auth.json` and any custom-provider `models.json` are written into it
+  // BEFORE AuthStorage/ModelRegistry are pointed at it, so they are loaded on construction.
+  const configDir = createStageConfigDir();
+  writeStageAuthFile(configDir, hint);
+  writeStageCustomProviders(configDir, hint);
+
+  const authStorage = AuthStorage.create(join(configDir, "auth.json"));
+  // Brokered API-key providers apply as runtime overrides (AuthStorage's highest-priority, non-persisted
+  // source) so Pi resolves them as if set by the operator and the agent never sees the raw secret. The
+  // secret rides in `runtimeEnv`; the hint declares which var carries which provider's key.
+  applyApiKeyAuth(hint, ctx.runtimeEnv, authStorage);
+  const modelRegistry = ModelRegistry.create(authStorage, join(configDir, "models.json"));
 
   let model: unknown;
   if (ctx.config.model) {
@@ -562,6 +610,18 @@ async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike
     ...(model ? { model } : {}),
   });
   const piSession = session as PiSessionLike;
+  // Decorate dispose() to tear down the hermetic config dir (the OAuth auth.json / custom models.json)
+  // when the runner releases the session. The runner disposes on EVERY terminus - failed batch, the
+  // summarise turn that ends an ok batch, an interactive settle, and cancel - so the per-stage
+  // credentials never outlive the stage.
+  const innerDispose = piSession.dispose.bind(piSession);
+  piSession.dispose = (): void => {
+    try {
+      innerDispose();
+    } finally {
+      cleanupStageConfigDir(configDir);
+    }
+  };
   // The adapter's `runInteractive` registers its dispatcher here; the tool's `execute` above reads it.
   piSession.setAskUserQuestionHandler = (handler) => {
     askHandler = handler;
@@ -572,14 +632,6 @@ async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike
   };
   return piSession;
 }
-
-/** Common provider inference-key env var names -> Pi provider ids ( `runtimeEnv`). */
-const PROVIDER_BY_ENV: Record<string, string> = {
-  ANTHROPIC_API_KEY: "anthropic",
-  OPENAI_API_KEY: "openai",
-  GEMINI_API_KEY: "google",
-  GOOGLE_API_KEY: "google",
-};
 
 /** The minimum of a Pi model we depend on. The SDK's own type is not resolved at build time (the
  *  package is imported by variable specifier), so we describe only what we read. */

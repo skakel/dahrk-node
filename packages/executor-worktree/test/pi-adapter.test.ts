@@ -13,7 +13,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
@@ -544,6 +545,68 @@ test("DHK-505 runInteractive elicit: the turn stream ending mid-question returns
   const result = await createPiRunner({ createSession: async () => fake }).runInteractive(ctxInteractive(), turns, () => {});
   assert.equal(answer, "The question was cancelled.");
   assert.equal(result.status, "ok");
+});
+
+// DHK-511: hermetic per-stage config dir. The live factory writes the OAuth `auth.json` / custom
+// `models.json` into a temp dir and points Pi at it; that dir must be torn down when the stage
+// settles - on the NORMAL completion path (not only on cancel, where `dispose()` already ran). These
+// tests model the factory's decorated `dispose()` (clean up the config dir) and assert the runner
+// invokes it on every terminus: an ok batch (via the summarise turn), a failed batch, an interactive
+// stage, and cancel.
+
+/** A fake session whose `dispose()` also removes a real per-stage config dir, mirroring how
+ *  `defaultCreatePiSession` decorates `dispose` to call `cleanupStageConfigDir`. */
+const fakeSessionWithConfigDir = (scripts: ScriptStep[]): { fake: FakePiSession; configDir: string } => {
+  const configDir = mkdtempSync(join(tmpdir(), "dahrk-pi-test-"));
+  const fake = new FakePiSession(scripts);
+  const inner = fake.dispose.bind(fake);
+  fake.dispose = (): void => {
+    inner();
+    rmSync(configDir, { recursive: true, force: true });
+  };
+  return { fake, configDir };
+};
+
+test("DHK-511 teardown: an ok batch stage cleans up its config dir after the summarise turn", async () => {
+  const { fake, configDir } = fakeSessionWithConfigDir([
+    STAGE_SCRIPT,
+    [pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Recap." } }),
+     pe({ type: "agent_end", messages: [{ stopReason: "stop" }] })],
+  ]);
+  const runner = createPiRunner({ createSession: async () => fake });
+  await runner.runBatch(ctx(), () => {});
+  assert.ok(existsSync(configDir), "the warm session is kept for summarise, so the dir survives runBatch");
+  await runner.summarise(ctx());
+  assert.ok(!existsSync(configDir), "the summarise turn is the batch terminus: its config dir is gone");
+});
+
+test("DHK-511 teardown: a failed batch stage (no summarise follows) cleans up its config dir", async () => {
+  const { fake, configDir } = fakeSessionWithConfigDir([
+    [pe({ type: "agent_end", messages: [{ stopReason: "error", errorMessage: "provider 500" }] })],
+  ]);
+  const result = await createPiRunner({ createSession: async () => fake }).runBatch(ctx(), () => {});
+  assert.equal(result.status, "fail");
+  assert.ok(!existsSync(configDir), "a failed batch gets no summarise, so runBatch itself tears the dir down");
+});
+
+test("DHK-511 teardown: an interactive stage cleans up its config dir on normal settle", async () => {
+  const { fake, configDir } = fakeSessionWithConfigDir([
+    [pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "What is the objective?" } }),
+     pe({ type: "turn_end", message: { stopReason: "stop" } })],
+    [pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Explained." } }),
+     pe({ type: "agent_end", messages: [{ stopReason: "stop" }] })],
+  ]);
+  await createPiRunner({ createSession: async () => fake }).runInteractive(ctx(), turnsFrom([]), () => {});
+  assert.ok(!existsSync(configDir), "runInteractive is self-contained: it tears the dir down on settle");
+});
+
+test("DHK-511 teardown: cancel also cleans up the config dir", async () => {
+  const { fake, configDir } = fakeSessionWithConfigDir([STAGE_SCRIPT]);
+  const runner = createPiRunner({ createSession: async () => fake });
+  await runner.runBatch(ctx(), () => {});
+  assert.ok(existsSync(configDir), "an ok batch keeps the dir for a possible summarise");
+  await runner.cancel();
+  assert.ok(!existsSync(configDir), "cancel disposes the session and tears the dir down");
 });
 
 // DHK-504: Pi pre-execution tool gate. The pure decision mirrors Claude's `policyCanUseTool`: only a
