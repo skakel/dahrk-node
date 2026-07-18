@@ -34,6 +34,13 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   questions is asked one at a time and an unanswered question, a cancelled stage, or a second question
   raised while one is still open all behave exactly as they do for Claude.
 
+- **A managed node can now run a Pi stage container-isolated.** Setting `DAHRK_PI_ISOLATION=container`
+  makes the node run each Pi stage in a fresh per-job Docker container (`pi --mode rpc`) instead of the
+  embedded in-process session; without it the node keeps using the embedded path. The container image
+  is taken from `DAHRK_PI_IMAGE` (default `dahrk/pi:latest`). One known degradation on the container
+  path: the RPC session has no agent handle, so a meta-loop stage's tool-denial during `summarise` is a
+  no-op there (meta-loop stages are telemetry-only, so this is accepted).
+
 ### Changed
 
 - **The node now acknowledges cancels, so a cancel survives a hub restart or a dropped connection.**
