@@ -1,13 +1,12 @@
 /**
  * Pi trace-mapping tests ( Spike B). The acceptance check: a fixture Pi event stream
- * produces a TraceEvent sequence STRUCTURALLY IDENTICAL to the Claude and Codex mappers' output for
+ * produces a TraceEvent sequence STRUCTURALLY IDENTICAL to the Claude mapper's output for
  * the same logical stage. We also assert the CYPACK-1177 buffered-response rule over Pi's streamed
  * deltas, and that every emitted event validates against the contract schema.
  *
  * No live calls, no credentials: the fixtures are hand-authored to the vendored Pi docs (sdk.md event
- * list, session-format.md `Usage`). Note that Codex delivers whole items and settles its usage on
- * `turn.completed`, whereas Pi streams deltas and settles at `turn_end`/`agent_end`; we therefore
- * compare the normalised TYPE SEQUENCE plus the discriminating fields (the envelope is cross-runtime
+ * list, session-format.md `Usage`). Note that Pi streams deltas and settles at `turn_end`/`agent_end`;
+ * we compare the normalised TYPE SEQUENCE plus the discriminating fields (the envelope is cross-runtime
  * uniform), not byte-equality of the source records.
  */
 import test from "node:test";
@@ -17,11 +16,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { ThreadEvent } from "@openai/codex-sdk";
 import type { TraceEvent } from "@dahrk/contracts";
 import { consumePiEvent, mapPiEvent, newPiBufferState, type PiEvent } from "../src/pi-mappers.js";
 import { consumeClaudeMessage, newBufferState } from "../src/claude-mappers.js";
-import { mapCodexEvent } from "../src/codex-mappers.js";
 import { makeEmit } from "../src/runner-shared.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -33,7 +30,6 @@ const validateEvent = ajv.compile({ $ref: "https://skakel.io/schemas/trace.schem
 const FIXED_TS = "2026-06-21T00:00:00Z";
 const pe = (x: unknown): PiEvent => x as PiEvent;
 const cm = (x: unknown): SDKMessage => x as SDKMessage;
-const ce = (x: unknown): ThreadEvent => x as ThreadEvent;
 
 /** Fold a Pi event stream through the buffered-response machine, stamp the envelope. */
 function drivePi(fixtures: PiEvent[], suppressStageExit = false): TraceEvent[] {
@@ -56,18 +52,9 @@ function driveClaude(fixtures: SDKMessage[]): TraceEvent[] {
   return events;
 }
 
-function driveCodex(fixtures: ThreadEvent[]): TraceEvent[] {
-  const events: TraceEvent[] = [];
-  const emit = makeEmit("codex", (e) => events.push(e), () => FIXED_TS);
-  for (const ev of fixtures) {
-    for (const e of mapCodexEvent(ev).events) emit(e);
-  }
-  return events;
-}
-
-test("ACCEPTANCE: a Pi event stream maps to the SAME envelope sequence as Claude and Codex", () => {
+test("ACCEPTANCE: a Pi event stream maps to the SAME envelope sequence as Claude", () => {
   // One logical stage: a reasoning step, one tool call + its result, then a final assistant response.
-  // Encoded three ways; each mapper must yield thought -> action -> observation -> response -> state.
+  // Encoded two ways; each mapper must yield thought -> action -> observation -> response -> state.
   const pi = drivePi([
     pe({ type: "agent_start" }),
     pe({ type: "turn_start" }),
@@ -87,22 +74,12 @@ test("ACCEPTANCE: a Pi event stream maps to the SAME envelope sequence as Claude
     cm({ type: "result", subtype: "success", result: "All three tests pass.", session_id: "s1", usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 } }),
   ]);
 
-  const codex = driveCodex([
-    ce({ type: "thread.started", thread_id: "thr_1" }),
-    ce({ type: "turn.started" }),
-    ce({ type: "item.completed", item: { id: "r1", type: "reasoning", text: "Plan: run the tests." } }),
-    ce({ type: "item.completed", item: { id: "call_1", type: "command_execution", command: "pnpm test", aggregated_output: "3 passing", status: "completed" } }),
-    ce({ type: "item.completed", item: { id: "a1", type: "agent_message", text: "All three tests pass." } }),
-    ce({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5, cached_input_tokens: 2 } }),
-  ]);
-
   const expected = ["thought", "action", "observation", "response", "state"];
   assert.deepEqual(pi.map((e) => e.type), expected, "Pi type sequence");
   assert.deepEqual(claude.map((e) => e.type), expected, "Claude type sequence");
-  assert.deepEqual(codex.map((e) => e.type), expected, "Codex type sequence");
 
-  // The discriminating fields line up across all three envelopes.
-  for (const events of [pi, claude, codex]) {
+  // The discriminating fields line up across both envelopes.
+  for (const events of [pi, claude]) {
     const thought = events[0] as Extract<TraceEvent, { type: "thought" }>;
     assert.equal(thought.subtype, "reasoning_text");
     assert.equal(thought.text, "Plan: run the tests.");
@@ -125,7 +102,6 @@ test("ACCEPTANCE: a Pi event stream maps to the SAME envelope sequence as Claude
     for (const e of events) assert.ok(validateEvent(e), `schema: ${JSON.stringify(validateEvent.errors)}`);
   }
 
-  // Pi and Claude carry the full cache-creation counter; Codex's SDK has no cache-write field.
   const piState = pi[4] as Extract<TraceEvent, { type: "state" }>;
   const claudeState = claude[4] as Extract<TraceEvent, { type: "state" }>;
   assert.deepEqual(piState.usage, { input: 10, output: 5, cacheRead: 2, cacheCreate: 1 });
