@@ -14,7 +14,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@dahrk/contracts": "^0.3.0",
+    "@dahrk/contracts": "^0.4.0",
     "@dahrk/executor-worktree": "workspace:*",
     "pino": "^10.3.1",
     "ws": "^8.18.0"

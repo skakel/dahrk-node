@@ -288,15 +288,11 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
   // row; we ack even a cancel for a job we no longer run (finished/unknown) - a harmless no-op that still
   // settles the row. We retain the ack per job and re-send it on every (re)connect, so a hub that rolled
   // mid-cancel still settles the row (idempotent: `ackDispatch` on the hub is a no-op on an acked row).
-  // Bounded exactly like `lastResults`.
-  //
-  // Forward-compat shim until the `@dahrk/contracts` bump (harness DHK-421 publishes `cancel-ack` in the
-  // `EdgeToHub` union at 0.4.0). `encode` on the wire is a plain `JSON.stringify`, so the extra member
-  // rides through intact even though the published 0.3.0 type omits it - mirrors the `PushMode` shim in
-  // `stage-runner.ts`. Drop the cast and bump the dependency once 0.4.0 is released.
+  // Bounded exactly like `lastResults`. `cancel-ack` is part of the `EdgeToHub` union as of
+  // `@dahrk/contracts@0.4.0` (harness DHK-421).
   const ackedCancels = new Map<string, EdgeToHub>();
   const ackCancel = (jobId: string): void => {
-    const frame = { type: "cancel-ack", jobId } as unknown as EdgeToHub;
+    const frame: EdgeToHub = { type: "cancel-ack", jobId };
     ackedCancels.delete(jobId); // re-key to most-recent insertion order
     ackedCancels.set(jobId, frame);
     if (ackedCancels.size > MAX_RESEND) {

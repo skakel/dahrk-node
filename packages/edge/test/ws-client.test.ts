@@ -195,13 +195,9 @@ test("a hub that stops answering pings is terminated and reconnected, not left a
 
 // --- cancel is a durable, acked ledger item (DHK-421) ---------------------------------------------
 
-/** Cancel-ack frames the hub received, filtered off the untyped inbound list (the published 0.3.0
- *  `EdgeToHub` type predates `cancel-ack`, so this rides through as an extra JSON member). */
-const cancelAcks = (inbound: EdgeToHub[]): Array<{ type: string; jobId: string }> =>
-  inbound.filter((m) => (m as { type?: string }).type === "cancel-ack") as unknown as Array<{
-    type: string;
-    jobId: string;
-  }>;
+/** Cancel-ack frames the hub received (DHK-421, `@dahrk/contracts@0.4.0`). */
+const cancelAcks = (inbound: EdgeToHub[]): Array<Extract<EdgeToHub, { type: "cancel-ack" }>> =>
+  inbound.filter((m): m is Extract<EdgeToHub, { type: "cancel-ack" }> => m.type === "cancel-ack");
 
 test("a cancel frame is acknowledged, even for a job the node is not running (a harmless settle)", async () => {
   await withEdge(async (ctx) => {
