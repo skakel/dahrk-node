@@ -339,6 +339,140 @@ test("a stage that exceeds its timeout is killed and marked `timeout` (job.timeo
   }
 });
 
+test("a batch stage that streams no output for `stallMs` is cancelled and marked `timeout` (stall watchdog)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dahrk-sr-stall-"));
+  const repo = join(root, "repo");
+  execFileSync("mkdir", ["-p", repo]);
+  initRepo(repo);
+
+  const sink: TraceSink = {
+    event: () => undefined,
+    finalised: () => undefined,
+    requestBlobUrl: async (req) => ({ key: `k/${req.sha256}` }),
+  };
+
+  // A runner that hangs producing no trace at all - the orphaned-subprocess case. With no wall clock
+  // (job.timeout absent), only the batch output-idle watchdog can end it: it fires cancel() after
+  // `stallMs` of silence, and the stage is reported `timeout` with a distinct `stalled` summary.
+  const makeSilentRunner = (runtime: Runner["runtime"]): Runner => {
+    let release: (() => void) | undefined;
+    const aborted = new Promise<void>((r) => (release = r));
+    return {
+      runtime,
+      async runBatch() {
+        await aborted;
+        return { status: "fail" };
+      },
+      async runInteractive() {
+        await aborted;
+        return { status: "fail" };
+      },
+      async summarise() {
+        return "n/a";
+      },
+      async cancel() {
+        release?.();
+      },
+    };
+  };
+
+  const runner = createStageRunner({
+    gitService: createGitService({ worktreesDir: join(root, "wt"), mirrorsDir: join(root, "mir") }),
+    makeRunner: makeSilentRunner,
+    rules: [],
+    sendProgress: () => undefined,
+    trace: sink,
+  });
+
+  const job: JobRequest = {
+    tenantId: "t_default",
+    runId: "run-sr-stall",
+    stageId: "build",
+    jobId: "job-sr-stall-1",
+    awakeableId: "awk-stall",
+    executorType: "worktree",
+    agentConfig: { runtime: "claude-code", interaction: "batch", tools: ["shell"] },
+    workspaceRef: { repoId: "repo", gitUrl: repo, repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
+    // No `timeout`: the wall clock is opt-in and absent here, so the stall watchdog is the only guard.
+  };
+
+  const prev = process.env.DAHRK_BATCH_STALL_MS;
+  process.env.DAHRK_BATCH_STALL_MS = "50"; // 50ms of silence -> stall
+  try {
+    const result = await runner.runJob(job);
+    assert.equal(result.status, "timeout", "a silent batch stage is cancelled by the stall watchdog");
+    assert.match(result.summary ?? "", /stalled \(no output for/, "the summary marks it a stall, not a plain timeout");
+  } finally {
+    if (prev === undefined) delete process.env.DAHRK_BATCH_STALL_MS;
+    else process.env.DAHRK_BATCH_STALL_MS = prev;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a batch stage that keeps streaming resets the stall watchdog and is never cancelled", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dahrk-sr-nostall-"));
+  const repo = join(root, "repo");
+  execFileSync("mkdir", ["-p", repo]);
+  initRepo(repo);
+
+  const sink: TraceSink = {
+    event: () => undefined,
+    finalised: () => undefined,
+    requestBlobUrl: async (req) => ({ key: `k/${req.sha256}` }),
+  };
+
+  // A runner that streams a `thought` every 20ms for ~200ms, then finishes ok. Every event bumps the
+  // 50ms watchdog, so no single gap exceeds the window and the stage is never cancelled - proving an
+  // actively-working batch stage outlives a stall window many times its own length.
+  const makeStreamingRunner = (runtime: Runner["runtime"]): Runner => ({
+    runtime,
+    async runBatch(_ctx: RunnerContext, onTrace: (event: TraceEvent) => void) {
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        onTrace({ seq: i, ts: new Date().toISOString(), type: "thought", runtime, text: `tick ${i}` });
+      }
+      return { status: "ok" };
+    },
+    async runInteractive() {
+      return { status: "ok" };
+    },
+    async summarise() {
+      return "done";
+    },
+    async cancel() {},
+  });
+
+  const runner = createStageRunner({
+    gitService: createGitService({ worktreesDir: join(root, "wt"), mirrorsDir: join(root, "mir") }),
+    makeRunner: makeStreamingRunner,
+    rules: [],
+    sendProgress: () => undefined,
+    trace: sink,
+  });
+
+  const job: JobRequest = {
+    tenantId: "t_default",
+    runId: "run-sr-nostall",
+    stageId: "build",
+    jobId: "job-sr-nostall-1",
+    awakeableId: "awk-nostall",
+    executorType: "worktree",
+    agentConfig: { runtime: "claude-code", interaction: "batch", tools: ["shell"] },
+    workspaceRef: { repoId: "repo", gitUrl: repo, repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
+  };
+
+  const prev = process.env.DAHRK_BATCH_STALL_MS;
+  process.env.DAHRK_BATCH_STALL_MS = "50"; // shorter than the total run, longer than each 20ms gap
+  try {
+    const result = await runner.runJob(job);
+    assert.equal(result.status, "ok", "a continuously-streaming batch stage is never cancelled by the watchdog");
+  } finally {
+    if (prev === undefined) delete process.env.DAHRK_BATCH_STALL_MS;
+    else process.env.DAHRK_BATCH_STALL_MS = prev;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the Job's runtimeEnv is threaded onto the runner ctx (injection boundary)", async () => {
   const root = mkdtempSync(join(tmpdir(), "dahrk-sr-rtenv-"));
   const repo = join(root, "repo");
