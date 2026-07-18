@@ -6,6 +6,15 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A pinned component is no longer written into a worktree the runtime cannot read.** The component
+  overlay only special-cased Codex for warn-and-skip, so any other non-Claude runtime (for instance
+  Pi) fell through and had Claude-convention `.claude/` files written into its worktree that it never
+  reads, with no warning - the component was silently absent. The overlay now materialises files only
+  for the Claude runtime, which owns the `.claude/` surface, and emits a warning naming the skipped
+  component for every other runtime.
+
 ## [0.1.20] - 2026-07-18
 
 ### Added

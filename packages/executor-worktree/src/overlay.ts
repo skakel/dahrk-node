@@ -9,9 +9,11 @@
  *  - Claude (`claude-code`): write the files under `.claude/`, with REPO-LOCAL PRECEDENCE - if the
  *    repo already ships a file at the same path, keep the repo's and skip the central one (never
  *    clobber a repo file). Idempotent: re-overlaying identical bytes is a no-op.
- *  - Codex: no skills/commands/agents surface, so write nothing and record a warning per component
- *    (inline into the prompt or use Claude). The warn-and-skip contract is defined and traced now;
- *    prompt-inlining for Codex is a follow-up.
+ *  - Every other runtime (Codex, Pi, ...): no `.claude/` skills/commands/agents surface, so write
+ *    nothing and record a warning per component (inline into the prompt or use Claude). The
+ *    manifest bakes Claude-convention `.claude/` paths (see {@link PackCache}), so there is nothing
+ *    to reshape for these runtimes; the only correct action is warn-and-skip. The contract is
+ *    defined and traced now; per-adapter projection / prompt-inlining is a follow-up (DHK-172).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -24,7 +26,7 @@ export interface OverlayResult {
   written: string[];
   /** Worktree-relative paths skipped because the repo already ships its own (repo-local precedence). */
   skippedRepoLocal: string[];
-  /** Human-readable notes (e.g. Codex runtime cannot materialise a component). */
+  /** Human-readable notes (e.g. a non-Claude runtime cannot materialise a component). */
   warnings: string[];
 }
 
@@ -49,9 +51,12 @@ export async function overlayComponents(opts: OverlayOptions): Promise<OverlayRe
   const result: OverlayResult = { written: [], skippedRepoLocal: [], warnings: [] };
 
   for (const ref of components) {
-    if (runtime === "codex") {
+    // Only Claude has a `.claude/` component surface the runner reads. Every other runtime
+    // (Codex, Pi, ...) would get files it never looks at, so warn-and-skip and name the component
+    // rather than write it silently.
+    if (runtime !== "claude-code") {
       result.warnings.push(
-        `codex runtime: ${ref.kind} \`${ref.name}@${ref.version}\` not materialised; inline into the prompt or use Claude`,
+        `${runtime} runtime: ${ref.kind} \`${ref.name}@${ref.version}\` not materialised; inline into the prompt or use Claude`,
       );
       continue;
     }
