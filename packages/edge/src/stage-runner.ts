@@ -923,15 +923,14 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // read defensively until the contract republishes) or env `DAHRK_BATCH_STALL_MS`; default 300s.
         let stalled = false;
         let stallTimer: ReturnType<typeof setTimeout> | undefined;
-        const stallMs = interactive
-          ? 0
-          : Math.max(
-              0,
-              Math.floor(
-                (agentConfig as { stallMs?: number }).stallMs ??
-                  Number(process.env.DAHRK_BATCH_STALL_MS ?? process.env.SKAKEL_BATCH_STALL_MS ?? 300_000),
-              ),
-            );
+        // Stall window source: the stage's `stall_seconds` (surfaced as agentConfig.stallMs), else the
+        // env override, else 300s. Sanitised (clamp to a non-negative integer) exactly as killMs above;
+        // interactive stages opt out with 0. Reading env has no side effects, so computing the source
+        // unconditionally is equivalent to the old interactive-short-circuit.
+        const stallSource =
+          (agentConfig as { stallMs?: number }).stallMs ??
+          Number(process.env.DAHRK_BATCH_STALL_MS ?? process.env.SKAKEL_BATCH_STALL_MS ?? 300_000);
+        const stallMs = interactive ? 0 : Math.max(0, Math.floor(stallSource));
         if (stallMs > 0) {
           bumpStall = (): void => {
             if (stallTimer) clearTimeout(stallTimer);
