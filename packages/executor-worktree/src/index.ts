@@ -18,6 +18,7 @@ import type { Runner } from "@dahrk/contracts";
 import { createMockRunner } from "./mock-runner.js";
 import { createClaudeRunner } from "./claude-adapter.js";
 import { createPiRunner } from "./pi-adapter.js";
+import { createIsolatedPiRunner } from "./pi-container.js";
 
 /** GitService - worktree lifecycle and base-branch resolution (M3). */
 export {
@@ -78,9 +79,20 @@ export type { ContainerPiSessionOpts } from "./pi-container.js";
  * Construct the runner for a runtime. Defaults to the real adapters; `DAHRK_RUNNER=mock`
  * selects the deterministic, credential-free mock (set by the offline hub harness so its
  * scenarios stay green without Claude/Pi auth).
+ *
+ * A managed node that requires container isolation sets `DAHRK_PI_ISOLATION=container` to run
+ * each Pi stage in a fresh per-job Docker container (`pi --mode rpc`) instead of the embedded
+ * in-process session. Known degradation on that path: `PiRpcSession` has no `agent` handle, so
+ * `summarise`'s tool-denial is a no-op there (see `pi-rpc-client.ts`); meta-loop stages are
+ * telemetry-only, so this is accepted.
  */
 export function makeRunner(runtime: Runner["runtime"]): Runner {
   if ((process.env.DAHRK_RUNNER ?? process.env.SKAKEL_RUNNER ?? "real") === "mock") return createMockRunner(runtime);
-  if (runtime === "pi") return createPiRunner();
+  if (runtime === "pi") return piContainerIsolationRequired() ? createIsolatedPiRunner() : createPiRunner();
   return createClaudeRunner();
+}
+
+/** Whether Pi stages must run container-isolated; a managed node sets `DAHRK_PI_ISOLATION=container`. */
+function piContainerIsolationRequired(): boolean {
+  return (process.env.DAHRK_PI_ISOLATION ?? process.env.SKAKEL_PI_ISOLATION) === "container";
 }
