@@ -8,6 +8,16 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- **A Pi stage can now run against any provider a selected auth profile names, not just Anthropic,
+  OpenAI, or Google.** The Pi runtime used to recognise a fixed four-key table, so a brokered
+  OpenRouter, Kimi, Mistral, or Groq key was ignored and a subscription login (ChatGPT/Codex, GitHub
+  Copilot, Gemini) could not be attached at all. Provider identity now comes from the auth profile the
+  run selects: an API-key provider is applied as a runtime override (and, where Pi ships no built-in
+  for it, reached through a custom endpoint from the profile), and an OAuth-subscription provider is
+  attached from the profile's token material. Each stage resolves its providers into a private,
+  per-stage config that is created fresh and removed when the stage settles, so nothing leaks between
+  stages and no machine-global Pi config is inherited. The raw key is never exposed to the agent's own
+  tool calls.
 - **A Pi stage now enforces tool policy before a tool runs, not just after.** Previously only a Claude
   stage had a pre-execution guardrail; a Pi stage's sole check was the post-hoc re-evaluation of the
   trace, which could hard-fail a filesystem-confinement escape only after the command had already run.
