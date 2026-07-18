@@ -258,7 +258,10 @@ function sanitizeNotes(text) {
 // Draft a Keep-a-Changelog section from the commit log using claude-opus-4-8. Falls back to the raw
 // commit list if --no-ai, no SDK/key, or a refusal.
 async function draftSection(unreleasedFallback) {
-  const range = prevTag ? `${prevTag}..HEAD` : 'HEAD'
+  // Use the tag range only if the tag actually exists. On a release branch the [Unreleased] section is
+  // already rolled into a dated heading, so prevTag resolves to the version being released - a tag not
+  // created until merge. Fall back to full history rather than crashing on an unknown revision.
+  const range = prevTag && gitOk('rev-parse', '--verify', '--quiet', `${prevTag}^{commit}`) ? `${prevTag}..HEAD` : 'HEAD'
   // Subjects only (no `%b` bodies) — bodies carry trailers, internal `run-…` IDs, and tracker keys we
   // don't want in public notes. Subjects keep the human summary + the `(#N)` GitHub ref.
   const log = git('log', '--no-merges', `--pretty=format:- %s`, range).trim()

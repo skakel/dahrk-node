@@ -6,9 +6,11 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-07-18
+
 ### Added
 
-- **`install.sh` installs the client and enrols the node in one copy-paste.** The curl one-liner the
+- **`install.sh` installs the client and enrols the node in one copy-paste.** (#78) The curl one-liner the
   docs and dashboard advertise now exists in the repo and is served at `https://dahrk.ai/install.sh`.
   Passed a connect token - `curl -fsSL https://dahrk.ai/install.sh | sh -s -- --token <token>`, or the
   `DAHRK_TOKEN` environment variable - it installs `dahrk-node` from npm, preflights the token with
@@ -20,10 +22,10 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   missing or too-old Node fails loudly. Re-running on an already-enrolled machine re-attaches as the
   same node rather than creating a duplicate. `--hub-url` / `DAHRK_HUB_URL` override the hub for
   self-hosters.
-- **`dahrk start --no-service` enrols without installing the always-on service.** For a node you
+- **`dahrk start --no-service` enrols without installing the always-on service.** (#78) For a node you
   supervise yourself (a container, pm2, your own unit), it caches the enrolment token and returns
   without registering the launchd / systemd service. `install.sh --no-service` forwards to it.
-- **`dahrk repo add` registers the current repository with the hub, from the client side.** Run it from
+- **`dahrk repo add` registers the current repository with the hub, from the client side.** (#74) Run it from
   inside a repo - `cd your-repo && dahrk repo add` - and the node reads the `origin` remote and the current
   branch itself, so the git URL and default branch are derived from the working directory and you are never
   asked to paste a URL. The URL is registered in the form the host can authenticate: an HTTPS origin is kept
@@ -699,7 +701,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/dahrkai/dahrk-node/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/dahrkai/dahrk-node/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/dahrkai/dahrk-node/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/dahrkai/dahrk-node/compare/v0.1.16...v0.1.17
