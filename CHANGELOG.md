@@ -8,6 +8,15 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- **Batch output-idle watchdog: a hung batch stage is cancelled instead of running forever.** A batch
+  stage (build, plan, test) now cancels its runner if it streams no output - no assistant text, tool
+  call, or tool result - for a stall window, defaulting to 300s and overridable per stage
+  (`stall_seconds`) or via `DAHRK_BATCH_STALL_MS`. Every streamed event resets the timer, so an
+  actively-working stage runs unbounded; only a genuinely stalled one (an orphaned subprocess, a
+  runtime that stopped streaming) is stopped, reported as `timeout` with a `stalled (no output for Ns)`
+  summary. This is the guard that replaces the removed default 30-minute wall clock: with the stage
+  wall clock now opt-in, batch stages had no automatic guard of their own. Interactive stages keep
+  their existing per-turn idle timer.
 - **A Pi stage can now run against any provider a selected auth profile names, not just Anthropic,
   OpenAI, or Google.** The Pi runtime used to recognise a fixed four-key table, so a brokered
   OpenRouter, Kimi, Mistral, or Groq key was ignored and a subscription login (ChatGPT/Codex, GitHub
