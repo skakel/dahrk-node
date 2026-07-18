@@ -403,6 +403,17 @@ export function resolveStageArtifact(
   return undefined;
 }
 
+/**
+ * Whether a runtime consumes brokered MCP servers through the node-local gateway proxy, and so needs
+ * the gateway started for a stage that declares them (DHK-507). True for Claude (SDK-native MCP) and
+ * Pi (its extension bridge, `createBrokeredMcpExtension`); false for Codex, whose SDK has no MCP - a
+ * proxy for it would be dead weight. Pure + exported so the gate is unit-testable without standing up
+ * the whole stage runner (`startMcpGateway` binds a real socket).
+ */
+export function runtimeUsesMcpGateway(runtime: Runner["runtime"]): boolean {
+  return runtime === "claude-code" || runtime === "pi";
+}
+
 export function createStageRunner(deps: StageRunnerDeps): StageRunner {
   const worktrees = new Map<string, WorkspaceRef>();
   /** Silent by default so an embedder (and every existing test) sees no new output. */
@@ -835,11 +846,13 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           if (event.type !== "state") deps.sendProgress({ jobId, kind: event.type, ts: event.ts, ...previewOf(event) });
         };
 
-        // Start the per-stage MCP gateway when the stage declares brokered MCP servers. Claude only:
-        // the Codex SDK has no MCP support, so a proxy for it would be dead weight (the codex adapter
-        // logs and ignores declared servers).
+        // Start the per-stage MCP gateway when the stage declares brokered MCP servers, for every
+        // runtime that can route MCP through it: Claude (SDK-native) and Pi (its extension bridge,
+        // DHK-507). Codex is excluded - its SDK has no MCP, so a proxy would be dead weight (the codex
+        // adapter logs and ignores declared servers). The gateway holds the token and injects it
+        // upstream, so the agent never sees the raw secret (`mcpProxyBaseUrl` seam) regardless of runtime.
         const mcpServers = agentConfig.mcpServers;
-        if (mcpServers && mcpServers.length > 0 && runtime === "claude-code") {
+        if (mcpServers && mcpServers.length > 0 && runtimeUsesMcpGateway(runtime)) {
           gateway = await startMcpGateway({ servers: mcpServers, creds: job.brokeredCreds ?? {} });
         }
 

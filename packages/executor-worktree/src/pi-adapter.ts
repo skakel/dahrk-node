@@ -158,6 +158,83 @@ function registerToolCallGate(s: PiSessionLike, ctx: RunnerContext): void {
   s.setToolCallGate?.((toolName, input) => piToolCallDecision(policyCtx, toolName, input));
 }
 
+/** One brokered MCP server as the Pi extension consumes it: transport + the node-local proxy url the
+ *  agent connects to. Never carries the raw upstream url or the token - both live only in the gateway. */
+export interface BrokeredPiMcpServer {
+  type: "http" | "sse";
+  url: string;
+}
+
+/**
+ * Brokered MCP servers for Pi (DHK-507): point each declared server at the node's gateway proxy
+ * (`${proxyBaseUrl}/<id>`), which holds the token and injects it upstream - the agent never sees the
+ * raw secret. The direct analogue of the Claude adapter's `buildBrokeredMcpServers`, minus the SDK
+ * `Options` cast (Pi has no native `mcpServers`; the extension below consumes this map). Returns
+ * undefined when the stage declares none (or the proxy is absent), so the no-MCP Pi session is
+ * unchanged. Module-level + pure so it is unit-testable without the live SDK.
+ */
+export function buildBrokeredPiMcpServers(ctx: RunnerContext): Record<string, BrokeredPiMcpServer> | undefined {
+  const servers = ctx.config.mcpServers;
+  if (!servers || servers.length === 0 || !ctx.mcpProxyBaseUrl) return undefined;
+  const entries: Record<string, BrokeredPiMcpServer> = {};
+  for (const s of servers) entries[s.id] = { type: s.type, url: `${ctx.mcpProxyBaseUrl}/${s.id}` };
+  return entries;
+}
+
+/**
+ * The brokered-MCP bridge extension (DHK-507). Pi 0.80.6 has no native MCP; the seam is an extension
+ * whose factory acts as an MCP client. `createAgentSession` awaits every extension factory before
+ * startup, so the factory can connect -> list -> register synchronously with respect to the session:
+ * for each brokered server it opens an MCP `Client` over Streamable HTTP to the node-local proxy url
+ * (`http://127.0.0.1:<port>/<id>` - never the real upstream, never the token), lists the server's
+ * tools, and registers each as a Pi tool via `pi.registerTool`. The tool's `execute` proxies to
+ * `client.callTool`, so a Pi turn calls a brokered tool like any other and the gateway injects the
+ * bearer upstream. A per-server connect/list failure is caught so one bad server contributes no tools
+ * without crashing the session (a stage's non-MCP work still runs). The MCP SDK is dynamic-imported so
+ * only a stage that actually declares brokered servers loads it. `pi` is typed `any` (the extension
+ * API is resolved at runtime, matching `toolGateExtension`).
+ */
+export function createBrokeredMcpExtension(servers: Record<string, BrokeredPiMcpServer>): {
+  name: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  factory: (pi: any) => Promise<void>;
+} {
+  return {
+    name: "dahrk-brokered-mcp",
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    factory: async (pi: any) => {
+      const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+      const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+      for (const [id, server] of Object.entries(servers)) {
+        try {
+          const client = new Client({ name: `dahrk-${id}`, version: "0.1.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+          const { tools } = await client.listTools();
+          for (const tool of tools) {
+            pi.registerTool({
+              name: tool.name,
+              label: tool.name,
+              description: tool.description ?? "",
+              // The MCP inputSchema is a JSON-schema object; Pi validates against it at runtime (its
+              // custom tools use the same plain-object shape - see the injected tools above).
+              parameters: tool.inputSchema,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              execute: async (_toolCallId: string, params: any) => {
+                const result = await client.callTool({ name: tool.name, arguments: params ?? {} });
+                // MCP's `{ content: [...] }` maps straight onto Pi's `AgentToolResult` (content + details).
+                return { content: result.content, details: {} };
+              },
+            });
+          }
+        } catch {
+          // A server whose connect/list fails contributes no tools rather than throwing out of the
+          // factory (which would abort session startup). The token never enters scope regardless.
+        }
+      }
+    },
+  };
+}
+
 /** Builds a fresh Pi session bound to the stage's worktree and brokered inference creds. */
 export type PiSessionFactory = (ctx: RunnerContext) => Promise<PiSessionLike>;
 
@@ -591,11 +668,19 @@ async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike
   const cwd = ctx.workspace.worktreePath;
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
+  // Brokered MCP (DHK-507): when the stage declares MCP servers and the node started its gateway
+  // proxy (`mcpProxyBaseUrl`), add the bridge extension that registers each brokered server's tools,
+  // routed through `127.0.0.1/<id>`. Absent -> only `toolGateExtension`, so the no-MCP session is
+  // byte-for-byte unchanged.
+  const brokeredMcp = buildBrokeredPiMcpServers(ctx);
+  const extensionFactories = brokeredMcp
+    ? [toolGateExtension, createBrokeredMcpExtension(brokeredMcp)]
+    : [toolGateExtension];
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
     settingsManager,
-    extensionFactories: [toolGateExtension],
+    extensionFactories,
   });
   await resourceLoader.reload();
 

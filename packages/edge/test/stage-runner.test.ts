@@ -13,7 +13,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JobProgress, JobRequest, PushJob, Runner, RunnerContext, TraceEvent, TraceMeta } from "@dahrk/contracts";
 import { createGitService, createMockRunner } from "@dahrk/executor-worktree";
-import { createStageRunner, resolveStageArtifact, type BlobPutRequestArgs, type TraceSink } from "../src/stage-runner.js";
+import {
+  createStageRunner,
+  resolveStageArtifact,
+  runtimeUsesMcpGateway,
+  type BlobPutRequestArgs,
+  type TraceSink,
+} from "../src/stage-runner.js";
 
 function initRepo(dir: string): void {
   const git = (...args: string[]): void => void execFileSync("git", args, { cwd: dir, stdio: "ignore" });
@@ -840,4 +846,13 @@ test("action and observation progress frames carry a shared toolUseId through a 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("the node MCP gateway starts for both brokered-MCP runtimes (claude-code and pi), not codex (DHK-507)", () => {
+  // The gateway holds the brokered token and injects it upstream; a runtime with no MCP client can
+  // never route through it. Claude consumes brokered MCP via the SDK, Pi via its extension bridge;
+  // Codex has no MCP in its SDK, so a proxy for it would be dead weight.
+  assert.equal(runtimeUsesMcpGateway("claude-code"), true);
+  assert.equal(runtimeUsesMcpGateway("pi"), true);
+  assert.equal(runtimeUsesMcpGateway("codex"), false);
 });

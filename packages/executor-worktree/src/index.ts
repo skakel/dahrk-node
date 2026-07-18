@@ -69,8 +69,8 @@ export { createMockRunner } from "./mock-runner.js";
 /** The real runner adapters (M4): thin wrappers over the Claude Agent SDK and Pi. */
 export { createClaudeRunner } from "./claude-adapter.js";
 /** The Pi runtime adapter: the model-agnostic runtime for the managed node. */
-export { createPiRunner, PI_STAGE_COMPLETE_TOOL } from "./pi-adapter.js";
-export type { PiSessionLike, PiSessionFactory, PiRunnerDeps } from "./pi-adapter.js";
+export { createPiRunner, PI_STAGE_COMPLETE_TOOL, buildBrokeredPiMcpServers, createBrokeredMcpExtension } from "./pi-adapter.js";
+export type { PiSessionLike, PiSessionFactory, PiRunnerDeps, BrokeredPiMcpServer } from "./pi-adapter.js";
 /** Container Pi session factory + isolated runner: Docker isolation seam. */
 export { createContainerPiSession, createIsolatedPiRunner } from "./pi-container.js";
 export type { ContainerPiSessionOpts } from "./pi-container.js";

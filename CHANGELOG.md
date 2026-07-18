@@ -43,6 +43,14 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   questions is asked one at a time and an unanswered question, a cancelled stage, or a second question
   raised while one is still open all behave exactly as they do for Claude.
 
+- **A Pi stage can now use brokered MCP servers, routed through the node's gateway proxy.** Previously
+  a stage that declared MCP servers got them only on the Claude runtime; a Pi stage ignored them
+  entirely. A Pi stage now reaches each declared brokered server through the same node-local gateway
+  proxy the Claude path uses: the node holds the credential and injects it upstream, and the Pi agent
+  only ever talks to `127.0.0.1`, so the raw token never reaches the agent. The remote server's tools
+  appear to the Pi model as ordinary tools. Only remote (`http`) brokered servers are wired; a stage
+  that declares no MCP servers is unchanged.
+
 - **A managed node can now run a Pi stage container-isolated.** Setting `DAHRK_PI_ISOLATION=container`
   makes the node run each Pi stage in a fresh per-job Docker container (`pi --mode rpc`) instead of the
   embedded in-process session; without it the node keeps using the embedded path. The container image

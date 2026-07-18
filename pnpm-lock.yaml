@@ -64,12 +64,18 @@ importers:
         specifier: ^8.18.0
         version: 8.21.0
     devDependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: 1.29.0
+        version: 1.29.0(zod@3.25.76)
       '@types/ws':
         specifier: ^8.5.12
         version: 8.18.1
       tsx:
         specifier: ^4.19.0
         version: 4.22.5
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
 
   packages/executor-worktree:
     dependencies:
@@ -82,6 +88,9 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: 0.80.6
         version: 0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))(ws@8.21.0)(zod@3.25.76)
+      '@modelcontextprotocol/sdk':
+        specifier: 1.29.0
+        version: 1.29.0(zod@3.25.76)
       zod:
         specifier: ^3.23.8
         version: 3.25.76
