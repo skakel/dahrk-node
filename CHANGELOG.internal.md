@@ -39,6 +39,16 @@ this file is left verbatim.
   unset the step is skipped and the page can be refreshed by hand
   (`gh workflow run deploy.yml --repo dahrkai/dahrk-web`).
 
+### Fixed
+
+- **`scripts/release.mjs`: the commit-log range no longer crashes on a not-yet-created tag.** The
+  `smoke-release-script` guard (DHK-393) runs the script in dry-run on every PR, including the release
+  PR itself - where `[Unreleased]` is already rolled into a dated heading, so `prevTag` resolves to the
+  version being released, a tag not created until merge. `draftSection` ran `git log v<version>..HEAD`
+  against that missing revision and exited 128. The range now uses the tag only when
+  `git rev-parse --verify` confirms it exists, falling back to full history otherwise. No effect on a
+  real release (which always carries hand-written `[Unreleased]` notes and never enters `draftSection`).
+
 ### Changed
 
 - **`GitService`: fold the repeated brokered-or-ambient credential setup into one `resolveRemoteAuth`
