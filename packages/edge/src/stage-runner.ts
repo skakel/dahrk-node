@@ -807,7 +807,12 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           }
           return verdict;
         };
+        // Reset hook for the batch output-idle watchdog (armed below, batch stages only). Every
+        // streamed trace event is a sign of life, so bumping it here keeps an actively-working stage
+        // alive; a no-op until the watchdog is armed.
+        let bumpStall: () => void = () => {};
         const onTrace = (event: TraceEvent): void => {
+          bumpStall();
           if (event.type === "action") {
             const key = actionKey(event.tool, event.input);
             const authorised = authorisedActions.indexOf(key);
@@ -895,6 +900,35 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // timer does not keep the event loop alive, so an otherwise-idle loop could drain before it
         // fires and the kill would never happen. It is always cleared in the `finally` below, so it
         // can never outlive the job.
+        //
+        // Batch output-idle watchdog. A batch stage has no idle timer of its own, and the wall clock is
+        // opt-in (usually absent), so a genuinely hung stage - an orphaned subprocess, a runtime that
+        // stops streaming - would otherwise run forever. Cancel the runner if it emits NO trace event
+        // (assistant text, tool call, tool result) for `stallMs`; `bumpStall` above resets it on every
+        // event, so an actively-working stage is never touched. Batch-only: interactive stages keep
+        // their own per-turn idle timer. Override via the stage's `stall_seconds` (-> agentConfig.stallMs,
+        // read defensively until the contract republishes) or env `DAHRK_BATCH_STALL_MS`; default 300s.
+        let stalled = false;
+        let stallTimer: ReturnType<typeof setTimeout> | undefined;
+        const stallMs = interactive
+          ? 0
+          : Math.max(
+              0,
+              Math.floor(
+                (agentConfig as { stallMs?: number }).stallMs ??
+                  Number(process.env.DAHRK_BATCH_STALL_MS ?? process.env.SKAKEL_BATCH_STALL_MS ?? 300_000),
+              ),
+            );
+        if (stallMs > 0) {
+          bumpStall = (): void => {
+            if (stallTimer) clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+              stalled = true;
+              void runner.cancel();
+            }, stallMs);
+          };
+          bumpStall(); // arm before the first event, so a stage that never streams still trips
+        }
         try {
           if (interactive) {
             const mailbox = new ManagedMailbox<HumanTurn>();
@@ -905,6 +939,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           }
         } finally {
           if (killTimer) clearTimeout(killTimer);
+          if (stallTimer) clearTimeout(stallTimer);
         }
         // A policy deny blocks the individual *action* (already recorded as a policy-deny trace
         // event and streamed as a progress error); the deny-only guards are guardrails the agent
@@ -913,7 +948,10 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // its tool actions was denied. (Previously any deny forced the whole stage to `fail`, so a
         // recovered-from `rm -rf` on a throwaway scratch dir turned a correctly-completed build into
         // a false-negative.) The deny still surfaces in the trace and in the summary note below.
-        let status: JobStatus = timedOut ? "timeout" : result.status;
+        // A wall-clock kill and a batch stall both cancel the runner and surface as `timeout` (the same
+        // status the old default wall clock produced, so the hub folds them identically). They differ
+        // only in the summary below, so a stall is legible in the trace without a new JobStatus variant.
+        let status: JobStatus = timedOut || stalled ? "timeout" : result.status;
 
         // The one deny that DOES kill the stage (DHK-392). On a runtime with no pre-execution hook the
         // confinement breach was detected after the fact: the command already read what it read. That
@@ -942,6 +980,11 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // Interactive stages return their own handoff summary; a batch stage gets the
         // engine-owned summarisation turn (only after success, never failing the stage).
         let summary = result.summary ?? `${stageId}: ${status}`;
+        // A stalled batch stage reports a distinct, legible summary (the runner's own summary is
+        // unreliable after a mid-stream cancel). Prefer it over the generic `<stage>: timeout`.
+        if (stalled && !timedOut) {
+          summary = `${stageId}: stalled (no output for ${Math.round(stallMs / 1000)}s)`;
+        }
         if (!interactive && status === "ok") {
           try {
             summary = await runner.summarise(ctx);
