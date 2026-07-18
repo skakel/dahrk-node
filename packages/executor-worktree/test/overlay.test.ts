@@ -1,6 +1,6 @@
 /**
  * overlay tests: materialise pinned components into the worktree `.claude/` with repo-local
- * precedence (Claude), warn-and-skip for Codex, and idempotency on re-dispatch.
+ * precedence (Claude), warn-and-skip for non-Claude runtimes (Codex, Pi), and idempotency on re-dispatch.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -100,6 +100,25 @@ test("Codex warns and writes nothing", async () => {
   assert.equal(res.written.length, 0);
   assert.equal(res.warnings.length, 1);
   assert.match(res.warnings[0]!, /codex runtime/);
+  assert.equal(existsSync(join(worktree, ".claude/skills/review/SKILL.md")), false);
+});
+
+test("Pi warns and writes nothing (no .claude/ surface)", async () => {
+  const skill = component("skill", "review", ".claude/skills/review/SKILL.md", "central skill");
+  const cache = fixtureCache(skill);
+  const worktree = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+
+  const res = await overlayComponents({
+    worktreePath: worktree,
+    runtime: "pi",
+    components: [skill.ref],
+    cache,
+  });
+
+  assert.equal(res.written.length, 0);
+  assert.equal(res.warnings.length, 1);
+  assert.match(res.warnings[0]!, /pi runtime/);
+  assert.match(res.warnings[0]!, /review/);
   assert.equal(existsSync(join(worktree, ".claude/skills/review/SKILL.md")), false);
 });
 
