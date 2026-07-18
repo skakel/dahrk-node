@@ -42,6 +42,13 @@ this file is left verbatim.
   change: reading env has no side effects, so computing the source unconditionally is equivalent to
   the old interactive short-circuit.
 
+- **Tidy the Pi adapter and its test path (DHK-508).** In `pi-adapter.ts`, `runInteractive` now casts
+  `ctx` to the module's existing `PolicyAwareRunnerContext` (which already declares `emitElicit`)
+  instead of an ad-hoc inline `RunnerContext & { emitElicit? }` that duplicated it, so both the
+  tool-gate and elicit paths reach the ctx through one named shape. Removed a dead unused `here`
+  binding from `pi-adapter.test.ts` and `pi-mappers.test.ts`. Type-only / test-only; no behaviour
+  change (the 202 executor-worktree tests are unchanged and pass).
+
 ### Removed
 
 - **Remove the Codex runtime adapter (DHK-510).** Deleted `codex-adapter.ts`, `codex-mappers.ts`, and

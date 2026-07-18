@@ -374,7 +374,7 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
       // identical result. `emitElicit` (put on the ctx by the stage runner for every runtime) carries
       // the `elicit` wire frame; the preceding trace event is audit-only (the hub maps a trace
       // `elicitation` to null and raises Linear solely from the wire frame, so this does not double-post).
-      const elicitCtx = ctx as RunnerContext & { emitElicit?: (question: ElicitQuestion) => void };
+      const elicitCtx = ctx as PolicyAwareRunnerContext;
       const ask = async (question: ElicitQuestion): Promise<string> => {
         const outcome = await router.ask(awaitingFirstReply, () => {
           emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });

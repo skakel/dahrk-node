@@ -21,7 +21,6 @@ import { consumePiEvent, mapPiEvent, newPiBufferState, type PiEvent } from "../s
 import { consumeClaudeMessage, newBufferState } from "../src/claude-mappers.js";
 import { makeEmit } from "../src/runner-shared.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
 const traceSchema = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.resolve("@dahrk/contracts"))), "..", "schemas", "trace.schema.json"), "utf8"));
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 ajv.addSchema(traceSchema);
