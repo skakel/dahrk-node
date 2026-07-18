@@ -20,7 +20,6 @@ import type { Runtime } from "@dahrk/contracts";
 /** One probe per runtime: the CLI to invoke and the `Runtime` it maps to. */
 const PROBES: ReadonlyArray<{ runtime: Runtime; cmd: string }> = [
   { runtime: "claude-code", cmd: "claude" },
-  { runtime: "codex", cmd: "codex" },
   { runtime: "pi", cmd: "pi" },
 ];
 

@@ -4,7 +4,7 @@
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
-  "description": "The worktree executor: thin runner adapters (Claude Agent SDK, Codex SDK) behind the Runner interface, a vendored GitService for worktree lifecycle, and the trace producer.",
+  "description": "The worktree executor: thin runner adapters (Claude Agent SDK, Pi) behind the Runner interface, a vendored GitService for worktree lifecycle, and the trace producer.",
   "exports": { ".": "./src/index.ts" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -15,7 +15,6 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.183",
     "@earendil-works/pi-coding-agent": "0.80.6",
-    "@openai/codex-sdk": "0.141.0",
     "@dahrk/contracts": "^0.4.0",
     "zod": "^3.23.8"
   },

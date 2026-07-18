@@ -34,7 +34,7 @@ async function withFakeBins(names: string[], fn: () => Promise<void>): Promise<v
 test("advertises only the runtimes whose CLI responds", async () => {
   await withFakeBins(["claude", "pi"], async () => {
     const detected = await detectRuntimes(2000);
-    assert.deepEqual(detected, ["claude-code", "pi"], "claude + pi present, codex absent");
+    assert.deepEqual(detected, ["claude-code", "pi"]);
   });
 });
 
@@ -45,10 +45,10 @@ test("no installed runtimes -> empty set (never a false advertise)", async () =>
   });
 });
 
-test("all three present -> all three, in stable order", async () => {
-  await withFakeBins(["claude", "codex", "pi"], async () => {
+test("both installed -> both, in stable order", async () => {
+  await withFakeBins(["claude", "pi"], async () => {
     const detected = await detectRuntimes(2000);
-    assert.deepEqual(detected, ["claude-code", "codex", "pi"]);
+    assert.deepEqual(detected, ["claude-code", "pi"]);
   });
 });
 
@@ -98,7 +98,7 @@ test("a runtime whose CLI always errors is still not advertised (preserved behav
 
 test("probeRuntimeStatuses reports installed + version, absent runtimes as not-installed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "dahrk-status-"));
-  // A fake `claude` that prints a version; `codex`/`pi` stay absent from the throwaway PATH.
+  // A fake `claude` that prints a version; `pi` stays absent from the throwaway PATH.
   const p = join(dir, "claude");
   writeFileSync(p, '#!/bin/sh\necho "claude 9.9.9"\nexit 0\n');
   chmodSync(p, 0o755);
@@ -113,9 +113,8 @@ test("probeRuntimeStatuses reports installed + version, absent runtimes as not-i
       installed: true,
       version: "claude 9.9.9",
     });
-    assert.equal(byRuntime["codex"]?.installed, false);
     assert.equal(byRuntime["pi"]?.installed, false);
-    assert.equal(byRuntime["codex"]?.version, undefined);
+    assert.equal(byRuntime["pi"]?.version, undefined);
   } finally {
     process.env.PATH = prevPath;
     rmSync(dir, { recursive: true, force: true });

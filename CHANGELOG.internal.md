@@ -19,6 +19,13 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Removed
+
+- **Remove the Codex runtime adapter (DHK-510).** Deleted `codex-adapter.ts`, `codex-mappers.ts`, and
+  their three test files; dropped the `codex` branch from `makeRunner`; removed the `codex --version`
+  probe from `detect-runtimes`; removed `@openai/codex-sdk` from `packages/executor-worktree` and
+  `apps/edge-node`. Pi reaches GPT/Codex models through OpenAI auth, so no model coverage is lost.
+
 ## [0.1.20] - 2026-07-18
 
 ### Added

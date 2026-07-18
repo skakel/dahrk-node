@@ -3,7 +3,7 @@
  *
  * Three things:
  *  1. Runner adapters: thin wrappers over @anthropic-ai/claude-agent-sdk and
- *     @openai/codex-sdk implementing the Runner interface from contracts. Added M4.
+ *     @earendil-works/pi-coding-agent implementing the Runner interface from contracts. Added M4.
  *  2. GitService: VENDORED (copied) from cyrus - worktree create/teardown and
  *     base-branch resolution. Pure git/node logic. Added M3. cyrus-core helpers
  *     are replaced with our own.
@@ -17,7 +17,6 @@
 import type { Runner } from "@dahrk/contracts";
 import { createMockRunner } from "./mock-runner.js";
 import { createClaudeRunner } from "./claude-adapter.js";
-import { createCodexRunner } from "./codex-adapter.js";
 import { createPiRunner } from "./pi-adapter.js";
 
 /** GitService - worktree lifecycle and base-branch resolution (M3). */
@@ -66,9 +65,8 @@ export type { OverlayResult, OverlayOptions } from "./overlay.js";
 
 export { createMockRunner } from "./mock-runner.js";
 
-/** The real runner adapters (M4): thin wrappers over the Claude Agent SDK and Codex SDK. */
+/** The real runner adapters (M4): thin wrappers over the Claude Agent SDK and Pi. */
 export { createClaudeRunner } from "./claude-adapter.js";
-export { createCodexRunner } from "./codex-adapter.js";
 /** The Pi runtime adapter: the model-agnostic runtime for the managed node. */
 export { createPiRunner, PI_STAGE_COMPLETE_TOOL } from "./pi-adapter.js";
 export type { PiSessionLike, PiSessionFactory, PiRunnerDeps } from "./pi-adapter.js";
@@ -79,10 +77,10 @@ export type { ContainerPiSessionOpts } from "./pi-container.js";
 /**
  * Construct the runner for a runtime. Defaults to the real adapters; `DAHRK_RUNNER=mock`
  * selects the deterministic, credential-free mock (set by the offline hub harness so its
- * scenarios stay green without Claude/Codex/Pi auth).
+ * scenarios stay green without Claude/Pi auth).
  */
 export function makeRunner(runtime: Runner["runtime"]): Runner {
   if ((process.env.DAHRK_RUNNER ?? process.env.SKAKEL_RUNNER ?? "real") === "mock") return createMockRunner(runtime);
   if (runtime === "pi") return createPiRunner();
-  return runtime === "codex" ? createCodexRunner() : createClaudeRunner();
+  return createClaudeRunner();
 }
