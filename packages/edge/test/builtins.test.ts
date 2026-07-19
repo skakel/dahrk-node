@@ -102,7 +102,7 @@ test("shell_guard blocks catastrophic rm -rf targets but allows scratch cleanup"
   assert.equal(verdict("rm -rf /tmp/sl340-test /tmp/sl340-test2 /tmp/driver-debug.log"), "allow");
   assert.equal(verdict("cd /tmp && rm -rf sl340-test && git clone -q . sl340-test"), "allow");
   assert.equal(verdict("rm -rf node_modules"), "allow");
-  assert.equal(verdict("rm -rf .skakel/scratch/tmp"), "allow");
+  assert.equal(verdict("rm -rf .dahrk/scratch/tmp"), "allow");
   // A non-recursive rm is never in scope.
   assert.equal(verdict("rm -f somefile"), "allow");
 });
@@ -141,7 +141,7 @@ test("shell_guard allows the safe /dev sinks but still blocks raw device writes"
 
   // The common stderr-suppression idiom (and other safe sinks) must not be denied -
   // regression for the `2>/dev/null` false positive that failed whole stages.
-  assert.equal(verdict("ls .skakel/scratch/ 2>/dev/null"), "allow");
+  assert.equal(verdict("ls .dahrk/scratch/ 2>/dev/null"), "allow");
   assert.equal(verdict("cat package.json 2>/dev/null && ls -R src 2>/dev/null"), "allow");
   assert.equal(verdict("node --test 2>&1 | tail"), "allow");
   assert.equal(verdict("echo hi > /dev/stdout"), "allow");

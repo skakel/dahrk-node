@@ -23,7 +23,7 @@ const workspace = (worktreePath: string): WorkspaceRef => ({
   repo: "sample-repo",
   baseBranch: "main",
   worktreePath,
-  scratchPath: join(worktreePath, ".skakel", "scratch"),
+  scratchPath: join(worktreePath, ".dahrk", "scratch"),
 });
 
 const ctxOf = (worktreePath: string, config: RunnerContext["config"], issueContext?: string): RunnerContext => ({
@@ -227,7 +227,7 @@ test("attached documents are appended as a <documents> block with a scratch-file
   );
   assert.match(out, /<documents>/);
   assert.match(out, /title="The Plan"/);
-  assert.match(out, /file=".skakel\/scratch\/docs\/abc123\.md"/);
+  assert.match(out, /file=".dahrk\/scratch\/docs\/abc123\.md"/);
   assert.match(out, /step one/);
   // The instruction still trails the preamble.
   assert.ok(out.trimEnd().endsWith("do it"));
@@ -247,7 +247,7 @@ test("a document longer than the cap is truncated with a pointer to the full fil
   const out = resolveStagePrompt(
     docCtx(dir, [{ id: "d1", slug: "s1", title: "Big", url: "u", content: big }]),
   );
-  assert.match(out, /\.\.\.\(truncated; full text at \.skakel\/scratch\/docs\/s1\.md\)/);
+  assert.match(out, /\.\.\.\(truncated; full text at \.dahrk\/scratch\/docs\/s1\.md\)/);
   // The inlined excerpt is capped, not the full body.
   assert.ok(out.length < big.length + 500);
 });
@@ -296,6 +296,6 @@ test("the prompt's scratch-file pointer matches the edge's sanitised basename", 
   const out = resolveStagePrompt(
     docCtx(dir, [{ id: "d", slug: "../evil id!", title: "T", url: "u", content: "body" }]),
   );
-  assert.match(out, /file=".skakel\/scratch\/docs\/evil-id-\.md"/);
+  assert.match(out, /file=".dahrk\/scratch\/docs\/evil-id-\.md"/);
   assert.doesNotMatch(out, /\.\.\//);
 });

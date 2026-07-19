@@ -18,7 +18,7 @@ const ctx = (): RunnerContext =>
       repo: "dahrk-node",
       baseBranch: "main",
       worktreePath: "/tmp/wt",
-      scratchPath: "/tmp/wt/.skakel/scratch",
+      scratchPath: "/tmp/wt/.dahrk/scratch",
     },
   }) as RunnerContext;
 
@@ -38,7 +38,7 @@ test("DAHRK_SANDBOX=1 confines writes to the run, and never auto-approves Bash",
     assert.equal(sandbox.failIfUnavailable, false);
     // Auto-approving Bash would bypass the very canUseTool hook our block lives on.
     assert.equal(sandbox.autoAllowBashIfSandboxed, false);
-    assert.deepEqual(sandbox.filesystem?.allowWrite?.slice(0, 2), ["/tmp/wt", "/tmp/wt/.skakel/scratch"]);
+    assert.deepEqual(sandbox.filesystem?.allowWrite?.slice(0, 2), ["/tmp/wt", "/tmp/wt/.dahrk/scratch"]);
     assert.ok(sandbox.filesystem?.denyRead?.includes("/Volumes"), "mounted volumes stay unreadable");
   } finally {
     delete process.env.DAHRK_SANDBOX;

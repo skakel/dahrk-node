@@ -98,12 +98,13 @@ const canonical = (p: string): string => {
 };
 
 /**
- * The last time a run actually did anything, as a durable on-disk clock. `.skakel/scratch/state.json`
+ * The last time a run actually did anything, as a durable on-disk clock. `.dahrk/scratch/state.json`
  * is rewritten by the stage runner on every stage entry and exit, so its mtime survives a process
- * restart (which the in-memory map did not). Falls back to the worktree dir's own mtime.
+ * restart (which the in-memory map did not). Falls back to the legacy `.skakel/scratch/state.json`
+ * (worktrees set up before 2/7), then the worktree dir's own mtime.
  */
 function lastUsedMs(worktreePath: string): number {
-  const candidates = [join(worktreePath, ".skakel", "scratch", "state.json"), worktreePath];
+  const candidates = [join(worktreePath, ".dahrk", "scratch", "state.json"), join(worktreePath, ".skakel", "scratch", "state.json"), worktreePath];
   let newest = 0;
   for (const p of candidates) {
     try {

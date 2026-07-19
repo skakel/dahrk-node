@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import type { RunnerContext, WorkspaceRef } from "@dahrk/contracts";
 import { interactiveIdleWindows } from "../src/runner-shared.js";
 
-const ws: WorkspaceRef = { repoId: "r", gitUrl: "https://example.invalid/r.git", repo: "r", baseBranch: "main", worktreePath: "/tmp/r", scratchPath: "/tmp/r/.skakel" };
+const ws: WorkspaceRef = { repoId: "r", gitUrl: "https://example.invalid/r.git", repo: "r", baseBranch: "main", worktreePath: "/tmp/r", scratchPath: "/tmp/r/.dahrk" };
 const ctx = (config: Partial<RunnerContext["config"]> = {}): RunnerContext => ({
   config: { runtime: "claude-code", interaction: "interactive", ...config },
   workspace: ws,

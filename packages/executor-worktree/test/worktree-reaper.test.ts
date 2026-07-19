@@ -34,11 +34,11 @@ function makeBareRemote(): string {
   return remote;
 }
 
-/** Backdate a worktree's durable last-used clock (`.skakel/scratch/state.json`) by `ms`. */
+/** Backdate a worktree's durable last-used clock (`.dahrk/scratch/state.json`) by `ms`. */
 function ageBy(worktreePath: string, ms: number): void {
   const t = (Date.now() - ms) / 1000;
-  const state = join(worktreePath, ".skakel", "scratch", "state.json");
-  mkdirSync(join(worktreePath, ".skakel", "scratch"), { recursive: true });
+  const state = join(worktreePath, ".dahrk", "scratch", "state.json");
+  mkdirSync(join(worktreePath, ".dahrk", "scratch"), { recursive: true });
   if (!existsSync(state)) writeFileSync(state, "{}\n");
   utimesSync(state, t, t);
   utimesSync(worktreePath, t, t);

@@ -30,7 +30,7 @@ function makeRepo(): string {
 
 /** A throwaway BARE repo that stands in for a pushable remote, seeded with one commit on main.
  *  When `gitignore` is given it is committed as the repo's `.gitignore` (e.g. the harness repo, which
- *  ignores its own `.skakel/scratch/`). */
+ *  ignores its own `.dahrk/scratch/`). */
 function makeBareRemote(gitignore?: string): string {
   const remote = mkdtempSync(join(tmpdir(), "dahrk-remote-"));
   git(remote, ["init", "--bare", "-b", "main"]);
@@ -130,7 +130,7 @@ test("openPrAmbient is non-fatal: an unparseable git URL yields a prError, never
     repo: "r",
     baseBranch: "main",
     worktreePath: "/tmp/none",
-    scratchPath: "/tmp/none/.skakel",
+    scratchPath: "/tmp/none/.dahrk",
   };
   const res = await svc.openPrAmbient(ref, { branch: "skakel/x", base: "main", title: "t", body: "b" });
   assert.equal(res.prUrl, undefined);
@@ -175,7 +175,7 @@ test("commitAndPush commits the worktree and pushes the per-issue branch to the 
     assert.match(git(remote, ["show", `${branch}:hello.txt`]), /from session 1/);
     // ...but the scratch dir is excluded from the pushed tree.
     const tree = git(remote, ["ls-tree", "-r", "--name-only", branch]);
-    assert.ok(!tree.split("\n").some((p) => p.startsWith(".skakel/scratch")), "scratch is not pushed");
+    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch") || p.startsWith(".skakel/scratch")), "scratch is not pushed");
 
     // Re-summon (a NEW session/run) continues the SAME branch: the worktree is created on it with the
     // prior commit present, not forked off main.
@@ -617,7 +617,7 @@ test("backupPush preserves the run's HEAD on a disposable wip ref with no base m
     assert.equal(git(remote, ["rev-parse", wipRef]).trim(), r.headSha, "the wip ref points at the preserved sha");
     assert.match(git(remote, ["show", `${wipRef}:README.md`]), /this run's change/);
     const tree = git(remote, ["ls-tree", "-r", "--name-only", wipRef]);
-    assert.ok(!tree.split("\n").some((p) => p.startsWith(".skakel/scratch")), "scratch is excluded from the wip ref");
+    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch") || p.startsWith(".skakel/scratch")), "scratch is excluded from the wip ref");
     // No PR was opened and the per-issue branch was NOT pushed (backup only touches the wip ref).
     assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "the per-issue branch is untouched");
 
@@ -638,11 +638,11 @@ test("backupPush preserves the run's HEAD on a disposable wip ref with no base m
   }
 });
 
-test("commitAndPush succeeds when the target repo's own .gitignore ignores .skakel/scratch", async () => {
-  // The harness repo (which Skakel dogfoods on) gitignores `.skakel/scratch/`. Naming scratch as an
-  // explicit `:!.skakel/scratch` pathspec made `git add` fail ("paths are ignored ... use -f") and so
-  // failed every push on such a repo. The worktree-local exclude + plain `git add -A` must handle it.
-  const remote = makeBareRemote(".skakel/scratch/\n");
+test("commitAndPush succeeds when the target repo's own .gitignore ignores .dahrk/scratch", async () => {
+  // The harness repo gitignores `.dahrk/scratch/`. Naming scratch as an explicit `:!.dahrk/scratch`
+  // pathspec made `git add` fail ("paths are ignored ... use -f") and so failed every push on such a
+  // repo. The worktree-local exclude + plain `git add -A` must handle it.
+  const remote = makeBareRemote(".dahrk/scratch/\n");
   const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
   const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
   const svc = createGitService({ worktreesDir, mirrorsDir });
@@ -666,7 +666,7 @@ test("commitAndPush succeeds when the target repo's own .gitignore ignores .skak
 
     const tree = git(remote, ["ls-tree", "-r", "--name-only", branch]);
     assert.match(tree, /code\.ts/, "real code is pushed");
-    assert.ok(!tree.split("\n").some((p) => p.startsWith(".skakel/scratch")), "scratch is still excluded");
+    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch") || p.startsWith(".skakel/scratch")), "scratch is still excluded");
   } finally {
     rmSync(remote, { recursive: true, force: true });
     rmSync(worktreesDir, { recursive: true, force: true });

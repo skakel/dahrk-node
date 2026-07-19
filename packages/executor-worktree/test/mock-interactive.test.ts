@@ -10,7 +10,7 @@ import type { HumanTurn, RunnerContext, TraceEvent, WorkspaceRef } from "@dahrk/
 import { createMockRunner } from "../src/mock-runner.js";
 import { ManagedMailbox } from "../src/runner-shared.js";
 
-const ws: WorkspaceRef = { repoId: "r", gitUrl: "https://example.invalid/r.git", repo: "r", baseBranch: "main", worktreePath: "/tmp/r", scratchPath: "/tmp/r/.skakel" };
+const ws: WorkspaceRef = { repoId: "r", gitUrl: "https://example.invalid/r.git", repo: "r", baseBranch: "main", worktreePath: "/tmp/r", scratchPath: "/tmp/r/.dahrk" };
 const ctx: RunnerContext = { config: { runtime: "claude-code", interaction: "interactive" }, workspace: ws };
 const turn = (text: string): HumanTurn => ({ text, ts: "2026-06-21T00:00:00Z" });
 

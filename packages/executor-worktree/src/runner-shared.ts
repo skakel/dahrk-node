@@ -83,7 +83,7 @@ function stageInstruction(ctx: RunnerContext): string {
   return "Begin the stage.";
 }
 
-/** Per-document inline cap. The full body is on disk at `.skakel/scratch/docs/<slug>.md`, so the
+/** Per-document inline cap. The full body is on disk at `.dahrk/scratch/docs/<slug>.md`, so the
  *  prompt only needs enough to orient the agent; a long doc is truncated with a pointer to the file. */
 export const MAX_INLINE_DOC_CHARS = 6000;
 /** Overall inline budget across all documents, so many attached docs cannot blow up the prompt. */
@@ -98,7 +98,7 @@ function neutraliseDelimiters(text: string): string {
 
 /** Build the `<documents>` block from the run's attached Linear documents: per doc a header (title +
  *  the scratch path holding the full text) and a capped excerpt. Returns "" when there are none.
- *  The full body always lives at `.skakel/scratch/docs/<slug>.md`, which the edge wrote. */
+ *  The full body always lives at `.dahrk/scratch/docs/<slug>.md`, which the edge wrote. */
 function documentsBlock(ctx: RunnerContext): string {
   const docs = ctx.attachedDocuments;
   if (!docs || docs.length === 0) return "";
@@ -107,7 +107,7 @@ function documentsBlock(ctx: RunnerContext): string {
   for (const doc of docs) {
     // Share the basename function with the edge's file write so the pointer can never drift from the
     // file it names.
-    const path = `.skakel/scratch/docs/${attachedDocBasename(doc)}.md`;
+    const path = `.dahrk/scratch/docs/${attachedDocBasename(doc)}.md`;
     const cap = Math.max(0, Math.min(MAX_INLINE_DOC_CHARS, budget));
     const body = doc.content.trim();
     const truncated = body.length > cap;

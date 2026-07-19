@@ -24,7 +24,7 @@ import { evaluatePolicies } from "../src/policy.js";
 function worktree(): { path: string; scratch: string } {
   const path = mkdtempSync(join(homedir(), ".dahrk-confine-test-"));
   execFileSync("git", ["init", "-q"], { cwd: path });
-  const scratch = join(path, ".skakel", "scratch");
+  const scratch = join(path, ".dahrk", "scratch");
   mkdirSync(scratch, { recursive: true });
   return { path, scratch };
 }
@@ -100,7 +100,7 @@ test("the ordinary commands a build stage runs are NOT mistaken for escapes", ()
     // The safe sinks. `2>/dev/null` appears on roughly a third of the shell commands real stages run
     // (measured against the Bash calls in three production run traces); reading it as a write outside
     // the worktree would have denied most of a normal build.
-    "ls -la .skakel/scratch/ 2>/dev/null; grep -n FOO deploy.yml",
+    "ls -la .dahrk/scratch/ 2>/dev/null; grep -n FOO deploy.yml",
     "pnpm test 2>&1 | tail -30",
     "git diff --name-only HEAD~1 HEAD 2>/dev/null || git status --short",
   ]) {
@@ -147,21 +147,21 @@ test("a relative path is judged from the shell's cwd persisted across Bash calls
   const run = (command: string) =>
     evaluatePolicies({ kind: "action", stageId: "build", tool: "Bash", input: { command } }, persistent);
 
-  // From the worktree root, `../../.skakel/scratch` climbs out - correctly denied.
+  // From the worktree root, `../../.dahrk/scratch` climbs out - correctly denied.
   const fresh = buildRules([], ctx());
   assert.equal(
     evaluatePolicies(
-      { kind: "action", stageId: "build", tool: "Bash", input: { command: "node ../../.skakel/scratch/repro.mjs" } },
+      { kind: "action", stageId: "build", tool: "Bash", input: { command: "node ../../.dahrk/scratch/repro.mjs" } },
       fresh,
     ).verdict,
     "deny",
     "from the worktree root the path really does escape",
   );
 
-  // But after a `cd` into packages/edge in an earlier call, `../../.skakel/scratch` is the worktree's
+  // But after a `cd` into packages/edge in an earlier call, `../../.dahrk/scratch` is the worktree's
   // own scratch dir - in scope. Same command, different (correct) base.
   assert.equal(run("cd packages/edge").verdict, "allow");
-  assert.equal(run("node --import tsx ../../.skakel/scratch/repro.mjs").verdict, "allow");
+  assert.equal(run("node --import tsx ../../.dahrk/scratch/repro.mjs").verdict, "allow");
 });
 
 test("the safe /dev sinks are writable; a raw device is not", () => {

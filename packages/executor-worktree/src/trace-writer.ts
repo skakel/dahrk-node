@@ -1,6 +1,6 @@
 /**
  * The trace producer (minimal, M3). Writes the normalised trace envelope for one
- * stage attempt under `.skakel/scratch/traces/<stageId>/attempt-<n>/`:
+ * stage attempt under `.dahrk/scratch/traces/<stageId>/attempt-<n>/`:
  *   - `trace.jsonl` - one normalised TraceEvent per line, append-only, grep-friendly;
  *   - `meta.json`   - the single TraceMeta, written at start and finalised at exit;
  *   - `blobs/<sha256>` - large payloads spilled out of the JSONL, referenced by the

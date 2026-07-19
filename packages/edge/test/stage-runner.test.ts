@@ -141,7 +141,7 @@ test("a telemetry-only Job (no workspaceRef) runs in scratch with no clone attem
     assert.equal(result.status, "ok", "the stage completes against injected telemetry + scratch");
 
     // The injected telemetry was written to the run's scratch dir, no git involved.
-    const issuePath = join(scratchRoot, "run-meta-1", ".skakel", "scratch", "issue.md");
+    const issuePath = join(scratchRoot, "run-meta-1", ".dahrk", "scratch", "issue.md");
     assert.ok(existsSync(issuePath), "the injected issueContext is written to scratch");
     assert.equal(readFileSync(issuePath, "utf8"), job.issueContext);
 
@@ -673,7 +673,7 @@ test("repeated identical policy denials surface only one human-visible error (DH
 test("artifact resolution rejects paths that escape the worktree", () => {
   const root = mkdtempSync(join(tmpdir(), "dahrk-artifact-"));
   const worktreePath = join(root, "worktree");
-  const scratchPath = join(worktreePath, ".skakel", "scratch");
+  const scratchPath = join(worktreePath, ".dahrk", "scratch");
   execFileSync("mkdir", ["-p", scratchPath]);
   initRepo(worktreePath);
   writeFileSync(join(root, "secret.md"), "outside");
@@ -691,7 +691,7 @@ test("artifact resolution rejects paths that escape the worktree", () => {
 /** A recording GitService stub: enough surface for the runPush routing tests, no real git. */
 function recordingGitService() {
   const calls: { method: string; branch?: string }[] = [];
-  const ref = { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath: "/tmp/wt", scratchPath: "/tmp/wt/.skakel" };
+  const ref = { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath: "/tmp/wt", scratchPath: "/tmp/wt/.dahrk" };
   const svc = {
     createWorktree: async (spec: { branch?: string }) => {
       calls.push({ method: "createWorktree", ...(spec.branch ? { branch: spec.branch } : {}) });
@@ -749,7 +749,7 @@ test("runPush forwards a `noop` integration as a clean, non-error no-op (no PR, 
   // close the push as a successful no-op - status ok, nothing pushed, no PR opened, no conflictFiles -
   // so the run reaches a non-error terminal state.
   const calls: string[] = [];
-  const ref = { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath: "/tmp/wt", scratchPath: "/tmp/wt/.skakel" };
+  const ref = { repoId: "repo", gitUrl: "u", repo: "repo", baseBranch: "main", worktreePath: "/tmp/wt", scratchPath: "/tmp/wt/.dahrk" };
   const svc = {
     createWorktree: async () => ref,
     commitAndPush: async () => {

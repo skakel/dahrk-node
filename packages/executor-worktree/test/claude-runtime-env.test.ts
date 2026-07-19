@@ -19,7 +19,7 @@ const ctx = (over: Partial<RunnerContext> = {}): RunnerContext =>
       repo: "dahrk-node",
       baseBranch: "main",
       worktreePath: "/tmp/wt",
-      scratchPath: "/tmp/wt/.skakel/scratch",
+      scratchPath: "/tmp/wt/.dahrk/scratch",
     },
     ...over,
   }) as RunnerContext;

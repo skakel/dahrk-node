@@ -7,11 +7,11 @@
  * The node needs no pre-cloned repo. It keeps a per-repo **bare mirror cache** keyed by
  * `repoId` under a mirrors dir: on first sight of a repo it `git clone --mirror <gitUrl>`; on later
  * jobs it `git -C mirror remote update --prune`. One worktree per run is added off the mirror on a
- * fresh `dahrk/<runId>` branch, under a configurable worktrees dir. The `.skakel/scratch` directory
+ * fresh `dahrk/<runId>` branch, under a configurable worktrees dir. The `.dahrk/scratch` directory
  * is created here; its `state.json` is written by the edge stage runner (tenant/run/stage context).
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { WorkspaceRef } from "@dahrk/contracts";
@@ -26,7 +26,11 @@ const noopLogger: GitLogger = { info: () => {}, warn: () => {} };
 /** The engine-owned scratch dir (state.json, traces, issue.md): runtime state that lives in the
  *  worktree for stages to read/write but must NEVER enter a commit or the PR. Excluded from git and
  *  untracked before every push; also the yardstick for the "nothing to deliver" no-op below. */
-const SCRATCH_DIR = ".skakel/scratch";
+const SCRATCH_DIR = ".dahrk/scratch";
+/** Transition compat path (2/7 → 5/7): a symlink here points to SCRATCH_DIR so old-path workflow
+ *  prompts resolve to the same bytes as new-path prompts. Excluded from git (as a symlink) via the
+ *  worktree-local exclude; removed in 5/7 cleanup. */
+const SCRATCH_DIR_COMPAT = ".skakel/scratch";
 
 /** Everything the node needs to build a worktree with no local repo config: the registry identity
  *  (`repoId`/`gitUrl`) it clones on demand, the base branch, and the run it is for. `repo` is the
@@ -360,38 +364,60 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
   };
 
   /**
-   * Exclude the engine-owned `.skakel/scratch` dir from git via the WORKTREE-LOCAL exclude file
-   * (`$GIT_DIR/info/exclude`), not the target repo's tracked `.gitignore`. This makes a plain
-   * `git add -A` silently skip scratch in EVERY repo the harness runs against - including one whose
-   * own `.gitignore` already lists `.skakel/scratch/` (e.g. the harness repo itself), where naming
-   * scratch as an explicit `:!.skakel/scratch` pathspec instead makes `git add` fail outright with
-   * "The following paths are ignored ... use -f" and so fails the whole push. Idempotent and never
+   * Exclude the engine-owned `.dahrk/scratch` dir and its compat symlink from git via the
+   * WORKTREE-LOCAL exclude file (`$GIT_DIR/info/exclude`), not the target repo's tracked `.gitignore`.
+   * This makes a plain `git add -A` silently skip scratch in EVERY repo the harness runs against -
+   * including one whose own `.gitignore` already lists `.dahrk/scratch/`, where naming scratch as an
+   * explicit `:!.dahrk/scratch` pathspec instead makes `git add` fail outright with "The following
+   * paths are ignored ... use -f" and so fails the whole push. Also excludes the compat symlink
+   * `.skakel/scratch` (no trailing slash, to match a symlink not a directory). Idempotent and never
    * committed; best-effort (a write failure is non-fatal, the `git rm --cached` untrack still runs).
    */
   const excludeScratchLocally = (worktreePath: string): void => {
-    const entry = `${SCRATCH_DIR}/`;
+    const entries = [`${SCRATCH_DIR}/`, SCRATCH_DIR_COMPAT];
     try {
       const rel = git(worktreePath, ["rev-parse", "--git-path", "info/exclude"]).trim();
       const excludePath = isAbsolute(rel) ? rel : join(worktreePath, rel);
       const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf-8") : "";
-      if (existing.split("\n").some((l) => l.trim() === entry)) return;
+      const lines = existing.split("\n").map((l) => l.trim());
+      const toAdd = entries.filter((e) => !lines.includes(e));
+      if (toAdd.length === 0) return;
       mkdirSync(dirname(excludePath), { recursive: true });
       const sep = existing && !existing.endsWith("\n") ? "\n" : "";
-      writeFileSync(excludePath, `${existing}${sep}${entry}\n`);
+      writeFileSync(excludePath, `${existing}${sep}${toAdd.join("\n")}\n`);
     } catch (e) {
       log.warn(`could not set worktree scratch exclude at ${worktreePath}: ${(e as Error).message}`);
     }
   };
 
   /**
-   * Stage everything except the engine-owned `.skakel/scratch` dir and commit iff something is staged.
-   * Shared by the deliver push and the merge-free backup push. Untracks scratch if a prior commit
-   * captured it, then `add -A` the rest; a commit is written only when the worktree is dirty (so a
-   * no-op push commits nothing). Returns the resulting HEAD sha and whether a commit was made.
+   * Create the compat symlink `.skakel/scratch → ../.dahrk/scratch` inside the worktree (2/7 transition).
+   * Best-effort: EEXIST means a symlink or old-style directory already occupies the path (idempotent);
+   * any other error is logged and ignored (the symlink is a convenience, not a correctness requirement).
+   */
+  const installCompatSymlink = (worktreePath: string): void => {
+    const linkPath = join(worktreePath, SCRATCH_DIR_COMPAT);
+    try {
+      mkdirSync(dirname(linkPath), { recursive: true });
+      symlinkSync(join("..", SCRATCH_DIR), linkPath);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+        log.warn(`could not create compat scratch symlink at ${linkPath}: ${(e as Error).message}`);
+      }
+    }
+  };
+
+  /**
+   * Stage everything except the engine-owned `.dahrk/scratch` dir and its compat symlink, and commit
+   * iff something is staged. Shared by the deliver push and the merge-free backup push. Untracks scratch
+   * if a prior commit captured it, then `add -A` the rest; a commit is written only when the worktree
+   * is dirty (so a no-op push commits nothing). Returns the resulting HEAD sha and whether a commit was
+   * made.
    */
   const commitPending = (worktreePath: string, message: string): { headSha: string; dirty: boolean } => {
     excludeScratchLocally(worktreePath);
     git(worktreePath, ["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", SCRATCH_DIR]);
+    git(worktreePath, ["rm", "--cached", "--ignore-unmatch", "--quiet", SCRATCH_DIR_COMPAT]);
     git(worktreePath, ["add", "-A", "--", "."]);
     // Commit only when something is actually staged (`diff --cached --quiet` exits non-zero iff so).
     const dirty = !gitOk(worktreePath, ["diff", "--cached", "--quiet"]);
@@ -728,7 +754,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
     baseBranch: spec.baseBranch,
     branch: sanitizeBranchName(spec.branch ?? `dahrk/${spec.runId}`),
     worktreePath,
-    scratchPath: join(worktreePath, ".skakel", "scratch"),
+    scratchPath: join(worktreePath, SCRATCH_DIR),
   });
 
   return {
@@ -743,7 +769,9 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       // needed: the worktree already exists from an earlier stage of the same run.
       if (existsSync(worktreePath) && gitOk(worktreePath, ["rev-parse", "--git-dir"])) {
         log.info(`reusing existing worktree at ${worktreePath}`);
-        mkdirSync(join(worktreePath, ".skakel", "scratch"), { recursive: true });
+        mkdirSync(join(worktreePath, SCRATCH_DIR), { recursive: true });
+        installCompatSymlink(worktreePath);
+        excludeScratchLocally(worktreePath);
         return refFor(spec, worktreePath);
       }
 
@@ -817,7 +845,9 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
         throw new Error(`base '${baseBranch}' did not materialise into ${worktreePath} (unborn HEAD)`);
       }
 
-      mkdirSync(join(worktreePath, ".skakel", "scratch"), { recursive: true });
+      mkdirSync(join(worktreePath, SCRATCH_DIR), { recursive: true });
+      installCompatSymlink(worktreePath);
+      excludeScratchLocally(worktreePath);
       return refFor(spec, worktreePath);
     },
 
@@ -901,6 +931,8 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
           const isScratchPath = (p: string): boolean =>
             p === SCRATCH_DIR ||
             p.startsWith(`${SCRATCH_DIR}/`) ||
+            p === SCRATCH_DIR_COMPAT ||
+            p.startsWith(`${SCRATCH_DIR_COMPAT}/`) ||
             gitOk(worktreePath, ["check-ignore", "-q", "--no-index", "--", p]);
           if (!delta.some((p) => !isScratchPath(p))) {
             return { headSha, pushed: false, nothingToCommit: true, commitsAhead, integration: "noop" };
@@ -1038,9 +1070,9 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
 
       // Back to the last good commit, and drop the untracked debris the agent left with it. Without the
       // `-x`/`clean` the tree would still carry untracked half-written files, which is the corruption we
-      // are here to prevent; scratch is excluded because it is engine-owned state, not agent output.
+      // are here to prevent; scratch and its compat symlink are excluded (engine-owned, not agent output).
       git(worktreePath, ["reset", "--hard", headSha]);
-      git(worktreePath, ["clean", "-fd", "--exclude", SCRATCH_DIR]);
+      git(worktreePath, ["clean", "-fd", "--exclude", SCRATCH_DIR, "--exclude", SCRATCH_DIR_COMPAT]);
 
       return { dirty: true, headSha, tailSha, wipRef, pushed };
     },

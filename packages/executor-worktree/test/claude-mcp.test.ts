@@ -16,7 +16,7 @@ const ctx = (over: Partial<RunnerContext> & { config?: Partial<RunnerContext["co
       repo: "r",
       baseBranch: "main",
       worktreePath: "/tmp/x",
-      scratchPath: "/tmp/x/.skakel/scratch",
+      scratchPath: "/tmp/x/.dahrk/scratch",
     },
     ...over,
   }) as RunnerContext;

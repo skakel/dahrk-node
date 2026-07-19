@@ -70,6 +70,13 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Changed
 
+- **The in-worktree scratch directory is now `.dahrk/scratch` instead of `.skakel/scratch`.** The node
+  pre-writes stage inputs and reads the output deliverable from `.dahrk/scratch`; the old path is kept
+  reachable via a compat symlink (`.skakel/scratch → .dahrk/scratch`) placed in every worktree, so
+  workflow prompts that still reference `.skakel/scratch/output` continue to work until they are
+  republished. Both paths are excluded from git. The symlink and old-path fallback will be removed in a
+  later cleanup release once all prompts have been updated.
+
 - **The node now acknowledges cancels, so a cancel survives a hub restart or a dropped connection.**
   A `cancel` used to be handled and forgotten: the node aborted the stage but told the hub nothing, so
   a cancel that arrived while the node was momentarily disconnected, or was in flight across a hub

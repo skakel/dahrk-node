@@ -45,7 +45,7 @@ const MAX_TURNS = Number(process.env.DAHRK_MAX_TURNS ?? process.env.SKAKEL_MAX_T
 /** Default worktree-relative path stamped on a document handed back via `dahrk_stage_complete`
  *  when the stage declared no `emitArtifact`. Kept under the scratch output convention so it reads
  *  naturally in obs; the hub's `attach-document` resolves by content, not this exact path. */
-const HANDED_BACK_ARTIFACT_PATH = ".skakel/scratch/output/document.md";
+const HANDED_BACK_ARTIFACT_PATH = ".dahrk/scratch/output/document.md";
 
 /**
  * Anchor every stage to its worktree. The claude_code preset injects the dynamic

@@ -34,20 +34,20 @@ const withWorktree = (fn: (ref: WorkspaceRef, dir: string) => void, initGit = fa
 
 test("declared emitArtifact file wins when present", () => {
   withWorktree((ref, dir) => {
-    mkdirSync(join(dir, ".skakel/scratch/output"), { recursive: true });
-    writeFileSync(join(dir, ".skakel/scratch/output/spec.md"), "# Spec\nfrom file\n");
-    const r = resolveStageArtifact(ref, ".skakel/scratch/output/spec.md", undefined);
+    mkdirSync(join(dir, ".dahrk/scratch/output"), { recursive: true });
+    writeFileSync(join(dir, ".dahrk/scratch/output/spec.md"), "# Spec\nfrom file\n");
+    const r = resolveStageArtifact(ref, ".dahrk/scratch/output/spec.md", undefined);
     assert.equal(r?.source, "declared-file");
     assert.match(r?.artifact.content ?? "", /from file/);
-    assert.equal(r?.artifact.path, ".skakel/scratch/output/spec.md");
+    assert.equal(r?.artifact.path, ".dahrk/scratch/output/spec.md");
   });
 });
 
 test("a document handed back via the tool is used when the stage wrote no file", () => {
   withWorktree((ref) => {
     // No declared file exists (the stage wrote none) -> the handoff wins.
-    const r = resolveStageArtifact(ref, ".skakel/scratch/output/spec.md", {
-      path: ".skakel/scratch/output/spec.md",
+    const r = resolveStageArtifact(ref, ".dahrk/scratch/output/spec.md", {
+      path: ".dahrk/scratch/output/spec.md",
       content: "# Spec\nhanded back\n",
     });
     assert.equal(r?.source, "tool-handoff");
@@ -59,10 +59,10 @@ test("an interactive stage that writes its declared file resolves via declared-f
   // Interactive stages now have full tool parity, so they can write the declared artifact directly.
   // A written declared file must win over a document also handed back through the tool.
   withWorktree((ref, dir) => {
-    mkdirSync(join(dir, ".skakel/scratch/output"), { recursive: true });
-    writeFileSync(join(dir, ".skakel/scratch/output/spec.md"), "# Spec\nwritten by interactive stage\n");
-    const r = resolveStageArtifact(ref, ".skakel/scratch/output/spec.md", {
-      path: ".skakel/scratch/output/spec.md",
+    mkdirSync(join(dir, ".dahrk/scratch/output"), { recursive: true });
+    writeFileSync(join(dir, ".dahrk/scratch/output/spec.md"), "# Spec\nwritten by interactive stage\n");
+    const r = resolveStageArtifact(ref, ".dahrk/scratch/output/spec.md", {
+      path: ".dahrk/scratch/output/spec.md",
       content: "# Spec\nalso handed back\n",
     });
     assert.equal(r?.source, "declared-file");
@@ -72,10 +72,10 @@ test("an interactive stage that writes its declared file resolves via declared-f
 
 test("scratch-scan finds a differently-named markdown in the output dir", () => {
   withWorktree((ref, dir) => {
-    mkdirSync(join(dir, ".skakel/scratch/output"), { recursive: true });
+    mkdirSync(join(dir, ".dahrk/scratch/output"), { recursive: true });
     // Declared spec.md was never written; the agent wrote specification.md instead.
-    writeFileSync(join(dir, ".skakel/scratch/output/specification.md"), "# Spec\nscanned\n");
-    const r = resolveStageArtifact(ref, ".skakel/scratch/output/spec.md", undefined);
+    writeFileSync(join(dir, ".dahrk/scratch/output/specification.md"), "# Spec\nscanned\n");
+    const r = resolveStageArtifact(ref, ".dahrk/scratch/output/spec.md", undefined);
     assert.equal(r?.source, "scratch-scan");
     assert.match(r?.artifact.content ?? "", /scanned/);
   });
@@ -84,7 +84,7 @@ test("scratch-scan finds a differently-named markdown in the output dir", () => 
 test("changed-file fallback finds a new markdown written elsewhere in the worktree", () => {
   withWorktree((ref, dir) => {
     writeFileSync(join(dir, "REPORT.md"), "# Report\nchanged file\n");
-    const r = resolveStageArtifact(ref, ".skakel/scratch/output/spec.md", undefined);
+    const r = resolveStageArtifact(ref, ".dahrk/scratch/output/spec.md", undefined);
     assert.equal(r?.source, "changed-file");
     assert.match(r?.artifact.content ?? "", /changed file/);
     assert.equal(r?.artifact.path, "REPORT.md");
@@ -93,16 +93,16 @@ test("changed-file fallback finds a new markdown written elsewhere in the worktr
 
 test("returns undefined when no channel yields content", () => {
   withWorktree((ref) => {
-    assert.equal(resolveStageArtifact(ref, ".skakel/scratch/output/spec.md", undefined), undefined);
+    assert.equal(resolveStageArtifact(ref, ".dahrk/scratch/output/spec.md", undefined), undefined);
   }, true);
 });
 
 test("an empty/whitespace declared file falls through rather than publishing blank content", () => {
   withWorktree((ref, dir) => {
-    mkdirSync(join(dir, ".skakel/scratch/output"), { recursive: true });
-    writeFileSync(join(dir, ".skakel/scratch/output/spec.md"), "   \n");
-    const r = resolveStageArtifact(ref, ".skakel/scratch/output/spec.md", {
-      path: ".skakel/scratch/output/spec.md",
+    mkdirSync(join(dir, ".dahrk/scratch/output"), { recursive: true });
+    writeFileSync(join(dir, ".dahrk/scratch/output/spec.md"), "   \n");
+    const r = resolveStageArtifact(ref, ".dahrk/scratch/output/spec.md", {
+      path: ".dahrk/scratch/output/spec.md",
       content: "handed back",
     });
     assert.equal(r?.source, "tool-handoff", "blank declared file must not win over a real handoff");

@@ -24,7 +24,7 @@ const ctx = (authorizeToolUse?: Authorize): RunnerContext & { authorizeToolUse?:
       repo: "r",
       baseBranch: "main",
       worktreePath: "/tmp/x",
-      scratchPath: "/tmp/x/.skakel/scratch",
+      scratchPath: "/tmp/x/.dahrk/scratch",
     },
     ...(authorizeToolUse ? { authorizeToolUse } : {}),
   }) as RunnerContext & { authorizeToolUse?: Authorize };

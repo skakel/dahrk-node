@@ -251,7 +251,7 @@ function writeIssueContext(ref: WorkspaceRef, issueContext: string | undefined):
   }
 }
 
-/** Persist each attached Linear document's full body into `.skakel/scratch/docs/<slug>.md`, so the
+/** Persist each attached Linear document's full body into `.dahrk/scratch/docs/<slug>.md`, so the
  *  agent can read the complete text even when the prompt only inlines a capped excerpt. Best-effort;
  *  the slug is sanitised so a malformed value cannot escape the docs directory. */
 function writeAttachedDocuments(ref: WorkspaceRef, docs: JobRequest["attachedDocuments"]): void {
@@ -278,7 +278,7 @@ function renderGuidanceMarkdown(guidance: NonNullable<JobRequest["guidance"]>): 
   return `# Workspace guidance\n\n${lines.join("\n")}\n`;
 }
 
-/** Persist the run's workspace/team guidance into `.skakel/scratch/guidance.md`, so a stage
+/** Persist the run's workspace/team guidance into `.dahrk/scratch/guidance.md`, so a stage
  *  can re-read it as well as receiving it inline in the prompt. Best-effort, mirroring `writeIssueContext`. */
 function writeGuidance(ref: WorkspaceRef, guidance: JobRequest["guidance"]): void {
   if (!guidance || guidance.length === 0) return;
@@ -296,7 +296,11 @@ const ARTIFACT_CAP_BYTES = 64 * 1024;
 
 /** Worktree-relative directory workflows conventionally write deliverables to (mirrors the prompt
  *  guidance in the sample workflows). Scanned as a fallback when the declared path did not resolve. */
-const SCRATCH_OUTPUT_DIR = ".skakel/scratch/output";
+const SCRATCH_OUTPUT_DIR = ".dahrk/scratch/output";
+/** Transition compat path (2/7 → 5/7): old-path workflow prompts write here; the compat symlink
+ *  normally routes these to SCRATCH_OUTPUT_DIR, but we also read this directly as a fallback for
+ *  worktrees set up before the symlink was introduced. Removed in 5/7 cleanup. */
+const SCRATCH_OUTPUT_DIR_LEGACY = ".skakel/scratch/output";
 
 function capContent(raw: string): string {
   return raw.length > ARTIFACT_CAP_BYTES ? raw.slice(0, ARTIFACT_CAP_BYTES) : raw;
@@ -331,22 +335,27 @@ function readEmittedArtifact(ref: WorkspaceRef, relPath: string): { path: string
   }
 }
 
-/** Fallback: a markdown deliverable under `.skakel/scratch/output/`, preferring one whose basename
- *  matches the declared path (the agent may have written a differently-named file to the right dir). */
+/** Fallback: a markdown deliverable under the scratch output dir, preferring one whose basename
+ *  matches the declared path (the agent may have written a differently-named file to the right dir).
+ *  Tries the canonical `.dahrk/scratch/output` first; falls back to the legacy `.skakel/scratch/output`
+ *  for worktrees set up before the compat symlink was introduced (removed in 5/7 cleanup). */
 function scanScratchOutput(ref: WorkspaceRef, preferRel?: string): { path: string; content: string } | undefined {
-  try {
-    const names = readdirSync(join(ref.worktreePath, SCRATCH_OUTPUT_DIR)).filter((n) =>
-      n.toLowerCase().endsWith(".md"),
-    );
-    if (names.length === 0) return undefined;
-    const preferBase = preferRel?.split("/").pop();
-    const pick = (preferBase && names.includes(preferBase) ? preferBase : names[0]) as string;
-    const raw = readFileSync(join(ref.worktreePath, SCRATCH_OUTPUT_DIR, pick), "utf8");
-    if (raw.trim().length === 0) return undefined;
-    return { path: `${SCRATCH_OUTPUT_DIR}/${pick}`, content: capContent(raw) };
-  } catch {
-    return undefined;
+  const preferBase = preferRel?.split("/").pop();
+  for (const dir of [SCRATCH_OUTPUT_DIR, SCRATCH_OUTPUT_DIR_LEGACY]) {
+    try {
+      const names = readdirSync(join(ref.worktreePath, dir)).filter((n) =>
+        n.toLowerCase().endsWith(".md"),
+      );
+      if (names.length === 0) continue;
+      const pick = (preferBase && names.includes(preferBase) ? preferBase : names[0]) as string;
+      const raw = readFileSync(join(ref.worktreePath, dir, pick), "utf8");
+      if (raw.trim().length === 0) continue;
+      return { path: `${dir}/${pick}`, content: capContent(raw) };
+    } catch {
+      /* try next candidate */
+    }
   }
+  return undefined;
 }
 
 /** Last-resort fallback: any new or modified markdown file in the worktree (the agent wrote the
@@ -581,7 +590,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           } else {
             const base = deps.scratchRoot ?? join(tmpdir(), "dahrk", "scratch");
             const worktreePath = join(base, runId);
-            const scratchPath = join(worktreePath, ".skakel", "scratch");
+            const scratchPath = join(worktreePath, ".dahrk", "scratch");
             mkdirSync(scratchPath, { recursive: true });
             ref = { repoId: "", gitUrl: "", repo: "", baseBranch: "", worktreePath, scratchPath };
             scratchOnly.add(runId);

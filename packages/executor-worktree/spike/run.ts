@@ -45,7 +45,7 @@ function makeWorktree(): WorkspaceRef {
     cwd: worktreePath,
     env: { ...process.env, GIT_AUTHOR_NAME: "skakel", GIT_AUTHOR_EMAIL: "s@skakel.io", GIT_COMMITTER_NAME: "skakel", GIT_COMMITTER_EMAIL: "s@skakel.io" },
   });
-  return { repoId: "live", gitUrl: "https://example.invalid/live.git", repo: "live", baseBranch: "main", worktreePath, scratchPath: join(worktreePath, ".skakel", "scratch") };
+  return { repoId: "live", gitUrl: "https://example.invalid/live.git", repo: "live", baseBranch: "main", worktreePath, scratchPath: join(worktreePath, ".dahrk", "scratch") };
 }
 
 const metaFor = (runtime: AgentConfig["runtime"], stageId: string): TraceMeta => ({
