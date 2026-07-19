@@ -323,6 +323,151 @@ test("commitAndPush reports a conflict and pushes nothing when the advanced base
   }
 });
 
+test("commitAndPush replays a recorded rerere resolution and pushes clean instead of parking (DHK-553)", async () => {
+  // Tier-2 pre-resolve, rung 1: a base-advanced conflict on a file for which a human resolution was
+  // recorded (rerere) auto-resolves at push time - no agent stage, no park. The merge runs with rerere
+  // enabled, so the recorded hunk is replayed and staged; the residual set is empty and the push is clean.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-TEST-rerere";
+
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-rerere",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-rerere-1",
+      branch,
+    });
+    git(ref.worktreePath, ["config", "user.email", "harness@dahrk.test"]);
+    git(ref.worktreePath, ["config", "user.name", "Dahrk"]);
+    // Our run edits README and commits it, so HEAD carries the run's version.
+    writeFileSync(join(ref.worktreePath, "README.md"), "# fixture\nrun line\n");
+    git(ref.worktreePath, ["add", "README.md"]);
+    git(ref.worktreePath, ["commit", "-m", "run edit"]);
+    // The base advances on the SAME file (a genuine, overlapping conflict at push time).
+    advanceRemoteMain(remote, "README.md", "# fixture\nbase line\n", "base edited README");
+
+    // Seed a rerere resolution for EXACTLY this conflict, then abort the trial merge (rr-cache persists).
+    git(ref.worktreePath, ["config", "rerere.enabled", "true"]);
+    git(ref.worktreePath, ["fetch", remote, "main"]);
+    assert.throws(() => git(ref.worktreePath, ["merge", "--no-edit", "FETCH_HEAD"]), "trial merge conflicts");
+    writeFileSync(join(ref.worktreePath, "README.md"), "# fixture\nreconciled line\n");
+    git(ref.worktreePath, ["add", "README.md"]);
+    git(ref.worktreePath, ["rerere"]); // record the resolution
+    git(ref.worktreePath, ["merge", "--abort"]); // undo the trial; the recorded resolution survives
+
+    // The real push hits the same conflict; rerere replays the recorded resolution and it pushes clean.
+    const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
+    assert.equal(r.integration, "clean", "a rerere-recorded conflict integrates clean");
+    assert.equal(r.pushed, true);
+    assert.equal(r.conflictFiles, undefined, "no residual conflict is reported");
+    assert.match(git(remote, ["show", `${branch}:README.md`]), /reconciled line/, "the recorded resolution was pushed");
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
+test("commitAndPush deterministically resolves safe paths (lockfile + CHANGELOG) and pushes clean (DHK-553)", async () => {
+  // Tier-2 pre-resolve, rungs 2-3: a base-advanced conflict confined to safe generated/append-only
+  // paths clears mechanically - the lockfile takes the base side (`theirs`, regenerated downstream) and
+  // the CHANGELOG is union-merged (both sides' `[Unreleased]` entries kept). No agent stage, no park.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-TEST-safe";
+
+  try {
+    // Seed the safe paths at the merge base BEFORE the worktree branches off it.
+    advanceRemoteMain(remote, "pnpm-lock.yaml", "lockfileVersion: base-1\n", "add lockfile");
+    advanceRemoteMain(remote, "CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n", "add changelog");
+    const ref = await svc.createWorktree({
+      repoId: "repo-safe",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-safe-1",
+      branch,
+    });
+    git(ref.worktreePath, ["config", "user.email", "harness@dahrk.test"]);
+    git(ref.worktreePath, ["config", "user.name", "Dahrk"]);
+    // Our run edits both safe files and commits.
+    writeFileSync(join(ref.worktreePath, "pnpm-lock.yaml"), "lockfileVersion: run-2\n");
+    writeFileSync(join(ref.worktreePath, "CHANGELOG.md"), "# Changelog\n\n## [Unreleased]\n- run entry\n");
+    git(ref.worktreePath, ["add", "."]);
+    git(ref.worktreePath, ["commit", "-m", "run edits safe files"]);
+    // The base advances on the SAME safe files (overlapping conflicts on both).
+    advanceRemoteMain(remote, "pnpm-lock.yaml", "lockfileVersion: base-3\n", "base bumped lockfile");
+    advanceRemoteMain(remote, "CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n- base entry\n", "base changelog");
+
+    const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
+    assert.equal(r.integration, "clean", "a conflict confined to safe paths resolves clean");
+    assert.equal(r.pushed, true);
+    assert.equal(r.conflictFiles, undefined, "no residual conflict is reported");
+    // The lockfile took the base side; the CHANGELOG kept BOTH entries.
+    assert.match(git(remote, ["show", `${branch}:pnpm-lock.yaml`]), /base-3/, "lockfile resolved to theirs (base)");
+    const changelog = git(remote, ["show", `${branch}:CHANGELOG.md`]);
+    assert.match(changelog, /- run entry/, "the run's CHANGELOG entry is kept");
+    assert.match(changelog, /- base entry/, "the base's CHANGELOG entry is kept");
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
+test("commitAndPush parks only the RESIDUAL conflict after clearing safe paths (DHK-553)", async () => {
+  // A conflict spanning a safe path AND a genuine source file: the safe path clears deterministically,
+  // but the source file has real content overlap, so the run still parks - on the REDUCED residual set
+  // (only the source file), never the already-resolved safe path.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-TEST-residual";
+
+  try {
+    advanceRemoteMain(remote, "CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n", "add changelog");
+    const ref = await svc.createWorktree({
+      repoId: "repo-residual",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-residual-1",
+      branch,
+    });
+    git(ref.worktreePath, ["config", "user.email", "harness@dahrk.test"]);
+    git(ref.worktreePath, ["config", "user.name", "Dahrk"]);
+    // Our run edits a safe path (CHANGELOG) AND a genuine source file (README) and commits.
+    writeFileSync(join(ref.worktreePath, "CHANGELOG.md"), "# Changelog\n\n## [Unreleased]\n- run entry\n");
+    writeFileSync(join(ref.worktreePath, "README.md"), "# fixture\nrun's real change\n");
+    git(ref.worktreePath, ["add", "."]);
+    git(ref.worktreePath, ["commit", "-m", "run edits changelog + source"]);
+    // The base advances on BOTH (a safe conflict and a genuine one).
+    advanceRemoteMain(remote, "CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n- base entry\n", "base changelog");
+    advanceRemoteMain(remote, "README.md", "# fixture\nbase's real change\n", "base edited README");
+
+    const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
+    assert.equal(r.integration, "conflict", "a genuine residual conflict still parks");
+    assert.equal(r.pushed, false);
+    assert.deepEqual(r.conflictFiles, ["README.md"], "only the genuine conflict remains; the safe path cleared");
+    // Nothing was pushed and the abort left no half-merge behind.
+    assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "no branch was pushed on residual conflict");
+    assert.equal(git(ref.worktreePath, ["status", "--porcelain"]).trim(), "", "worktree left clean");
+    assert.throws(
+      () => git(ref.worktreePath, ["rev-parse", "--verify", "-q", "MERGE_HEAD"]),
+      "the merge was aborted (no MERGE_HEAD)",
+    );
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
 test("commitAndPush reports `diverged` (never a masked `merge --abort` error) on unrelated histories", async () => {
   // Regression for the DHK-256 failure: the run's branch shared no history with the base, so the
   // push-time `git merge FETCH_HEAD` refused ("unrelated histories") WITHOUT starting a merge (no

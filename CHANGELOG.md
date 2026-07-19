@@ -8,6 +8,16 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- **A base-advanced merge conflict with no genuine content overlap now integrates and pushes clean
+  instead of parking.** At push-time base integration, before aborting on the first conflict the edge
+  runs a deterministic (no-LLM) pre-resolve pass: it replays any recorded `rerere` resolution, then
+  mechanically resolves an explicitly-safe set of paths - generated lockfiles take the base side
+  (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, regenerated downstream) and append-only
+  CHANGELOGs are union-merged so both sides' `[Unreleased]` entries survive. Only the residual conflict
+  set (genuine, hand-mergeable overlap) then parks as before, so a run no longer burns an agent
+  conflict-resolution stage - or a manual park - on a conflict pure git can clear. The safe path set is
+  overridable per repo. This stays inside the determinism boundary: git decides the outcome, nothing is
+  inferred.
 - **Batch output-idle watchdog: a hung batch stage is cancelled instead of running forever.** A batch
   stage (build, plan, test) now cancels its runner if it streams no output - no assistant text, tool
   call, or tool result - for a stall window, defaulting to 300s and overridable per stage
