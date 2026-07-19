@@ -5,7 +5,7 @@ The executor behind the Job contract: it runs a stage in a git worktree.
 - **GitService** (`src/git-service.ts`): `createGitService()` - `createWorktree` / `teardownWorktree`
   + base-branch resolution over `git worktree`, adapted from cyrus and stripped to pure git/node we own
   (zero cyrus deps; `execFileSync` arg arrays, no shell interpolation). One worktree per run on a
-  `dahrk/<runId>` branch with a `.skakel/scratch` dir.
+  `dahrk/<runId>` branch with a `.dahrk/scratch` dir.
 - **Trace producer** (`src/trace-writer.ts`): `createTraceWriter()` writes the normalised
   `trace.jsonl` (writer-owned monotonic `seq`) + `meta.json` and spills large payloads to `blobs/`,
   under `traces/<stageId>/attempt-<n>/`.

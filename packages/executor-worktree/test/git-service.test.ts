@@ -175,7 +175,7 @@ test("commitAndPush commits the worktree and pushes the per-issue branch to the 
     assert.match(git(remote, ["show", `${branch}:hello.txt`]), /from session 1/);
     // ...but the scratch dir is excluded from the pushed tree.
     const tree = git(remote, ["ls-tree", "-r", "--name-only", branch]);
-    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch") || p.startsWith(".skakel/scratch")), "scratch is not pushed");
+    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch")), "scratch is not pushed");
 
     // Re-summon (a NEW session/run) continues the SAME branch: the worktree is created on it with the
     // prior commit present, not forked off main.
@@ -617,7 +617,7 @@ test("backupPush preserves the run's HEAD on a disposable wip ref with no base m
     assert.equal(git(remote, ["rev-parse", wipRef]).trim(), r.headSha, "the wip ref points at the preserved sha");
     assert.match(git(remote, ["show", `${wipRef}:README.md`]), /this run's change/);
     const tree = git(remote, ["ls-tree", "-r", "--name-only", wipRef]);
-    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch") || p.startsWith(".skakel/scratch")), "scratch is excluded from the wip ref");
+    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch")), "scratch is excluded from the wip ref");
     // No PR was opened and the per-issue branch was NOT pushed (backup only touches the wip ref).
     assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "the per-issue branch is untouched");
 
@@ -666,7 +666,7 @@ test("commitAndPush succeeds when the target repo's own .gitignore ignores .dahr
 
     const tree = git(remote, ["ls-tree", "-r", "--name-only", branch]);
     assert.match(tree, /code\.ts/, "real code is pushed");
-    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch") || p.startsWith(".skakel/scratch")), "scratch is still excluded");
+    assert.ok(!tree.split("\n").some((p) => p.startsWith(".dahrk/scratch")), "scratch is still excluded");
   } finally {
     rmSync(remote, { recursive: true, force: true });
     rmSync(worktreesDir, { recursive: true, force: true });
