@@ -403,6 +403,17 @@ export function resolveStageArtifact(
   return undefined;
 }
 
+/**
+ * Whether a runtime consumes brokered MCP servers through the node-local gateway proxy, and so needs
+ * the gateway started for a stage that declares them (DHK-507). True for Claude (SDK-native MCP) and
+ * Pi (its extension bridge, `createBrokeredMcpExtension`); false for Codex, whose SDK has no MCP - a
+ * proxy for it would be dead weight. Pure + exported so the gate is unit-testable without standing up
+ * the whole stage runner (`startMcpGateway` binds a real socket).
+ */
+export function runtimeUsesMcpGateway(runtime: Runner["runtime"]): boolean {
+  return runtime === "claude-code" || runtime === "pi";
+}
+
 export function createStageRunner(deps: StageRunnerDeps): StageRunner {
   const worktrees = new Map<string, WorkspaceRef>();
   /** Silent by default so an embedder (and every existing test) sees no new output. */
@@ -817,7 +828,12 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           }
           return verdict;
         };
+        // Reset hook for the batch output-idle watchdog (armed below, batch stages only). Every
+        // streamed trace event is a sign of life, so bumping it here keeps an actively-working stage
+        // alive; a no-op until the watchdog is armed.
+        let bumpStall: () => void = () => {};
         const onTrace = (event: TraceEvent): void => {
+          bumpStall();
           if (event.type === "action") {
             const key = actionKey(event.tool, event.input);
             const authorised = authorisedActions.indexOf(key);
@@ -840,11 +856,13 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           if (event.type !== "state") deps.sendProgress({ jobId, kind: event.type, ts: event.ts, ...previewOf(event) });
         };
 
-        // Start the per-stage MCP gateway when the stage declares brokered MCP servers. Claude only:
-        // the Codex SDK has no MCP support, so a proxy for it would be dead weight (the codex adapter
-        // logs and ignores declared servers).
+        // Start the per-stage MCP gateway when the stage declares brokered MCP servers, for every
+        // runtime that can route MCP through it: Claude (SDK-native) and Pi (its extension bridge,
+        // DHK-507). Codex is excluded - its SDK has no MCP, so a proxy would be dead weight (the codex
+        // adapter logs and ignores declared servers). The gateway holds the token and injects it
+        // upstream, so the agent never sees the raw secret (`mcpProxyBaseUrl` seam) regardless of runtime.
         const mcpServers = agentConfig.mcpServers;
-        if (mcpServers && mcpServers.length > 0 && runtime === "claude-code") {
+        if (mcpServers && mcpServers.length > 0 && runtimeUsesMcpGateway(runtime)) {
           gateway = await startMcpGateway({ servers: mcpServers, creds: job.brokeredCreds ?? {} });
         }
 
@@ -905,6 +923,34 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // timer does not keep the event loop alive, so an otherwise-idle loop could drain before it
         // fires and the kill would never happen. It is always cleared in the `finally` below, so it
         // can never outlive the job.
+        //
+        // Batch output-idle watchdog. A batch stage has no idle timer of its own, and the wall clock is
+        // opt-in (usually absent), so a genuinely hung stage - an orphaned subprocess, a runtime that
+        // stops streaming - would otherwise run forever. Cancel the runner if it emits NO trace event
+        // (assistant text, tool call, tool result) for `stallMs`; `bumpStall` above resets it on every
+        // event, so an actively-working stage is never touched. Batch-only: interactive stages keep
+        // their own per-turn idle timer. Override via the stage's `stall_seconds` (-> agentConfig.stallMs,
+        // read defensively until the contract republishes) or env `DAHRK_BATCH_STALL_MS`; default 300s.
+        let stalled = false;
+        let stallTimer: ReturnType<typeof setTimeout> | undefined;
+        // Stall window source: the stage's `stall_seconds` (surfaced as agentConfig.stallMs), else the
+        // env override, else 300s. Sanitised (clamp to a non-negative integer) exactly as killMs above;
+        // interactive stages opt out with 0. Reading env has no side effects, so computing the source
+        // unconditionally is equivalent to the old interactive-short-circuit.
+        const stallSource =
+          (agentConfig as { stallMs?: number }).stallMs ??
+          Number(process.env.DAHRK_BATCH_STALL_MS ?? process.env.SKAKEL_BATCH_STALL_MS ?? 300_000);
+        const stallMs = interactive ? 0 : Math.max(0, Math.floor(stallSource));
+        if (stallMs > 0) {
+          bumpStall = (): void => {
+            if (stallTimer) clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+              stalled = true;
+              void runner.cancel();
+            }, stallMs);
+          };
+          bumpStall(); // arm before the first event, so a stage that never streams still trips
+        }
         try {
           if (interactive) {
             const mailbox = new ManagedMailbox<HumanTurn>();
@@ -915,6 +961,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           }
         } finally {
           if (killTimer) clearTimeout(killTimer);
+          if (stallTimer) clearTimeout(stallTimer);
         }
         // A policy deny blocks the individual *action* (already recorded as a policy-deny trace
         // event and streamed as a progress error); the deny-only guards are guardrails the agent
@@ -923,7 +970,10 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // its tool actions was denied. (Previously any deny forced the whole stage to `fail`, so a
         // recovered-from `rm -rf` on a throwaway scratch dir turned a correctly-completed build into
         // a false-negative.) The deny still surfaces in the trace and in the summary note below.
-        let status: JobStatus = timedOut ? "timeout" : result.status;
+        // A wall-clock kill and a batch stall both cancel the runner and surface as `timeout` (the same
+        // status the old default wall clock produced, so the hub folds them identically). They differ
+        // only in the summary below, so a stall is legible in the trace without a new JobStatus variant.
+        let status: JobStatus = timedOut || stalled ? "timeout" : result.status;
 
         // The one deny that DOES kill the stage (DHK-392). On a runtime with no pre-execution hook the
         // confinement breach was detected after the fact: the command already read what it read. That
@@ -952,6 +1002,11 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // Interactive stages return their own handoff summary; a batch stage gets the
         // engine-owned summarisation turn (only after success, never failing the stage).
         let summary = result.summary ?? `${stageId}: ${status}`;
+        // A stalled batch stage reports a distinct, legible summary (the runner's own summary is
+        // unreliable after a mid-stream cancel). Prefer it over the generic `<stage>: timeout`.
+        if (stalled && !timedOut) {
+          summary = `${stageId}: stalled (no output for ${Math.round(stallMs / 1000)}s)`;
+        }
         if (!interactive && status === "ok") {
           try {
             summary = await runner.summarise(ctx);

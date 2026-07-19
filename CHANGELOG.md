@@ -6,6 +6,68 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **A base-advanced merge conflict with no genuine content overlap now integrates and pushes clean
+  instead of parking.** At push-time base integration, before aborting on the first conflict the edge
+  runs a deterministic (no-LLM) pre-resolve pass: it replays any recorded `rerere` resolution, then
+  mechanically resolves an explicitly-safe set of paths - generated lockfiles take the base side
+  (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, regenerated downstream) and append-only
+  CHANGELOGs are union-merged so both sides' `[Unreleased]` entries survive. Only the residual conflict
+  set (genuine, hand-mergeable overlap) then parks as before, so a run no longer burns an agent
+  conflict-resolution stage - or a manual park - on a conflict pure git can clear. The safe path set is
+  overridable per repo. This stays inside the determinism boundary: git decides the outcome, nothing is
+  inferred.
+- **Batch output-idle watchdog: a hung batch stage is cancelled instead of running forever.** A batch
+  stage (build, plan, test) now cancels its runner if it streams no output - no assistant text, tool
+  call, or tool result - for a stall window, defaulting to 300s and overridable per stage
+  (`stall_seconds`) or via `DAHRK_BATCH_STALL_MS`. Every streamed event resets the timer, so an
+  actively-working stage runs unbounded; only a genuinely stalled one (an orphaned subprocess, a
+  runtime that stopped streaming) is stopped, reported as `timeout` with a `stalled (no output for Ns)`
+  summary. This is the guard that replaces the removed default 30-minute wall clock: with the stage
+  wall clock now opt-in, batch stages had no automatic guard of their own. Interactive stages keep
+  their existing per-turn idle timer.
+- **A Pi stage can now run against any provider a selected auth profile names, not just Anthropic,
+  OpenAI, or Google.** The Pi runtime used to recognise a fixed four-key table, so a brokered
+  OpenRouter, Kimi, Mistral, or Groq key was ignored and a subscription login (ChatGPT/Codex, GitHub
+  Copilot, Gemini) could not be attached at all. Provider identity now comes from the auth profile the
+  run selects: an API-key provider is applied as a runtime override (and, where Pi ships no built-in
+  for it, reached through a custom endpoint from the profile), and an OAuth-subscription provider is
+  attached from the profile's token material. Each stage resolves its providers into a private,
+  per-stage config that is created fresh and removed when the stage settles, so nothing leaks between
+  stages and no machine-global Pi config is inherited. The raw key is never exposed to the agent's own
+  tool calls.
+- **A Pi stage now enforces tool policy before a tool runs, not just after.** Previously only a Claude
+  stage had a pre-execution guardrail; a Pi stage's sole check was the post-hoc re-evaluation of the
+  trace, which could hard-fail a filesystem-confinement escape only after the command had already run.
+  A Pi stage now consults the same edge policy set as Claude (`fs_confine`, `read_only`, `write_scope`,
+  `max_tool_calls`, `shell_guard`) before each tool executes and blocks a denied call up front,
+  surfacing the policy's reason, so a policy-violating write or command never runs in the first place.
+  The post-hoc check stays in place as a defence-in-depth backstop.
+- **An interactive Pi stage can now ask the human a structured multiple-choice question, surfaced as a
+  Linear elicitation.** Previously only a Claude stage could raise a structured question; a Pi stage
+  had no way to, so it fell back to guessing. A Pi stage's `ask_user_question` tool now maps each
+  question (with its options and multi-select flag) to a Linear `select` elicitation, waits for the
+  human's pick, and feeds the selection straight back into the same stage so it continues with the
+  answer. It reuses the same one-question-at-a-time machinery as the Claude path, so a batch of
+  questions is asked one at a time and an unanswered question, a cancelled stage, or a second question
+  raised while one is still open all behave exactly as they do for Claude.
+
+- **A Pi stage can now use brokered MCP servers, routed through the node's gateway proxy.** Previously
+  a stage that declared MCP servers got them only on the Claude runtime; a Pi stage ignored them
+  entirely. A Pi stage now reaches each declared brokered server through the same node-local gateway
+  proxy the Claude path uses: the node holds the credential and injects it upstream, and the Pi agent
+  only ever talks to `127.0.0.1`, so the raw token never reaches the agent. The remote server's tools
+  appear to the Pi model as ordinary tools. Only remote (`http`) brokered servers are wired; a stage
+  that declares no MCP servers is unchanged.
+
+- **A managed node can now run a Pi stage container-isolated.** Setting `DAHRK_PI_ISOLATION=container`
+  makes the node run each Pi stage in a fresh per-job Docker container (`pi --mode rpc`) instead of the
+  embedded in-process session; without it the node keeps using the embedded path. The container image
+  is taken from `DAHRK_PI_IMAGE` (default `dahrk/pi:latest`). One known degradation on the container
+  path: the RPC session has no agent handle, so a meta-loop stage's tool-denial during `summarise` is a
+  no-op there (meta-loop stages are telemetry-only, so this is accepted).
+
 ### Changed
 
 - **The node now acknowledges cancels, so a cancel survives a hub restart or a dropped connection.**

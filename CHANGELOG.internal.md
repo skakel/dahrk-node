@@ -19,6 +19,43 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Added
+
+- **Wire brokered MCP into the Pi adapter via the node-local gateway proxy (DHK-507).** Added
+  `buildBrokeredPiMcpServers` (pure, mirrors the Claude adapter's `buildBrokeredMcpServers`) and
+  `createBrokeredMcpExtension` (an inline Pi extension whose async factory acts as an MCP client:
+  connect over Streamable HTTP to `mcpProxyBaseUrl/<id>`, list tools, register each via
+  `pi.registerTool`) in `pi-adapter.ts`; `defaultCreatePiSession` appends it alongside the tool-gate
+  extension when the stage declares brokered servers. Widened the `stage-runner.ts` gateway gate from
+  `claude-code` to a `runtimeUsesMcpGateway` predicate (Claude + Pi, not Codex). Declared
+  `@modelcontextprotocol/sdk@1.29.0` as a direct dependency of `executor-worktree` (was a transitive
+  peer of the Pi SDK) and a devDependency of `edge` (stub MCP server in the e2e test). Tests:
+  `pi-mcp.test.ts` (pure builder + extension against a direct stub), a `runtimeUsesMcpGateway` unit in
+  `stage-runner.test.ts`, and `pi-mcp-brokered.test.ts` (real gateway + extension, asserting the token
+  is injected upstream and never reaches the agent-facing config). Pi 0.80.6 kept; no SDK upgrade.
+
+### Changed
+
+- **Clarify the batch stall-watchdog window computation (DHK-210).** Split the nested
+  `stallMs` expression in `stage-runner.ts` into a `stallSource` fallback (config `stall_seconds` →
+  env → 300s default) and a separate non-negative-integer clamp that mirrors `killMs`. No behaviour
+  change: reading env has no side effects, so computing the source unconditionally is equivalent to
+  the old interactive short-circuit.
+
+- **Tidy the Pi adapter and its test path (DHK-508).** In `pi-adapter.ts`, `runInteractive` now casts
+  `ctx` to the module's existing `PolicyAwareRunnerContext` (which already declares `emitElicit`)
+  instead of an ad-hoc inline `RunnerContext & { emitElicit? }` that duplicated it, so both the
+  tool-gate and elicit paths reach the ctx through one named shape. Removed a dead unused `here`
+  binding from `pi-adapter.test.ts` and `pi-mappers.test.ts`. Type-only / test-only; no behaviour
+  change (the 202 executor-worktree tests are unchanged and pass).
+
+### Removed
+
+- **Remove the Codex runtime adapter (DHK-510).** Deleted `codex-adapter.ts`, `codex-mappers.ts`, and
+  their three test files; dropped the `codex` branch from `makeRunner`; removed the `codex --version`
+  probe from `detect-runtimes`; removed `@openai/codex-sdk` from `packages/executor-worktree` and
+  `apps/edge-node`. Pi reaches GPT/Codex models through OpenAI auth, so no model coverage is lost.
+
 ## [0.1.20] - 2026-07-18
 
 ### Added
