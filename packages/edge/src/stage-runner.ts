@@ -297,10 +297,6 @@ const ARTIFACT_CAP_BYTES = 64 * 1024;
 /** Worktree-relative directory workflows conventionally write deliverables to (mirrors the prompt
  *  guidance in the sample workflows). Scanned as a fallback when the declared path did not resolve. */
 const SCRATCH_OUTPUT_DIR = ".dahrk/scratch/output";
-/** Transition compat path (2/7 → 5/7): old-path workflow prompts write here; the compat symlink
- *  normally routes these to SCRATCH_OUTPUT_DIR, but we also read this directly as a fallback for
- *  worktrees set up before the symlink was introduced. Removed in 5/7 cleanup. */
-const SCRATCH_OUTPUT_DIR_LEGACY = ".skakel/scratch/output";
 
 function capContent(raw: string): string {
   return raw.length > ARTIFACT_CAP_BYTES ? raw.slice(0, ARTIFACT_CAP_BYTES) : raw;
@@ -336,26 +332,21 @@ function readEmittedArtifact(ref: WorkspaceRef, relPath: string): { path: string
 }
 
 /** Fallback: a markdown deliverable under the scratch output dir, preferring one whose basename
- *  matches the declared path (the agent may have written a differently-named file to the right dir).
- *  Tries the canonical `.dahrk/scratch/output` first; falls back to the legacy `.skakel/scratch/output`
- *  for worktrees set up before the compat symlink was introduced (removed in 5/7 cleanup). */
+ *  matches the declared path (the agent may have written a differently-named file to the right dir). */
 function scanScratchOutput(ref: WorkspaceRef, preferRel?: string): { path: string; content: string } | undefined {
   const preferBase = preferRel?.split("/").pop();
-  for (const dir of [SCRATCH_OUTPUT_DIR, SCRATCH_OUTPUT_DIR_LEGACY]) {
-    try {
-      const names = readdirSync(join(ref.worktreePath, dir)).filter((n) =>
-        n.toLowerCase().endsWith(".md"),
-      );
-      if (names.length === 0) continue;
-      const pick = (preferBase && names.includes(preferBase) ? preferBase : names[0]) as string;
-      const raw = readFileSync(join(ref.worktreePath, dir, pick), "utf8");
-      if (raw.trim().length === 0) continue;
-      return { path: `${dir}/${pick}`, content: capContent(raw) };
-    } catch {
-      /* try next candidate */
-    }
+  try {
+    const names = readdirSync(join(ref.worktreePath, SCRATCH_OUTPUT_DIR)).filter((n) =>
+      n.toLowerCase().endsWith(".md"),
+    );
+    if (names.length === 0) return undefined;
+    const pick = (preferBase && names.includes(preferBase) ? preferBase : names[0]) as string;
+    const raw = readFileSync(join(ref.worktreePath, SCRATCH_OUTPUT_DIR, pick), "utf8");
+    if (raw.trim().length === 0) return undefined;
+    return { path: `${SCRATCH_OUTPUT_DIR}/${pick}`, content: capContent(raw) };
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
 
 /** Last-resort fallback: any new or modified markdown file in the worktree (the agent wrote the

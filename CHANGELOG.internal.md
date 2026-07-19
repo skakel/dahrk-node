@@ -51,6 +51,15 @@ this file is left verbatim.
 
 ### Removed
 
+- **Remove the `.skakel/scratch` transition scaffolding (DHK-565).** Deleted `installCompatSymlink`
+  and `SCRATCH_DIR_COMPAT` from `git-service.ts`; removed the `.skakel/scratch` entry from
+  `excludeScratchLocally`, the `git rm --cached` for the compat symlink in `commitPending`, the
+  `SCRATCH_DIR_COMPAT` path checks in `isScratchPath`, and the `--exclude .skakel/scratch` from the
+  `git clean` in `reconcileInterrupted`. Removed `SCRATCH_OUTPUT_DIR_LEGACY` and its fallback loop
+  from `stage-runner.ts`. Removed the `.skakel/scratch/state.json` candidate from
+  `worktree-reaper.ts`. Dropped `.skakel/scratch/` from `.gitignore`. Updated test assertions that
+  checked for the compat path. No behaviour change for any worktree that was set up after 2/7.
+
 - **Remove the Codex runtime adapter (DHK-510).** Deleted `codex-adapter.ts`, `codex-mappers.ts`, and
   their three test files; dropped the `codex` branch from `makeRunner`; removed the `codex --version`
   probe from `detect-runtimes`; removed `@openai/codex-sdk` from `packages/executor-worktree` and

@@ -19,7 +19,6 @@ build/
 
 # Dahrk runtime scratch (worktree-local; never committed)
 .dahrk/scratch/
-.skakel/scratch/
 
 # logs / os
 *.log
