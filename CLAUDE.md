@@ -46,3 +46,19 @@ PR is opened, so during a workflow stage you cannot know N. That is expected.)
 **Before you finish, run `pnpm check:changelog`.** It is the same check CI runs, it sees your
 uncommitted work, and it tells you exactly what is missing. A red `changelog` job is always
 preventable.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in Linear (`skakel` workspace, Dahrk / DHK team), filed via the `capture-issue`
+skill. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
