@@ -773,6 +773,12 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
 
         // Run the stage, intercepting tool actions for policy and streaming progress.
         let denied = false;
+        // Deny reasons already surfaced to the human this stage. A cap or a retried blocked command
+        // denies every subsequent action with the SAME reason, and each `kind:"error"` progress frame
+        // becomes a Linear comment - so an uncapped storm posted a wall of identical comments (DHK-493).
+        // Reset per stage (this closure is per job); the trace + agent-facing observation still record
+        // every deny, we only collapse the human-visible comment to one per distinct reason.
+        const surfacedDenyReasons = new Set<string>();
         // DHK-392: a confinement breach caught only AFTER the tool ran. Claude blocks pre-execution
         // (`canUseTool`), so this can only happen on Codex/Pi, which expose no such hook - there the
         // command has already scanned whatever it scanned, and a quiet note on the summary would be a
@@ -796,7 +802,11 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
             streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "observation", runtime, toolUseId, isError: true, output: { error: reason } }));
           }
           streamEvent(writer.append({ seq: 0, ts: nowIso(), type: "state", runtime, event: "policy-deny", detail: reason }));
-          deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: reason });
+          const surfaceKey = `${verdict.policy}\0${reason}`;
+          if (!surfacedDenyReasons.has(surfaceKey)) {
+            surfacedDenyReasons.add(surfaceKey);
+            deps.sendProgress({ jobId, kind: "error", ts: nowIso(), text: reason });
+          }
         };
         const authorizeToolUse = (tool: string, input: unknown): PolicyOutcome => {
           const verdict = evaluatePolicies({ kind: "action", stageId, tool, input }, rules);

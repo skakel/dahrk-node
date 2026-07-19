@@ -460,6 +460,76 @@ test("Claude-style runner authorization denies a policy-blocked tool before exec
   }
 });
 
+test("repeated identical policy denials surface only one human-visible error (DHK-493)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dahrk-sr-denyspam-"));
+  const repo = join(root, "repo");
+  execFileSync("mkdir", ["-p", repo]);
+  initRepo(repo);
+
+  const streamed: TraceEvent[] = [];
+  const progress: JobProgress[] = [];
+  const sink: TraceSink = {
+    event: (f) => void streamed.push(f.event),
+    finalised: () => undefined,
+    requestBlobUrl: async (req) => ({ key: `k/${req.sha256}` }),
+  };
+
+  // A runner that attempts the SAME denied command several times, as a capped or looping agent would.
+  const makeSpammingRunner = (runtime: Runner["runtime"]): Runner => ({
+    runtime,
+    async runBatch(ctx) {
+      const authorize = (ctx as RunnerContext & { authorizeToolUse?: (tool: string, input: unknown) => { verdict: string } })
+        .authorizeToolUse;
+      for (let i = 0; i < 5; i++) {
+        const verdict = authorize?.("Bash", { command: "sudo true" });
+        assert.equal(verdict?.verdict, "deny");
+      }
+      return { status: "ok" };
+    },
+    async runInteractive() {
+      return { status: "ok", summary: "n/a" };
+    },
+    async summarise() {
+      return "n/a";
+    },
+    async cancel() {},
+  });
+
+  const runner = createStageRunner({
+    gitService: createGitService({ worktreesDir: join(root, "wt"), mirrorsDir: join(root, "mir") }),
+    makeRunner: makeSpammingRunner,
+    rules: [],
+    sendProgress: (p) => void progress.push(p),
+    trace: sink,
+  });
+
+  const job: JobRequest = {
+    tenantId: "t_default",
+    runId: "run-denyspam-1",
+    stageId: "build",
+    jobId: "job-denyspam-1",
+    awakeableId: "awk-denyspam",
+    executorType: "worktree",
+    agentConfig: { runtime: "claude-code", interaction: "batch" },
+    workspaceRef: { repoId: "repo", gitUrl: repo, repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
+    policies: [{ shell_guard: { mode: "deny" } }],
+    timeout: 60,
+  };
+
+  try {
+    const result = await runner.runJob(job);
+    assert.equal(result.status, "ok");
+    // Every deny is still recorded in the trace (observability is unchanged)...
+    const denyEvents = streamed.filter((e) => e.type === "state" && (e as { event?: string }).event === "policy-deny");
+    assert.equal(denyEvents.length, 5, "each denied action is recorded once in the trace");
+    // ...but the human-visible error frame (which becomes a Linear comment) is collapsed to one.
+    const errorFrames = progress.filter((p) => p.kind === "error" && /shell command blocked/.test(p.text ?? ""));
+    assert.equal(errorFrames.length, 1, "the same deny reason surfaces at most one comment per stage");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("artifact resolution rejects paths that escape the worktree", () => {
   const root = mkdtempSync(join(tmpdir(), "dahrk-artifact-"));
   const worktreePath = join(root, "worktree");

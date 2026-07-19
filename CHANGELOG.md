@@ -18,6 +18,11 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Fixed
 
+- **A repeated policy denial no longer posts a duplicate comment for every blocked action.** When a
+  governance policy denied the same action over and over - a retried blocked command, or an agent that
+  kept calling tools after a cap - each denial streamed its own error, so the run's thread filled with
+  identical messages. The node now surfaces at most one human-visible error per distinct deny reason
+  per stage; the full trace and the agent-facing denial are unchanged, so nothing observable is lost.
 - **A pinned component is no longer written into a worktree the runtime cannot read.** The component
   overlay only special-cased Codex for warn-and-skip, so any other non-Claude runtime (for instance
   Pi) fell through and had Claude-convention `.claude/` files written into its worktree that it never
