@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-07-19
+
 ### Added
 
 - **A base-advanced merge conflict with no genuine content overlap now integrates and pushes clean
@@ -71,11 +73,10 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 ### Changed
 
 - **The in-worktree scratch directory is now `.dahrk/scratch` instead of `.skakel/scratch`.** The node
-  pre-writes stage inputs and reads the output deliverable from `.dahrk/scratch`; the old path is kept
-  reachable via a compat symlink (`.skakel/scratch → .dahrk/scratch`) placed in every worktree, so
-  workflow prompts that still reference `.skakel/scratch/output` continue to work until they are
-  republished. Both paths are excluded from git. The symlink and old-path fallback will be removed in a
-  later cleanup release once all prompts have been updated.
+  pre-writes stage inputs and reads the output deliverable from `.dahrk/scratch`, which is excluded from
+  git. This release completes the rename in a single step, with no `.skakel/scratch` compat shim: any
+  workflow prompt that still references `.skakel/scratch/output` must be updated to point at
+  `.dahrk/scratch/output`, or the stage will not find its deliverable.
 
 - **The node now acknowledges cancels, so a cancel survives a hub restart or a dropped connection.**
   A `cancel` used to be handled and forgotten: the node aborted the stage but told the hub nothing, so
@@ -794,7 +795,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/dahrkai/dahrk-node/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/dahrkai/dahrk-node/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/dahrkai/dahrk-node/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/dahrkai/dahrk-node/compare/v0.1.17...v0.1.18

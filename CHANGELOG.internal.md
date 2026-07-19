@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-07-19
+
 ### Added
 
 - **Wire brokered MCP into the Pi adapter via the node-local gateway proxy (DHK-507).** Added
