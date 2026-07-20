@@ -20,7 +20,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { ElicitQuestion, HumanTurn, JobResult, JobStatus, PolicyOutcome, Runner, RunnerContext } from "@dahrk/contracts";
+import type { HumanTurn, JobResult, JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumeClaudeMessage, newBufferState, type BufferState } from "./claude-mappers.js";
 import {
   makeEmit,
@@ -30,9 +30,11 @@ import {
   hasSystemPrompt,
   interactiveSeedText,
   createElicitTurnRouter,
+  elicitOutcomeReply,
   SUMMARISE_PROMPT,
   ManagedMailbox,
   type EmittableEvent,
+  type PolicyAwareRunnerContext,
 } from "./runner-shared.js";
 import { createStageCompleteTool } from "./stage-complete-tool.js";
 import { createAskUserQuestionTool, ASK_USER_QUESTION_ALIAS } from "./ask-user-question-tool.js";
@@ -54,13 +56,6 @@ const HANDED_BACK_ARTIFACT_PATH = ".dahrk/scratch/output/document.md";
  * a per-workflow prompt nudge. (Omitting systemPrompt left the batch stage with no cwd context.)
  */
 const CLAUDE_CODE_SYSTEM_PROMPT = { type: "preset", preset: "claude_code" } as const;
-
-type PolicyAwareRunnerContext = RunnerContext & {
-  authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
-  /** Surface an interactive-stage `AskUserQuestion` as a Linear `select` elicitation (DHK-344).
-   *  Supplied by the stage runner; absent in tests that do not exercise the elicit path. */
-  emitElicit?: (question: ElicitQuestion) => void;
-};
 
 const userMsg = (text: string): SDKUserMessage => ({
   type: "user",
@@ -304,22 +299,13 @@ export function createClaudeRunner(): Runner {
             emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
             (ctx as PolicyAwareRunnerContext).emitElicit?.(question);
           });
-          switch (outcome.kind) {
-            case "reply":
-              return `The user selected: ${outcome.text}`;
-            case "busy":
-              return "Only one question can be asked at a time; wait for the current one to be answered, then ask again.";
-            case "noreply":
-              return "No response from the user; proceed with your best judgement.";
-            case "cancel":
-              return "The question was cancelled.";
-          }
+          return elicitOutcomeReply(outcome);
         },
       });
 
       // Interactive stages have full tool parity with batch stages: a prompt that writes files or
       // explores the repo works the same as in a batch stage (customers bring all kinds of prompts,
-      // and Pi/Codex interactive already allow tools). The S2 spike gated tools to keep the stage
+      // and Pi interactive already allows tools). The S2 spike gated tools to keep the stage
       // conversational and avoid an execute-loop that never settled a per-turn result; that risk is
       // accepted here and bounded by maxTurns (forces a result) plus the edge's job.timeout wall-clock
       // kill. Edge policy still observes every action via onTrace exactly as for batch. The one
