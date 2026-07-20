@@ -86,6 +86,25 @@ test("registerRepo: a stored record with a different branch surfaces drift", asy
   }
 });
 
+test("registerRepo: a stale HTTPS/old-name gitUrl surfaces as drift (DHK-249)", async () => {
+  // The exact DHK-249 shape: the hub stores an HTTPS URL to the pre-rename name, which an ambient
+  // (SSH-only) node cannot clone. A re-run from a correct checkout must flag it, not silently pass.
+  const ssh: RepoFacts = { ...repo, gitUrl: "git@github.com:skakel/dahrk-node.git" };
+  const { fetch } = fakeFetch({ status: 200, body: { ...ssh, gitUrl: "https://github.com/skakel/dahrk.git" } });
+  const result = await registerRepo({ fetch }, { base: "https://api.dahrk.ai", token: "tok", repo: ssh });
+  assert.equal(result.kind, "already");
+  if (result.kind === "already") {
+    assert.equal(result.drift?.gitUrl, "https://github.com/skakel/dahrk.git");
+  }
+});
+
+test("registerRepo: a stored record identical to ours reports no drift", async () => {
+  const { fetch } = fakeFetch({ status: 200, body: { ...repo } });
+  const result = await registerRepo({ fetch }, { base: "https://api.dahrk.ai", token: "tok", repo });
+  assert.equal(result.kind, "already");
+  if (result.kind === "already") assert.equal(result.drift, undefined);
+});
+
 test("registerRepo: a network failure is an error, not a throw", async () => {
   const fn = (async () => {
     throw new Error("ECONNREFUSED");
