@@ -134,7 +134,7 @@ export interface RegisterDeps {
  *  `error` is a hard failure with a message to print. */
 export type RegisterResult =
   | { kind: "registered" }
-  | { kind: "already"; drift?: { branch?: string; name?: string } }
+  | { kind: "already"; drift?: { branch?: string; name?: string; gitUrl?: string } }
   | { kind: "error"; message: string };
 
 /** Read a response body as JSON, or undefined when it is empty / not JSON (a 409 may carry no body). */
@@ -147,14 +147,17 @@ async function readJson(res: Response): Promise<Record<string, unknown> | undefi
   }
 }
 
-/** Compare the hub's stored record to the freshly-derived facts and surface any branch/name drift, so the
- *  caller can warn that the stored record looks stale (still a success - `repo add` does not overwrite). */
-function driftOf(stored: Record<string, unknown> | undefined, repo: RepoFacts): { branch?: string; name?: string } | undefined {
+/** Compare the hub's stored record to the freshly-derived facts and surface any branch/name/gitUrl drift, so
+ *  the caller can warn that the stored record looks stale (still a success - `repo add` does not overwrite).
+ *  `gitUrl` drift is the DHK-249 case: the stored URL may be a stale HTTPS or old-name value that an ambient
+ *  (SSH-only) node cannot clone, and until now a re-run from a correct checkout could not even flag it. */
+function driftOf(stored: Record<string, unknown> | undefined, repo: RepoFacts): { branch?: string; name?: string; gitUrl?: string } | undefined {
   if (!stored) return undefined;
-  const drift: { branch?: string; name?: string } = {};
+  const drift: { branch?: string; name?: string; gitUrl?: string } = {};
   if (typeof stored.defaultBranch === "string" && stored.defaultBranch !== repo.defaultBranch) drift.branch = stored.defaultBranch;
   if (typeof stored.name === "string" && stored.name !== repo.name) drift.name = stored.name;
-  return drift.branch || drift.name ? drift : undefined;
+  if (typeof stored.gitUrl === "string" && stored.gitUrl !== repo.gitUrl) drift.gitUrl = stored.gitUrl;
+  return drift.branch || drift.name || drift.gitUrl ? drift : undefined;
 }
 
 /**

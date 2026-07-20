@@ -6,6 +6,15 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`dahrk repo add` now warns when the hub's stored git URL differs from what this checkout would
+  register.** The idempotent re-run already flagged a drifted default branch or display name; it now
+  also compares `gitUrl`, so a stale record - a URL left on HTTPS, or pointing at a repo's pre-rename
+  name, that an ambient (SSH-only) node cannot clone - is surfaced as a hint instead of passing
+  silently. The record is still left unchanged (`repo add` never overwrites); the warning tells the
+  operator to correct it in the hub.
+
 ## [0.1.21] - 2026-07-19
 
 ### Added

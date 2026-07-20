@@ -721,6 +721,7 @@ async function runRepoAdd(flags: RepoAddFlags): Promise<number> {
         const bits: string[] = [];
         if (result.drift.branch) bits.push(`branch ${result.drift.branch} (this repo is on ${repo.defaultBranch})`);
         if (result.drift.name) bits.push(`name ${result.drift.name}`);
+        if (result.drift.gitUrl) bits.push(`URL ${result.drift.gitUrl} (this repo registers as ${repo.gitUrl})`);
         uiOut(hint(`The hub's stored record differs - ${bits.join(", ")} - and was left unchanged.`));
       }
       return 0;
