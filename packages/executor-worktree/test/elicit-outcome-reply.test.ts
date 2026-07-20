@@ -5,7 +5,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { elicitOutcomeReply } from "../src/runner-shared.js";
+import { elicitOutcomeReply } from "../src/elicit-router.js";
 
 test("reply interpolates the selected text", () => {
   assert.equal(elicitOutcomeReply({ kind: "reply", text: "Option B" }), "The user selected: Option B");

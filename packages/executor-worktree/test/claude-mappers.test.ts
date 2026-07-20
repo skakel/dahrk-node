@@ -13,7 +13,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { TraceEvent } from "@dahrk/contracts";
 import { consumeClaudeMessage, mapClaudeMessage, newBufferState } from "../src/claude-mappers.js";
-import { makeEmit } from "../src/runner-shared.js";
+import { makeEmit } from "../src/runtime-session.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const traceSchema = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.resolve("@dahrk/contracts"))), "..", "schemas", "trace.schema.json"), "utf8"));

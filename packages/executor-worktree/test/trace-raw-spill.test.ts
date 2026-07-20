@@ -13,7 +13,7 @@ import type { TraceMeta } from "@dahrk/contracts";
 import type { SDKMessage as ClaudeMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createTraceWriter } from "../src/trace-writer.js";
 import { consumeClaudeMessage, newBufferState } from "../src/claude-mappers.js";
-import { makeEmit } from "../src/runner-shared.js";
+import { makeEmit } from "../src/runtime-session.js";
 
 const meta: TraceMeta = {
   tenantId: "t_default",

@@ -30,15 +30,14 @@ import {
 } from "./pi-auth.js";
 import {
   makeEmit,
-  elicitOutcomeReply,
-  runInteractiveLoop,
-  runBatchLoop,
   SUMMARISE_PROMPT,
   type PolicyAwareRunnerContext,
   type RuntimeSession,
   type RuntimeSessionHooks,
   type TurnResult,
-} from "./runner-shared.js";
+} from "./runtime-session.js";
+import { elicitOutcomeReply } from "./elicit-router.js";
+import { runInteractiveLoop, runBatchLoop } from "./turn-loop.js";
 import { askQuestionsSequentially } from "./ask-user-question-tool.js";
 
 /**
@@ -112,10 +111,6 @@ export interface PiSessionLike {
    */
   setToolCallGate?(gate: (toolName: string, input: unknown) => { block?: boolean; reason?: string } | undefined): void;
 }
-
-// `PolicyAwareRunnerContext` is defined once in `runner-shared.ts` and re-exported here so existing
-// consumers (e.g. `test/pi-adapter.test.ts`) keep importing it from this module.
-export type { PolicyAwareRunnerContext } from "./runner-shared.js";
 
 /**
  * The pure pre-execution decision (DHK-504), the Pi analogue of the Claude adapter's

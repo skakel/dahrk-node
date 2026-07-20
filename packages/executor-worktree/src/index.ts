@@ -49,7 +49,7 @@ export { createTraceWriter } from "./trace-writer.js";
 export type { TraceWriter } from "./trace-writer.js";
 
 /** A push/close async queue, reused by the edge as the per-job turn mailbox (M5b). */
-export { ManagedMailbox } from "./runner-shared.js";
+export { ManagedMailbox } from "./mailbox.js";
 
 /** Component provisioning: the content-addressed cache and the overlay-into-worktree step. */
 export { createPackCache, readManifestFiles } from "./pack-cache.js";

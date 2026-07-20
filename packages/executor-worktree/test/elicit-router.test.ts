@@ -6,7 +6,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { HumanTurn } from "@dahrk/contracts";
-import { ManagedMailbox, createElicitTurnRouter } from "../src/runner-shared.js";
+import { createElicitTurnRouter } from "../src/elicit-router.js";
+import { ManagedMailbox } from "../src/mailbox.js";
 
 const turn = (text: string): HumanTurn => ({ text, ts: "2026-07-10T00:00:00.000Z" });
 const windows = { firstReplyMs: 10_000, idleMs: 10_000 };

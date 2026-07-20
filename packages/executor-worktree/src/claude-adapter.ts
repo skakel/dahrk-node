@@ -23,19 +23,17 @@ import type { JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumeClaudeMessage, newBufferState, type BufferState } from "./claude-mappers.js";
 import {
   makeEmit,
-  resolveStagePrompt,
-  hasSystemPrompt,
-  elicitOutcomeReply,
-  runInteractiveLoop,
-  runBatchLoop,
   SUMMARISE_PROMPT,
-  ManagedMailbox,
   type EmittableEvent,
   type PolicyAwareRunnerContext,
   type RuntimeSession,
   type RuntimeSessionHooks,
   type TurnResult,
-} from "./runner-shared.js";
+} from "./runtime-session.js";
+import { resolveStagePrompt, hasSystemPrompt } from "./prompt-assembly.js";
+import { elicitOutcomeReply } from "./elicit-router.js";
+import { runInteractiveLoop, runBatchLoop } from "./turn-loop.js";
+import { ManagedMailbox } from "./mailbox.js";
 import { createStageCompleteTool, type StageCompleteTool } from "./stage-complete-tool.js";
 import { createAskUserQuestionTool, ASK_USER_QUESTION_ALIAS } from "./ask-user-question-tool.js";
 
