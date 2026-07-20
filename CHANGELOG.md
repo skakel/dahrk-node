@@ -8,6 +8,14 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- **A salvaged run-branch tip is now discoverable, and parked tips expire on a schedule.** When a new
+  run resets a branch that still held unpushed commits, the node parks the old tip at
+  `refs/dahrk/salvage/<branch>/<sha>` so it is never destroyed - but until now nothing told you it had
+  happened, and `git branch --contains` never lists it because it lives outside `refs/heads/*`. The
+  reap pass now reports how many tips are currently parked (`salvagedRefs` on the `EDGE_REAPED` log
+  line), and `docs/logging.md` documents how to find and recover one. Parked tips are also now
+  collected 14 days after parking (aged by park time, so a freshly parked tip always survives), so the
+  insurance cannot accumulate for ever. Parking behaviour itself is unchanged.
 - **`dahrk repo add` now warns when the hub's stored git URL differs from what this checkout would
   register.** The idempotent re-run already flagged a drifted default branch or display name; it now
   also compares `gitUrl`, so a stale record - a URL left on HTTPS, or pointing at a repo's pre-rename

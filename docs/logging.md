@@ -75,6 +75,36 @@ Two deliberate choices there:
   run can stall until it re-dispatches. Logging loudly and surviving is the better trade. Set
   `DAHRK_CRASH_EXIT=1` if you would rather your supervisor restart it.
 
+## Recovering a run branch whose commits look lost
+
+Symptom: a run branch (`chore/issue-DHK-…`, say) appears **reset to base** and your commits are gone;
+`git branch -a --contains <sha>` finds nothing, so the commit looks dangling and one `git gc` from
+destruction.
+
+It almost certainly is not. When a new run of the same issue resets a branch that still held unpushed
+commits, the node parks the old tip **before** the reset, at a ref outside `refs/heads/*`:
+
+```
+refs/dahrk/salvage/<branch>/<sha12>
+```
+
+It lives outside `refs/heads/*` by design - so it claims no branch name and no worktree - which is
+exactly why `git branch --contains` never lists it. To find and recover a parked tip:
+
+```bash
+# in the bare mirror for the repo (~/.dahrk/mirrors/<repo>)
+git for-each-ref refs/dahrk/salvage/        # every parked tip, newest sha last
+git branch recovered-work <the-ref>         # put it back on a real branch
+```
+
+The node also records how many tips are currently parked on every reap pass, in the `EDGE_REAPED`
+log line (`dahrk logs`), under `salvagedRefs`.
+
+**Lifetime.** Parked refs are not kept for ever: the worktree reaper collects one **14 days after it
+was parked** (aged by park time, not the commit's date, so a fresh park always survives its first
+sweeps). If work has gone missing, recover it well inside that window rather than relying on the ref
+still being there weeks later.
+
 ## Secrets
 
 A node holds real credentials: your SSH keys, your `gh` token, `DAHRK_GIT_TOKEN`, your Anthropic
