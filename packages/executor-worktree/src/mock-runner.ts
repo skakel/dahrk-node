@@ -3,7 +3,7 @@
  * batch run emits a deterministic thought -> action -> observation -> response
  * trace and returns `ok`. This lets the edge's stage runner, worktree, trace
  * producer, policy hook, and the whole hub<->edge path be exercised end-to-end
- * before M4 adds the real Claude and Codex adapters behind the same interface.
+ * before M4 adds the real Claude and Pi adapters behind the same interface.
  *
  * The single `action` it emits carries the stage's first configured tool (else
  * "shell"), so a policy that denies that tool can be exercised in tests.

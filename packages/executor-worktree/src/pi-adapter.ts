@@ -4,13 +4,12 @@
  * managed node): a single runtime that attaches different provider subscriptions via brokered
  * inference creds (`runtimeEnv`). It runs a stage to a terminal result
  * (batch) or across multi-turn human input (interactive), emitting the SAME normalised trace
- * envelope the Claude and Codex adapters produce, supplies the engine-owned summary, and
+ * envelope the Claude adapter produces, supplies the engine-owned summary, and
  * cancels cleanly.
  *
  * No LLM call decides control flow: this is the inside of a stage. The pure event -> envelope
- * mapping lives in ./pi-mappers.ts. Modelled on the Codex adapter:
- * like Codex, Pi has no live low-latency prompt injection, so interactive turns resume one at a
- * time (each human turn is one `session.prompt()` awaited to completion).
+ * mapping lives in ./pi-mappers.ts. Pi has no live low-latency prompt injection, so interactive
+ * turns resume one at a time (each human turn is one `session.prompt()` awaited to completion).
  *
  * The live SDK is reached through a small injectable session factory (`PiSessionFactory`).
  * `createPiRunner()` defaults to the real `createAgentSession`; tests inject a scripted fake
@@ -19,7 +18,7 @@
  * import so the build does not hard-depend on a live Pi install.
  */
 import { join } from "node:path";
-import type { ElicitQuestion, HumanTurn, JobResult, JobStatus, PolicyOutcome, Runner, RunnerContext } from "@dahrk/contracts";
+import type { ElicitQuestion, HumanTurn, JobResult, JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumePiEvent, newPiBufferState, type PiEvent } from "./pi-mappers.js";
 import {
   readAuthHint,
@@ -36,8 +35,10 @@ import {
   resolveStagePrompt,
   interactiveSeedText,
   createElicitTurnRouter,
+  elicitOutcomeReply,
   SUMMARISE_PROMPT,
   type EmittableEvent,
+  type PolicyAwareRunnerContext,
 } from "./runner-shared.js";
 import { askQuestionsSequentially } from "./ask-user-question-tool.js";
 
@@ -116,15 +117,9 @@ export interface PiSessionLike {
   setToolCallGate?(gate: (toolName: string, input: unknown) => { block?: boolean; reason?: string } | undefined): void;
 }
 
-/**
- * The stage runner puts `authorizeToolUse` on the RunnerContext for every runtime (the edge policy
- * gate) plus `emitElicit` for elicitation; neither is on the base `RunnerContext` type. Mirrors the
- * Claude adapter's `PolicyAwareRunnerContext`.
- */
-export type PolicyAwareRunnerContext = RunnerContext & {
-  authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
-  emitElicit?: (question: ElicitQuestion) => void;
-};
+// `PolicyAwareRunnerContext` is defined once in `runner-shared.ts` and re-exported here so existing
+// consumers (e.g. `test/pi-adapter.test.ts`) keep importing it from this module.
+export type { PolicyAwareRunnerContext } from "./runner-shared.js";
 
 /**
  * The pure pre-execution decision (DHK-504), the Pi analogue of the Claude adapter's
@@ -380,16 +375,7 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
           emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
           elicitCtx.emitElicit?.(question);
         });
-        switch (outcome.kind) {
-          case "reply":
-            return `The user selected: ${outcome.text}`;
-          case "busy":
-            return "Only one question can be asked at a time; wait for the current one to be answered, then ask again.";
-          case "noreply":
-            return "No response from the user; proceed with your best judgement.";
-          case "cancel":
-            return "The question was cancelled.";
-        }
+        return elicitOutcomeReply(outcome);
       };
       // Hand the batch dispatcher to the live session so its `ask_user_question` tool's execute can
       // reach it. A batch of questions is asked one at a time (the router forbids concurrent asks).
@@ -640,7 +626,7 @@ async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike
       // same soft note the router's no-reply path returns rather than blocking or erroring.
       const text = askHandler
         ? await askHandler((params as { questions: AskUserQuestions }).questions)
-        : "No response from the user; proceed with your best judgement.";
+        : elicitOutcomeReply({ kind: "noreply" });
       return { content: [{ type: "text", text }], details: {} };
     },
   });

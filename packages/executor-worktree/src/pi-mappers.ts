@@ -2,10 +2,10 @@
  * Pure Pi (`@earendil-works/pi-coding-agent`) session-event -> normalised trace envelope
  * mapping. Spike B: this de-risks the envelope mapping BEFORE the full runtime
  * adapter. It maps Pi `AgentSessionEvent`s DIRECTLY onto the SAME envelope the
- * Claude and Codex mappers produce, so a cross-runtime reader (a later stage, an `on_fail`
+ * Claude mapper produces, so a cross-runtime reader (a later stage, an `on_fail`
  * re-run, the optimiser) never sees a runtime-specific shape.
  *
- * The load-bearing difference from Claude/Codex: Pi STREAMS assistant text and reasoning as
+ * The load-bearing difference from Claude: Pi STREAMS assistant text and reasoning as
  * `message_update` deltas rather than delivering whole messages/items, so the response cannot
  * be read off a single message. The buffered state machine below (`consumePiEvent`) accumulates
  * deltas and settles at `turn_end`/`agent_end`, applying cyrus's CYPACK-1177 rule exactly as
@@ -78,7 +78,7 @@ export interface MapResult {
   recognised: boolean;
 }
 
-/** Pi `Usage` -> the envelope's usage shape, identical to what the Claude/Codex mappers produce.
+/** Pi `Usage` -> the envelope's usage shape, identical to what the Claude mapper produces.
  *  Pi's `cacheWrite` is the cache-creation counter (Claude's `cache_creation_input_tokens`). */
 export function mapUsage(u?: PiUsage): TraceMeta["usage"] {
   return {

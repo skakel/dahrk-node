@@ -1,12 +1,12 @@
 /**
- * Shared scaffolding for the real runner adapters (Claude, Codex). None of this is
+ * Shared scaffolding for the real runner adapters (Claude, Pi). None of this is
  * runtime-specific: it bridges the pure mappers (which emit envelope bodies) to the
  * stage runner's `onTrace`, supplies the engine-owned summarisation prompt, and the
  * streaming-prompt + idle-race primitives the interactive loop needs.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { HumanTurn, Runtime, RunnerContext, TraceEvent } from "@dahrk/contracts";
+import type { ElicitQuestion, HumanTurn, PolicyOutcome, Runtime, RunnerContext, TraceEvent } from "@dahrk/contracts";
 import { attachedDocBasename } from "@dahrk/contracts";
 
 /** Distributive Omit: a plain `Omit<Union, K>` collapses to the union's common keys and
@@ -16,6 +16,18 @@ type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K>
 /** An envelope body the mappers produce: the stage runner's TraceWriter owns seq, and
  *  the adapter stamps ts/runtime/rawRef, so the mapper never sets them. */
 export type EmittableEvent = DistributiveOmit<TraceEvent, "seq" | "ts" | "runtime" | "rawRef">;
+
+/**
+ * The stage runner puts `authorizeToolUse` on the RunnerContext for every runtime (the edge policy
+ * gate) plus `emitElicit` for elicitation; neither is on the base `RunnerContext` type. Shared by both
+ * runtime adapters so the policy-aware shape is defined once.
+ */
+export type PolicyAwareRunnerContext = RunnerContext & {
+  authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
+  /** Surface an interactive-stage structured question as a Linear `select` elicitation (DHK-344).
+   *  Supplied by the stage runner; absent in tests that do not exercise the elicit path. */
+  emitElicit?: (question: ElicitQuestion) => void;
+};
 
 /**
  * The engine-owned summarisation prompt (build spec section 9): one constrained turn that
@@ -231,7 +243,7 @@ export const OPENING_KICKOFF =
  * triggered by a Linear label or mention whose text rides in `issueContext`, never as a queued human
  * turn, so without a seed the runner would idle until it timed out with the model never running. Pass
  * `instructionInSystemPrompt: true` when the adapter already carries the stage instruction as a system
- * prompt (Claude, when `hasSystemPrompt(ctx)`) so a short kickoff suffices; otherwise (Codex, Pi, or a
+ * prompt (Claude, when `hasSystemPrompt(ctx)`) so a short kickoff suffices; otherwise (Pi, or a
  * bare-skill Claude stage) seed the full resolved prompt so the agent has its instructions.
  */
 export function interactiveSeedText(ctx: RunnerContext, instructionInSystemPrompt: boolean): string {
@@ -341,6 +353,21 @@ export type ElicitOutcome =
   | { kind: "noreply" }
   | { kind: "cancel" }
   | { kind: "busy" };
+
+/** Map an elicit outcome to the exact tool-result text the model reads. Shared so both adapters
+ *  (and the Pi no-handler fallback) return byte-identical strings. */
+export function elicitOutcomeReply(outcome: ElicitOutcome): string {
+  switch (outcome.kind) {
+    case "reply":
+      return `The user selected: ${outcome.text}`;
+    case "busy":
+      return "Only one question can be asked at a time; wait for the current one to be answered, then ask again.";
+    case "noreply":
+      return "No response from the user; proceed with your best judgement.";
+    case "cancel":
+      return "The question was cancelled.";
+  }
+}
 
 /**
  * Fan a single relayed human-turn stream out into (a) conversational turns the interactive loop reads

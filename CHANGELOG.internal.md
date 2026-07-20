@@ -19,6 +19,17 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Changed
+
+- **Unify the shared runtime-adapter helpers (DHK-591).** Collapsed the pieces the Pi and Claude
+  adapters copied between themselves into single shared definitions in `runner-shared.ts`, with no
+  behaviour change: `PolicyAwareRunnerContext` is now defined once and imported by both adapters
+  (`pi-adapter.ts` re-exports it so existing consumers keep resolving the name), and the elicit
+  outcome→text mapping lives in one `elicitOutcomeReply` helper used by both adapters and the Pi
+  no-handler fallback, so the four tool-result strings appear exactly once. Also swept the stale
+  "Codex" references (left over from the removed runtime, DHK-510) out of the executor-worktree
+  adapter/mapper/shared comments.
+
 ## [0.1.21] - 2026-07-19
 
 ### Added
