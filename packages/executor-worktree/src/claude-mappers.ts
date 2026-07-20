@@ -13,7 +13,7 @@
  */
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { JobStatus, TraceMeta } from "@dahrk/contracts";
-import type { EmittableEvent } from "./runner-shared.js";
+import type { EmittableEvent } from "./runtime-session.js";
 
 export interface MapResult {
   events: EmittableEvent[];

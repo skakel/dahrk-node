@@ -34,6 +34,16 @@ this file is left verbatim.
 
 ### Changed
 
+- **Split `runner-shared.ts` into five concern-named modules.** The 666-line file had accreted six
+  unrelated tenants behind one filename; a pure move (no signature, logic, or behaviour change)
+  relocated them into `prompt-assembly.ts` (stage-prompt building + defang), `mailbox.ts`
+  (`ManagedMailbox`, still exported from `index.ts`), `runtime-session.ts` (the `RuntimeSession` port,
+  `TurnResult`, hooks, `makeEmit`/`EmittableEvent`, `PolicyAwareRunnerContext`, `SUMMARISE_PROMPT`),
+  `elicit-router.ts` (the DHK-344 one-at-a-time router), and `turn-loop.ts` (`runInteractiveLoop` /
+  `runBatchLoop` + idle/coalesce timing). Dependency direction is strictly acyclic. Import sites in
+  both adapters, the mappers, and the test suites were repointed and `runner-shared.ts` deleted; the
+  `PolicyAwareRunnerContext` back-compat re-export in `pi-adapter.ts` went with it. No test bodies
+  changed - the existing `executor-worktree` suite is the safety net.
 - **Move the Claude adapter onto `RuntimeSession`; both runtimes drive one loop (DHK-594).** Converted
   `createClaudeRunner` to build a `RuntimeSession` (`makeClaudeRuntimeSession`) over the existing
   `ClaudeSessionLike` transport and deleted its private seed → race → coalesce → settle loop: `runBatch`

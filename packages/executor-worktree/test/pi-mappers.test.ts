@@ -19,7 +19,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { TraceEvent } from "@dahrk/contracts";
 import { consumePiEvent, mapPiEvent, newPiBufferState, type PiEvent } from "../src/pi-mappers.js";
 import { consumeClaudeMessage, newBufferState } from "../src/claude-mappers.js";
-import { makeEmit } from "../src/runner-shared.js";
+import { makeEmit } from "../src/runtime-session.js";
 
 const traceSchema = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.resolve("@dahrk/contracts"))), "..", "schemas", "trace.schema.json"), "utf8"));
 const ajv = new Ajv2020({ allErrors: true, strict: false });

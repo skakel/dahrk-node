@@ -22,7 +22,8 @@ import {
   type ClaudeSessionLike,
 } from "../src/claude-adapter.js";
 import type { StageCompleteTool } from "../src/stage-complete-tool.js";
-import { ManagedMailbox, SUMMARISE_PROMPT } from "../src/runner-shared.js";
+import { SUMMARISE_PROMPT } from "../src/runtime-session.js";
+import { ManagedMailbox } from "../src/mailbox.js";
 import { makeRunner } from "../src/index.js";
 
 const cm = (x: unknown): SDKMessage => x as SDKMessage;

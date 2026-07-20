@@ -8,7 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { HumanTurn, RunnerContext, TraceEvent, WorkspaceRef } from "@dahrk/contracts";
 import { createMockRunner } from "../src/mock-runner.js";
-import { ManagedMailbox } from "../src/runner-shared.js";
+import { ManagedMailbox } from "../src/mailbox.js";
 
 const ws: WorkspaceRef = { repoId: "r", gitUrl: "https://example.invalid/r.git", repo: "r", baseBranch: "main", worktreePath: "/tmp/r", scratchPath: "/tmp/r/.dahrk" };
 const ctx: RunnerContext = { config: { runtime: "claude-code", interaction: "interactive" }, workspace: ws };

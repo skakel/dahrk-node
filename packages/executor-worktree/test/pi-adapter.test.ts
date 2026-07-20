@@ -25,11 +25,11 @@ import {
   piToolCallDecision,
   type AskUserQuestions,
   type PiSessionLike,
-  type PolicyAwareRunnerContext,
   PI_STAGE_COMPLETE_TOOL,
 } from "../src/pi-adapter.js";
 import { makeRunner } from "../src/index.js";
-import { ManagedMailbox } from "../src/runner-shared.js";
+import { ManagedMailbox } from "../src/mailbox.js";
+import type { PolicyAwareRunnerContext } from "../src/runtime-session.js";
 
 const traceSchema = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.resolve("@dahrk/contracts"))), "..", "schemas", "trace.schema.json"), "utf8"));
 const ajv = new Ajv2020({ allErrors: true, strict: false });

@@ -25,7 +25,7 @@
  * Pure: no SDK calls, no I/O.
  */
 import type { JobStatus, TraceMeta } from "@dahrk/contracts";
-import type { EmittableEvent } from "./runner-shared.js";
+import type { EmittableEvent } from "./runtime-session.js";
 
 /** Pi `Usage` (session-format.md): note `cacheWrite`, which we normalise to `cacheCreate`. */
 export interface PiUsage {

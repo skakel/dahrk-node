@@ -1,7 +1,7 @@
 /**
  * The shared interactive/batch loop, proven once against a runtime-agnostic `FakeRuntimeSession`.
  *
- * `runInteractiveLoop`/`runBatchLoop` (runner-shared.ts) drive the `RuntimeSession` port - a
+ * `runInteractiveLoop`/`runBatchLoop` (turn-loop.ts) drive the `RuntimeSession` port - a
  * turn-level seam (`sendTurn`/`summariseTurn`/`cost`/`dispose`) - and never see a `PiEvent` or an
  * `SDKMessage`. This suite scripts a fake session's per-turn `TurnResult`s and asserts the loop's
  * settle state machine across the five exit kinds (tool-exit / gate / timeout / cancel / coalesce)
@@ -11,15 +11,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { HumanTurn, RunnerContext } from "@dahrk/contracts";
-import {
-  runInteractiveLoop,
-  runBatchLoop,
-  ManagedMailbox,
-  type EmittableEvent,
-  type RuntimeSession,
-  type RuntimeSessionHooks,
-  type TurnResult,
-} from "../src/runner-shared.js";
+import { runInteractiveLoop, runBatchLoop } from "../src/turn-loop.js";
+import { ManagedMailbox } from "../src/mailbox.js";
+import type {
+  EmittableEvent,
+  RuntimeSession,
+  RuntimeSessionHooks,
+  TurnResult,
+} from "../src/runtime-session.js";
 
 /**
  * A scripted `RuntimeSession`: each `sendTurn` shifts the next scripted `TurnResult` (default a

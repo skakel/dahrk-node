@@ -15,7 +15,7 @@ import {
   interactiveSeedText,
   OPENING_KICKOFF,
   MAX_INLINE_DOC_CHARS,
-} from "../src/runner-shared.js";
+} from "../src/prompt-assembly.js";
 
 const workspace = (worktreePath: string): WorkspaceRef => ({
   repoId: "sample-repo",
