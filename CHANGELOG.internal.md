@@ -19,6 +19,19 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Added
+
+- **Give the Claude adapter an injectable session seam + characterisation tests (DHK-592).** Wrapped
+  the Claude Agent SDK `query()` (and the interactive streaming `ManagedMailbox`) behind an injectable
+  factory (`ClaudeRunnerDeps.createSession` / `ClaudeSessionLike`), mirroring Pi's
+  `PiRunnerDeps.createSession` / `PiSessionLike`; the default remains the live `query()`-backed
+  session, so production behaviour is unchanged. Added a scripted `FakeClaudeSession` and a
+  `claude-adapter.test.ts` that drives `createClaudeRunner` without live inference or credentials -
+  Claude's interactive settle logic is now covered end-to-end for the first time, pinning every exit
+  kind (tool-exit, gate-summarise, idle-timeout, cancel, burst-coalescing) plus the batch/summarise
+  outputs. Supporting change: `StageCompleteTool` gained a `capture()` entry point (the body the live
+  MCP handler already runs) so the fake can drive a tool-exit without the SDK.
+
 ### Changed
 
 - **Unify the shared runtime-adapter helpers (DHK-591).** Collapsed the pieces the Pi and Claude

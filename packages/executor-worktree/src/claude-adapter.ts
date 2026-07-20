@@ -16,7 +16,6 @@ import { join } from "node:path";
 import {
   query,
   type Options,
-  type Query,
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -36,7 +35,7 @@ import {
   type EmittableEvent,
   type PolicyAwareRunnerContext,
 } from "./runner-shared.js";
-import { createStageCompleteTool } from "./stage-complete-tool.js";
+import { createStageCompleteTool, type StageCompleteTool } from "./stage-complete-tool.js";
 import { createAskUserQuestionTool, ASK_USER_QUESTION_ALIAS } from "./ask-user-question-tool.js";
 
 /** Debounce window for coalescing a burst of rapid human turns into one user message. */
@@ -162,10 +161,72 @@ export function runtimeEnvOptions(ctx: RunnerContext): Partial<Options> {
   return { env: { ...process.env, ...ctx.runtimeEnv } };
 }
 
-export function createClaudeRunner(): Runner {
+/**
+ * The subset of the Claude Agent SDK's `query()` the adapter drives, behind an injectable factory
+ * (mirroring Pi's `PiSessionLike`). Wrapping `query()` AND the interactive streaming mailbox here lets
+ * a scripted `FakeClaudeSession` drive the adapter's orchestration without live inference or
+ * credentials - the seam DHK-592 introduces so Claude's interactive settle logic is covered end-to-end.
+ * A one-shot batch/summarise session iterates its messages directly; an interactive session owns a
+ * `ManagedMailbox` and receives turns via `push()`/`end()`.
+ */
+export interface ClaudeSessionLike extends AsyncIterable<SDKMessage> {
+  /** Interactive: enqueue a user turn (seed / coalesced human turn / summarise prompt). */
+  push(msg: SDKUserMessage): void;
+  /** Interactive: end the streaming mailbox so the underlying query drains and completes. */
+  end(): void;
+  /** Best-effort close of the underlying query. */
+  close(): void;
+  /** Cancel the in-flight turn. */
+  interrupt(): Promise<void>;
+}
+
+export interface ClaudeSessionInit {
+  /** One-shot prompt for batch/summarise. Absent => interactive: the session owns the mailbox and
+   *  turns arrive via `push()`/`end()`. */
+  prompt?: string;
+  options: Options;
+  /** Interactive only: the stage-complete tool handle, so a `FakeClaudeSession` can drive a
+   *  tool-exit. The default factory ignores it (the real server is already in `options.mcpServers`). */
+  stageTool?: StageCompleteTool;
+}
+
+export type CreateClaudeSession = (init: ClaudeSessionInit) => ClaudeSessionLike;
+
+export interface ClaudeRunnerDeps {
+  /** Override the session factory (tests inject a scripted fake). Defaults to the live `query()`. */
+  createSession?: CreateClaudeSession;
+}
+
+/**
+ * The live session factory: exactly today's `query()` + interactive `ManagedMailbox` usage, relocated
+ * behind the injectable seam so production behaviour is unchanged. A batch/summarise call passes a
+ * string `prompt` and iterates directly; an interactive call omits `prompt`, so the session owns a
+ * streaming mailbox that `push()`/`end()` drive.
+ */
+const defaultCreateClaudeSession: CreateClaudeSession = ({ prompt, options }) => {
+  const mailbox = prompt === undefined ? new ManagedMailbox<SDKUserMessage>() : undefined;
+  const q = query({ prompt: mailbox ?? prompt!, options });
+  const it = q[Symbol.asyncIterator]();
+  return {
+    [Symbol.asyncIterator]: () => it,
+    push: (m) => mailbox?.push(m),
+    end: () => mailbox?.end(),
+    close: () => {
+      try {
+        q.close();
+      } catch {
+        /* best effort */
+      }
+    },
+    interrupt: () => q.interrupt(),
+  };
+};
+
+export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): Runner {
+  const createSession = deps.createSession ?? defaultCreateClaudeSession;
   const abortController = new AbortController();
   let cancelled = false;
-  let active: Query | undefined;
+  let active: ClaudeSessionLike | undefined;
   let sessionId: string | undefined;
   let costUsd: number | undefined;
 
@@ -262,9 +323,9 @@ export function createClaudeRunner(): Runner {
       const state = newBufferState();
       let status: JobStatus = "ok";
       try {
-        const q = query({ prompt, options });
-        active = q;
-        for await (const msg of q) {
+        const session = createSession({ prompt, options });
+        active = session;
+        for await (const msg of session) {
           const res = handleMessage(msg, emit, ctx, state, false);
           if (res.isResult && res.status) status = res.status;
         }
@@ -340,10 +401,9 @@ export function createClaudeRunner(): Runner {
       const exit = ctx.config.exit ?? "either";
       const wantsTool = exit === "tool" || exit === "either";
 
-      const mailbox = new ManagedMailbox<SDKUserMessage>();
-      const q = query({ prompt: mailbox, options });
-      active = q;
-      const it = q[Symbol.asyncIterator]();
+      const session = createSession({ options, stageTool });
+      active = session;
+      const it = session[Symbol.asyncIterator]();
       // The interactive loop reads conversational turns from the router, not the raw stream: any turn
       // that answers an in-stage AskUserQuestion is consumed by the router and never reaches here.
       const humanIter = router.conversation[Symbol.asyncIterator]();
@@ -366,7 +426,7 @@ export function createClaudeRunner(): Runner {
         // or mention whose text rides in `issueContext` (the system prompt), never as a queued human
         // turn, so open the interview ourselves. Without this the runner idled on `raceNextTurn`
         // until the idle timeout with the model never running (status timeout, $0, no trace events).
-        mailbox.push(userMsg(interactiveSeedText(ctx, hasSystemPrompt(ctx))));
+        session.push(userMsg(interactiveSeedText(ctx, hasSystemPrompt(ctx))));
         await consumeTurn();
         if (stageTool.fired() && wantsTool) exited = "tool";
         while (exited === null) {
@@ -402,7 +462,7 @@ export function createClaudeRunner(): Runner {
             break;
           }
           if (exited === "cancelled") break;
-          mailbox.push(userMsg(texts.join("\n")));
+          session.push(userMsg(texts.join("\n")));
           await consumeTurn();
           if (stageTool.fired() && wantsTool) {
             exited = "tool";
@@ -423,7 +483,7 @@ export function createClaudeRunner(): Runner {
         // (deny tools for this turn) so the final handoff summary is prose, not more stage work.
         summarising = true;
         try {
-          mailbox.push(userMsg(SUMMARISE_PROMPT));
+          session.push(userMsg(SUMMARISE_PROMPT));
           const reply = await consumeTurn();
           summary = (reply ?? "").trim() || "(no summary produced)";
         } catch {
@@ -440,7 +500,7 @@ export function createClaudeRunner(): Runner {
         summary = "(stage cancelled)";
       }
 
-      mailbox.end();
+      session.end();
       // Drain any trailing messages, then close.
       try {
         for (;;) {
@@ -488,9 +548,9 @@ export function createClaudeRunner(): Runner {
       };
       try {
         let out = "";
-        const q = query({ prompt: SUMMARISE_PROMPT, options });
-        active = q;
-        for await (const msg of q) {
+        const session = createSession({ prompt: SUMMARISE_PROMPT, options });
+        active = session;
+        for await (const msg of session) {
           const found = sessionIdOf(msg);
           if (found) sessionId = found;
           if (msg.type === "result" && msg.subtype === "success") out += msg.result;

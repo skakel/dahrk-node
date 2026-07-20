@@ -26,11 +26,20 @@ export interface StageCompleteTool {
   summary(): string | null;
   /** The captured deliverable document body, or null if none was handed back. */
   document(): string | null;
+  /** Invoke the capture directly, exactly as the SDK's MCP handler does - the seam a
+   *  `FakeClaudeSession` uses to drive a stage-complete exit without running the live SDK. */
+  capture(args: { summary: string; document?: string }): void;
 }
 
 export function createStageCompleteTool(): StageCompleteTool {
   let captured: string | null = null;
   let capturedDoc: string | null = null;
+  // The capture body the SDK's MCP handler runs; extracted so a `FakeClaudeSession` can drive the
+  // tool-exit path without the live SDK. Production still fires via the handler below, unchanged.
+  const capture = (args: { summary: string; document?: string }): void => {
+    captured = args.summary;
+    if (args.document !== undefined) capturedDoc = args.document;
+  };
   const completeTool = tool(
     "dahrk_stage_complete",
     "End the current stage and hand off a one-sentence summary of what was accomplished. When the " +
@@ -45,8 +54,7 @@ export function createStageCompleteTool(): StageCompleteTool {
         .describe("The full markdown body of the stage's deliverable document, if any."),
     },
     async (args) => {
-      captured = args.summary;
-      if (args.document !== undefined) capturedDoc = args.document;
+      capture(args);
       return { content: [{ type: "text", text: "Stage marked complete." }] };
     },
   );
@@ -56,5 +64,6 @@ export function createStageCompleteTool(): StageCompleteTool {
     fired: () => captured !== null,
     summary: () => captured,
     document: () => capturedDoc,
+    capture,
   };
 }
