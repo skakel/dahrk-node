@@ -370,16 +370,18 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
     },
 
     async runInteractive(ctx, turns, onTrace) {
-      const hooks: RuntimeSessionHooks = { emit: makeEmit("pi", onTrace), ask: defaultAsk };
+      const emit = makeEmit("pi", onTrace);
       const s = await openSession(ctx);
       registerToolCallGate(s, ctx);
-      const rt = makePiRuntimeSession(s, ctx, hooks, true);
       // DHK-505: route the live session's injected `ask_user_question` tool through the shared elicit
-      // router. `runInteractiveLoop` installs the router-backed `hooks.ask` before the opening turn, and
-      // this closure reads `hooks.ask` lazily, so a question raised mid-turn reaches it. A batch of
+      // router. The loop assembles the router-backed hooks and calls this factory with them, so the
+      // handler is wired to the FINAL `ask` at construction (no lazy read of a swapped field). A batch of
       // questions is asked one at a time (the router forbids concurrent asks).
-      s.setAskUserQuestionHandler?.((questions) => askQuestionsSequentially(questions, (q) => hooks.ask(q)));
-      const result = await runInteractiveLoop(rt, ctx, turns, hooks, {
+      const makeSession = (hooks: RuntimeSessionHooks): RuntimeSession => {
+        s.setAskUserQuestionHandler?.((questions) => askQuestionsSequentially(questions, (q) => hooks.ask(q)));
+        return makePiRuntimeSession(s, ctx, hooks, true);
+      };
+      const result = await runInteractiveLoop(ctx, turns, emit, makeSession, {
         signal,
         cancelled: () => cancelled,
         cancel: () => this.cancel(),

@@ -16,8 +16,9 @@
  *     resolves when the agent run finishes, so the RPC `prompt()` resolves on `agent_end` too:
  *     the event is delivered to subscribers FIRST (settling the mapper buffer), then the pending
  *     `prompt()` promise resolves.
- *   - Events on stdout match the mapper's `PiEvent` shape, so each parsed event is forwarded to
- *     subscribers verbatim (no re-mapping); the adapter maps them via `consumePiEvent`.
+ *   - Events on stdout match the mapper's `PiEvent` shape. Each parsed line is validated at the wire
+ *     boundary by `parsePiEvent` (the stdout is untrusted subprocess output) and forwarded to
+ *     subscribers with no re-mapping; the adapter maps them via `consumePiEvent`.
  *   - `abort` -> `{type:"abort"}` resolves on its command ack; `get_state` returns
  *     `data.sessionId`, a best-effort resume token.
  *
@@ -26,7 +27,7 @@
  * (meta-loop stages are telemetry-only); `agent` is intentionally omitted from this class.
  */
 import { StringDecoder } from "node:string_decoder";
-import type { PiEvent } from "./pi-mappers.js";
+import { parsePiEvent, type PiEvent } from "./pi-mappers.js";
 import type { PiSessionLike } from "./pi-adapter.js";
 
 /**
@@ -234,8 +235,11 @@ export class PiRpcSession implements PiSessionLike {
       }
       return;
     }
-    // Anything that is not a command response is an agent event: forward it verbatim.
-    const ev = msg as PiEvent;
+    // Anything that is not a command response should be an agent event. Validate it at this boundary
+    // (the wire is untrusted subprocess stdout) rather than casting straight to `PiEvent`: a `null`, a
+    // primitive, or a malformed `message_update` would otherwise crash the mapper on first field access.
+    const ev = parsePiEvent(msg);
+    if (!ev) return; // not a command response and not a well-formed agent event: drop it
     for (const l of [...this.#listeners]) l(ev);
     // Deliver-then-resolve: the buffer settles on agent_end before the prompt promise resolves.
     if (ev.type === "agent_end" && this.#pendingAgentEnd) {

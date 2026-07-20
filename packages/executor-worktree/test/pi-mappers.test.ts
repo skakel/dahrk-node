@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { TraceEvent } from "@dahrk/contracts";
-import { consumePiEvent, mapPiEvent, newPiBufferState, type PiEvent } from "../src/pi-mappers.js";
+import { consumePiEvent, mapPiEvent, newPiBufferState, parsePiEvent, type PiEvent } from "../src/pi-mappers.js";
 import { consumeClaudeMessage, newBufferState } from "../src/claude-mappers.js";
 import { makeEmit } from "../src/runtime-session.js";
 
@@ -182,4 +182,32 @@ test("a failed agent_end maps to an error plus a failed stage-exit; noise and un
   assert.deepEqual(mapPiEvent(pe({ type: "compaction_start" })).events, []);
   assert.equal(mapPiEvent(pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x" } })).recognised, true);
   assert.equal(mapPiEvent(pe({ type: "some_future_event" })).recognised, false);
+});
+
+test("parsePiEvent: accepts well-formed events (known and unknown types) untouched", () => {
+  const good = { type: "agent_end", messages: [] };
+  assert.equal(parsePiEvent(good), good, "a valid event is returned by reference, not copied");
+  const msgUpdate = { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } };
+  assert.equal(parsePiEvent(msgUpdate), msgUpdate);
+  // An unknown type is still a well-formed event object; the mapper's default case treats it as noise.
+  assert.ok(parsePiEvent({ type: "some_future_event" }));
+});
+
+test("parsePiEvent: rejects non-events so the RPC boundary can drop them instead of crashing the mapper", () => {
+  assert.equal(parsePiEvent(null), null, "JSON null is valid JSON but not an event");
+  assert.equal(parsePiEvent(42), null);
+  assert.equal(parsePiEvent("agent_end"), null, "a bare string is not an event");
+  assert.equal(parsePiEvent([{ type: "agent_end" }]), null, "an array has no string `type`");
+  assert.equal(parsePiEvent({ foo: 1 }), null, "an object without a `type` is rejected");
+  assert.equal(parsePiEvent({ type: 7 }), null, "a non-string `type` is rejected");
+});
+
+test("parsePiEvent: a message_update missing its body is rejected (the one field the mapper dereferences unconditionally)", () => {
+  assert.equal(parsePiEvent({ type: "message_update" }), null);
+  assert.equal(parsePiEvent({ type: "message_update", assistantMessageEvent: null }), null);
+  assert.equal(parsePiEvent({ type: "message_update", assistantMessageEvent: "x" }), null);
+  // A rejected message_update never reaches consumePiEvent, so the `ame.type` access cannot throw.
+  const ev = parsePiEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "ok" } });
+  assert.ok(ev);
+  assert.doesNotThrow(() => consumePiEvent(ev as PiEvent, newPiBufferState(), false));
 });

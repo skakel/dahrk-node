@@ -26,6 +26,7 @@
  */
 import type { JobStatus, TraceMeta } from "@dahrk/contracts";
 import type { EmittableEvent } from "./runtime-session.js";
+import { decideResponse } from "./response-rule.js";
 
 /** Pi `Usage` (session-format.md): note `cacheWrite`, which we normalise to `cacheCreate`. */
 export interface PiUsage {
@@ -72,6 +73,28 @@ export type PiEvent =
   | { type: "turn_end"; message?: PiAssistantSummary; toolResults?: unknown[] }
   | { type: "agent_end"; messages?: PiAssistantSummary[] }
   | { type: PiNoiseType };
+
+/**
+ * Validate an untrusted parsed-JSON value from the RPC wire as a `PiEvent`, returning `null` if it is
+ * not one. The embedded SDK back-end hands the mapper real typed `AgentSessionEvent`s, but the RPC
+ * back-end (`PiRpcSession`) reads arbitrary JSON off a subprocess's stdout - a `null`, a primitive, or a
+ * `message_update` missing its body would otherwise be cast straight to `PiEvent` and crash the mapper
+ * on first field access (`ev.type`, `ev.assistantMessageEvent.type`). This guard is the single boundary
+ * where the wire becomes trusted: it pins exactly the invariants the mappers dereference unconditionally
+ * - an object with a string `type`, and a `message_update` whose `assistantMessageEvent` is an object.
+ * An unknown `type` passes through and is handled as noise by `mapPiEvent`'s default case; every other
+ * field is already read defensively downstream.
+ */
+export function parsePiEvent(msg: unknown): PiEvent | null {
+  if (typeof msg !== "object" || msg === null) return null;
+  const type = (msg as { type?: unknown }).type;
+  if (typeof type !== "string") return null;
+  if (type === "message_update") {
+    const ame = (msg as { assistantMessageEvent?: unknown }).assistantMessageEvent;
+    if (typeof ame !== "object" || ame === null) return null;
+  }
+  return msg as PiEvent;
+}
 
 export interface MapResult {
   events: EmittableEvent[];
@@ -229,12 +252,9 @@ export function consumePiEvent(
   if (ev.type === "turn_end" || ev.type === "agent_end") {
     const r = mapPiEvent(ev);
     const status = settleStatus(settleMessage(ev));
-    let responseText: string | undefined;
-    const text = state.bufferedText.trim();
-    if (status === "ok" && text && !state.turnEndedOnTool) {
-      responseText = text;
-      events.push({ type: "response", text });
-    }
+    // CYPACK-1177 settle decision, shared with the Claude mapper (response-rule.ts).
+    const decision = decideResponse(state.bufferedText, state.turnEndedOnTool, status);
+    if (decision.event) events.push(decision.event);
     // A trailing reasoning delta with no following tool/text still surfaces as a thought.
     if (state.pendingThought) {
       events.push({ type: "thought", subtype: "reasoning_text", text: state.pendingThought });
@@ -246,7 +266,7 @@ export function consumePiEvent(
     state.bufferedText = "";
     state.pendingThought = "";
     state.turnEndedOnTool = false;
-    return { events, isResult: true, status, responseText };
+    return { events, isResult: true, status, responseText: decision.responseText };
   }
 
   // Recognised lifecycle noise (and unknown events) contribute nothing to the buffer.

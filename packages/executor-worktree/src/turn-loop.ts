@@ -15,7 +15,12 @@ import type {
 } from "@dahrk/contracts";
 import { interactiveSeedText, resolveStagePrompt } from "./prompt-assembly.js";
 import { createElicitTurnRouter, elicitOutcomeReply } from "./elicit-router.js";
-import type { PolicyAwareRunnerContext, RuntimeSession, RuntimeSessionHooks } from "./runtime-session.js";
+import type {
+  PolicyAwareRunnerContext,
+  RuntimeSession,
+  RuntimeSessionFactory,
+  RuntimeSessionHooks,
+} from "./runtime-session.js";
 
 /**
  * The idle windows (ms) an interactive stage waits for human input. Two distinct windows:
@@ -105,10 +110,10 @@ export interface InteractiveLoopOptions {
  * shared one-at-a-time / no-reply / cancel machinery.
  */
 export async function runInteractiveLoop(
-  session: RuntimeSession,
-  ctx: RunnerContext,
+  ctx: PolicyAwareRunnerContext,
   turns: AsyncIterable<HumanTurn>,
-  hooks: RuntimeSessionHooks,
+  emit: RuntimeSessionHooks["emit"],
+  makeSession: RuntimeSessionFactory,
   opts: InteractiveLoopOptions,
 ): Promise<Omit<JobResult, "jobId">> {
   const { signal, cancelled, cancel, instructionInSystemPrompt } = opts;
@@ -120,19 +125,20 @@ export async function runInteractiveLoop(
   const { firstReplyMs, idleMs } = interactiveIdleWindows(ctx);
 
   // Fan the relayed human-turn stream into (a) conversational turns this loop reads and (b) a blocking
-  // `ask` a session's injected structured-question tool awaits. Populate `hooks.ask` before the seed so
-  // a question raised on the opening turn reaches the router.
+  // `ask` a session's injected structured-question tool awaits. Assemble the complete hooks (router-backed
+  // `ask` included) BEFORE building the session, so the session receives its `ask` immutably at
+  // construction and a question raised on the opening turn already reaches the router.
   const router = createElicitTurnRouter(turns, { signal, firstReplyMs, idleMs });
   const humanIter = router.conversation[Symbol.asyncIterator]();
   let awaitingFirstReply = true;
-  const elicitCtx = ctx as PolicyAwareRunnerContext;
-  hooks.ask = async (question: ElicitQuestion): Promise<string> => {
+  const ask = async (question: ElicitQuestion): Promise<string> => {
     const outcome = await router.ask(awaitingFirstReply, () => {
-      hooks.emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
-      elicitCtx.emitElicit?.(question);
+      emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
+      ctx.emitElicit?.(question);
     });
     return elicitOutcomeReply(outcome);
   };
+  const session = makeSession({ emit, ask });
 
   let toolSummary: string | undefined;
   let artifact: { path: string; content: string } | undefined;
@@ -188,7 +194,7 @@ export async function runInteractiveLoop(
       }
     }
   } catch (e) {
-    if (!cancelled()) hooks.emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
+    if (!cancelled()) emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
     exited = cancelled() ? "cancelled" : "gate";
   }
 

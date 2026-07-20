@@ -34,6 +34,52 @@ this file is left verbatim.
 
 ### Changed
 
+- **Give the CYPACK-1177 settle rule one home (`response-rule.ts`).** "The response is the last
+  assistant text, and never a tool-ended turn's body" was implemented twice - `consumeClaudeMessage`
+  and `consumePiEvent` each had the settle decision inline, an invariant the two had to keep in
+  lock-step. Extracted the decision into a shared `decideResponse(bufferedText, endedOnTool, status)`
+  both mappers now defer to. The accumulators are deliberately NOT shared (Claude replaces the buffer
+  per whole assistant message, Pi appends streamed `text_delta`s - forcing one accumulator would be a
+  false abstraction); only the identical settle decision moved. New `response-rule.test.ts` pins every
+  veto and the trimming; the mappers' existing fixture suites still cover the accumulation end to end.
+  Behaviour-neutral.
+- **Validate Pi RPC events at the wire boundary (`parsePiEvent`).** `PiRpcSession.#onLine` cast raw
+  parsed JSON straight to `PiEvent` (`msg as PiEvent`) before forwarding to the mapper - an unvalidated
+  spike type as the interop contract. A JSON `null`, a primitive, or a malformed `message_update` would
+  crash the mapper on first field access (`ev.type`, `ev.assistantMessageEvent.type`) inside the stdout
+  `data` handler. Added `parsePiEvent(unknown): PiEvent | null` in `pi-mappers.ts` (the type's owner),
+  pinning exactly the invariants the mappers dereference unconditionally - an object with a string
+  `type`, and a `message_update` whose `assistantMessageEvent` is an object - and routed `#onLine`
+  through it, dropping anything that fails. Unknown `type`s still pass through as mapper noise. The
+  embedded SDK back-end (real typed events) is unaffected. New coverage in `pi-mappers.test.ts` and
+  `pi-rpc-client.test.ts` (a garbage-line stream that must not reach subscribers or throw).
+- **Extract the push-outcome ladder out of `stage-runner.runPush` into a pure `push-outcome.ts`.** The
+  deliver/backup/conflict/diverged/noop decision - ~90 lines of `PushResult` construction with its exact
+  summaries and forwarded git fields - lived inside `runPush`'s closure, reachable only through a full
+  push run. Lifted it into `resolveDeliverOutcome` / `resolveBackupOutcome` (plus the `PushMode` /
+  `PushJobWithMode` / `PushResultWithWip` forward-compat shims), leaving `runPush` to own only the I/O:
+  the repo-allowlist guard, worktree resolution, the `gitService` push calls, and the ambient PR open.
+  The one behaviour-neutral reshuffle: the PR open is now computed right after `commitAndPush` and passed
+  into the resolver, rather than inside the former clean-path branch - identical because only the clean
+  path pushes (`r.pushed`), so `pr` is `undefined` for every non-clean outcome exactly as before. New
+  `push-outcome.test.ts` pins all eleven branches of the ladder (status, integration/conflictFiles/PR
+  fields, and each human summary); the existing `stage-runner.test.ts` push cases are unchanged. Pure
+  internal refactor; production behaviour unchanged.
+- **Hand the `RuntimeSession` its `hooks` immutably at construction; kill the mutated `hooks.ask`
+  handshake.** The interactive elicitation `ask` genuinely depends on loop-owned state (the elicit
+  router + the live `awaitingFirstReply` flag), so it must be built by the loop - but the session was
+  built by the adapter *before* the loop ran. The old workaround was a temporal handshake across three
+  files: the adapter seeded `hooks.ask` with a throwaway `defaultAsk`, wired the runtime's
+  structured-question tool to read `hooks.ask` *lazily*, and `runInteractiveLoop` then *reassigned*
+  `hooks.ask` mid-loop. Inverted it: the loop now owns session construction via the (previously dead)
+  `RuntimeSessionFactory` port - it assembles the complete `{ emit, ask }` and calls
+  `makeSession(hooks)`, so the session receives its final `ask` at construction. `runInteractiveLoop`'s
+  signature is now `(ctx, turns, emit, makeSession, opts)`; both adapters hoist their interactive
+  session build into a `makeSession` closure; the interactive-path `defaultAsk` placeholder, the lazy
+  reads, and the `ctx as PolicyAwareRunnerContext` cast in the loop are gone. `runBatchLoop` is
+  unchanged (batch never elicits). `shared-loop.test.ts` migrated to the new call shape and gained a
+  case asserting a session's mid-turn `ask` routes through the shared router - coverage the mutation
+  previously made awkward to write. Pure internal refactor; production behaviour unchanged.
 - **Split `runner-shared.ts` into five concern-named modules.** The 666-line file had accreted six
   unrelated tenants behind one filename; a pure move (no signature, logic, or behaviour change)
   relocated them into `prompt-assembly.ts` (stage-prompt building + defang), `mailbox.ts`

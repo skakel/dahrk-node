@@ -445,63 +445,69 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): Runner {
     },
 
     async runInteractive(ctx, turns, onTrace) {
-      const hooks: RuntimeSessionHooks = { emit: makeEmit("claude-code", onTrace), ask: defaultAsk };
+      const emit = makeEmit("claude-code", onTrace);
       const stageTool = createStageCompleteTool();
       // The recap-only flag the gate-exit summarise turn flips; the `canUseTool` closure reads it. Held
       // on an object so the runtime session (which owns the summarise turn) and the options closure
       // share one cell.
       const summarising = { value: false };
 
-      // DHK-344: map the agent's structured `AskUserQuestion` onto a Linear `select` elicitation rather
-      // than letting it resolve to the headless default "the user did not answer". Read `hooks.ask`
-      // LAZILY: `runInteractiveLoop` overwrites it with the router-backed version before the seed, so a
-      // question raised mid-turn reaches the shared one-at-a-time / no-reply / cancel machinery.
-      const askTool = createAskUserQuestionTool({ ask: (question) => hooks.ask(question) });
+      // The interactive session is built by the loop through this factory, once it has assembled the
+      // router-backed hooks. The loop calls it SYNCHRONOUSLY before it awaits the opening turn, so the
+      // `active`-before-first-await cancel guarantee below still holds, and the AskUserQuestion shadow
+      // tool is wired to the FINAL `ask` at construction rather than a placeholder swapped in later.
+      let rt: RuntimeSession | undefined;
+      const makeSession = (hooks: RuntimeSessionHooks): RuntimeSession => {
+        // DHK-344: map the agent's structured `AskUserQuestion` onto a Linear `select` elicitation rather
+        // than letting it resolve to the headless default "the user did not answer".
+        const askTool = createAskUserQuestionTool({ ask: (question) => hooks.ask(question) });
 
-      // Interactive stages have full tool parity with batch stages: a prompt that writes files or
-      // explores the repo works the same as in a batch stage (customers bring all kinds of prompts,
-      // and Pi interactive already allows tools). The S2 spike gated tools to keep the stage
-      // conversational and avoid an execute-loop that never settled a per-turn result; that risk is
-      // accepted here and bounded by maxTurns (forces a result) plus the edge's job.timeout wall-clock
-      // kill. Edge policy still observes every action via onTrace exactly as for batch. The one
-      // exception is the gate-exit summarisation turn, which stays recap-only (no tools) via `summarising`.
-      const brokered = buildBrokeredMcpServers(ctx);
-      const options: Options = {
-        ...baseOptions(ctx),
-        // Keep the cwd-anchoring preset; fold the stage instruction in via `append` so the
-        // interactive persona still gets it without losing the working-directory context.
-        systemPrompt: hasSystemPrompt(ctx)
-          ? { type: "preset", preset: "claude_code", append: resolveStagePrompt(ctx) }
-          : CLAUDE_CODE_SYSTEM_PROMPT,
-        // Inject the stage-complete exit tool and the AskUserQuestion shadow alongside any brokered
-        // MCP servers (parity with batch).
-        mcpServers: { dahrk: stageTool.server, ask: askTool.server, ...(brokered ?? {}) },
-        // Redirect the built-in AskUserQuestion to the shadow tool so a structured question surfaces
-        // as a Linear elicitation. The redirect is name-only and single-hop; the tool still runs, so
-        // this is mapping, not gating (DHK-344 / DHK-223).
-        toolAliases: { [ASK_USER_QUESTION_ALIAS]: askTool.allowedToolName },
-        // Auto-approve the injected tools; `allowedTools` is an auto-approve list, not a whitelist, so
-        // it does not restrict the other tools canUseTool allows.
-        allowedTools: [stageTool.allowedToolName, askTool.allowedToolName],
-        canUseTool: async (toolName, input) =>
-          interactiveCanUseTool(summarising.value, stageTool.allowedToolName, ctx, toolName, input),
-        maxTurns: MAX_TURNS,
-        includePartialMessages: false,
+        // Interactive stages have full tool parity with batch stages: a prompt that writes files or
+        // explores the repo works the same as in a batch stage (customers bring all kinds of prompts,
+        // and Pi interactive already allows tools). The S2 spike gated tools to keep the stage
+        // conversational and avoid an execute-loop that never settled a per-turn result; that risk is
+        // accepted here and bounded by maxTurns (forces a result) plus the edge's job.timeout wall-clock
+        // kill. Edge policy still observes every action via onTrace exactly as for batch. The one
+        // exception is the gate-exit summarisation turn, which stays recap-only (no tools) via `summarising`.
+        const brokered = buildBrokeredMcpServers(ctx);
+        const options: Options = {
+          ...baseOptions(ctx),
+          // Keep the cwd-anchoring preset; fold the stage instruction in via `append` so the
+          // interactive persona still gets it without losing the working-directory context.
+          systemPrompt: hasSystemPrompt(ctx)
+            ? { type: "preset", preset: "claude_code", append: resolveStagePrompt(ctx) }
+            : CLAUDE_CODE_SYSTEM_PROMPT,
+          // Inject the stage-complete exit tool and the AskUserQuestion shadow alongside any brokered
+          // MCP servers (parity with batch).
+          mcpServers: { dahrk: stageTool.server, ask: askTool.server, ...(brokered ?? {}) },
+          // Redirect the built-in AskUserQuestion to the shadow tool so a structured question surfaces
+          // as a Linear elicitation. The redirect is name-only and single-hop; the tool still runs, so
+          // this is mapping, not gating (DHK-344 / DHK-223).
+          toolAliases: { [ASK_USER_QUESTION_ALIAS]: askTool.allowedToolName },
+          // Auto-approve the injected tools; `allowedTools` is an auto-approve list, not a whitelist, so
+          // it does not restrict the other tools canUseTool allows.
+          allowedTools: [stageTool.allowedToolName, askTool.allowedToolName],
+          canUseTool: async (toolName, input) =>
+            interactiveCanUseTool(summarising.value, stageTool.allowedToolName, ctx, toolName, input),
+          maxTurns: MAX_TURNS,
+          includePartialMessages: false,
+        };
+
+        // Create the streaming session and set `active` SYNCHRONOUSLY (before the loop's first await), so
+        // a `cancel()` racing the opening turn still interrupts it.
+        const session = createSession({ options, stageTool });
+        active = session;
+        rt = makeClaudeRuntimeSession(ctx, hooks, { interactive: true, session, stageTool, summarising });
+        return rt;
       };
-
-      // Create the streaming session and set `active` SYNCHRONOUSLY (before the first await), so a
-      // `cancel()` racing the opening turn still interrupts it.
-      const session = createSession({ options, stageTool });
-      active = session;
-      const rt = makeClaudeRuntimeSession(ctx, hooks, { interactive: true, session, stageTool, summarising });
-      const result = await runInteractiveLoop(rt, ctx, turns, hooks, {
+      const result = await runInteractiveLoop(ctx, turns, emit, makeSession, {
         signal: abortController.signal,
         cancelled: () => cancelled,
         cancel: () => this.cancel(),
         // Claude carries the stage instruction in its system prompt, so the seed can be a short kickoff.
         instructionInSystemPrompt: hasSystemPrompt(ctx),
       });
-      rt.dispose();
+      rt?.dispose();
       return result;
     },
 

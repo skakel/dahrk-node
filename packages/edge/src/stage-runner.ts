@@ -43,6 +43,12 @@ import { computeFsRoots } from "./fs-roots.js";
 import { createNodeLogger, type NodeLogger } from "./logger.js";
 import { evaluatePolicies, type PolicyRule } from "./policy.js";
 import { startMcpGateway, type McpGateway } from "./mcp-gateway.js";
+import {
+  resolveBackupOutcome,
+  resolveDeliverOutcome,
+  type PushJobWithMode,
+  type PushMode,
+} from "./push-outcome.js";
 
 /** Arguments for requesting a presigned upload of a heavy trace payload. */
 export interface BlobPutRequestArgs {
@@ -156,18 +162,6 @@ const PREVIEW = 500;
  *  still preserved in the trace archive via the `outputRef` spill. */
 const RESULT = 16_000;
 
-/**
- * Forward-compat shim over `@dahrk/contracts@0.1.0`, which predates DHK-264's backup-push fields. The
- * hub sends `PushJob.mode:"backup"` to preserve a run's committed HEAD on a durable `dahrk/wip/<runId>`
- * ref after a `deliver` push hit a base-advanced conflict; the edge echoes that ref back as
- * `PushResult.wipRef`. `decode` on the wire is a plain `JSON.parse`, so `mode` rides through intact even
- * though the published type omits it (mirrors how this file already forwards the not-yet-published
- * `diverged` integration outcome). Drop these shims and bump the `@dahrk/contracts` dependency once the
- * contract publishing PR (harness #262) has released these fields.
- */
-type PushMode = "deliver" | "backup";
-type PushJobWithMode = PushJob & { mode?: PushMode };
-type PushResultWithWip = PushResult & { wipRef?: string };
 type PolicyAwareRunnerContext = RunnerContext & {
   authorizeToolUse?: (toolName: string, input: unknown) => PolicyOutcome;
   /** Surface an interactive-stage `AskUserQuestion` as a Linear `select` elicitation (DHK-344). */
@@ -1062,17 +1056,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
               branch: job.branch,
               ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
             });
-            const result: PushResultWithWip = {
-              jobId,
-              status: "ok",
-              branch: job.branch,
-              headSha: r.headSha,
-              pushed: r.pushed,
-              nothingToCommit: r.nothingToCommit,
-              wipRef: r.wipRef,
-              summary: `backup: preserved ${r.headSha.slice(0, 7)} on ${r.wipRef} (no base merge, no PR)`,
-            };
-            return result;
+            return resolveBackupOutcome(r, { jobId, branch: job.branch });
           } catch (e) {
             return { jobId, status: "fail", branch: job.branch, summary: `backup push failed: ${(e as Error).message}` };
           }
@@ -1103,62 +1087,12 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
             base: job.base,
             ...(job.workspaceRef.credentialToken ? { credentialToken: job.workspaceRef.credentialToken } : {}),
           });
-          // Nothing to deliver (DHK-318): the branch's delta over the (possibly advanced) base is empty
-          // or only engine scratch, so the work is already present on the base. Close as a successful
-          // no-op - nothing pushed, no PR, no conflictFiles - rather than attempting an integration that
-          // could error on a stray scratch path. `status: "ok"` with `nothingToCommit`, so the run reaches
-          // a non-error terminal state. (`noop` is not yet in `@dahrk/contracts`'s IntegrationOutcome, so
-          // it is conveyed as an absent integration - "treated as clean" no-op - like `diverged` above.)
-          if (r.integration === "noop") {
-            return {
-              jobId,
-              status: "ok",
-              branch: job.branch,
-              headSha: r.headSha,
-              pushed: false,
-              nothingToCommit: true,
-              commitsAhead: r.commitsAhead,
-              summary: `no changes to deliver on ${job.branch} - work already present on ${job.base}`,
-            };
-          }
-          // the base advanced and merging it into the branch conflicted, so nothing was pushed.
-          // There is nothing to open a PR for; forward the conflict outcome and let the hub raise a
-          // manual-merge elicitation. `status: "ok"` (the executor did its job deterministically; a
-          // conflict is a real, non-error outcome, not a push failure that should trigger retries).
-          if (r.integration === "conflict") {
-            return {
-              jobId,
-              status: "ok",
-              branch: job.branch,
-              headSha: r.headSha,
-              pushed: false,
-              nothingToCommit: r.nothingToCommit,
-              commitsAhead: r.commitsAhead,
-              integration: "conflict",
-              ...(r.conflictFiles ? { conflictFiles: r.conflictFiles } : {}),
-              summary: `base advanced; merge conflict on ${job.branch} (manual merge needed)`,
-            };
-          }
-          // The branch and base share no common history (unrelated/diverged), so the base can never
-          // auto-integrate and nothing was pushed. Unlike a content conflict, an agent cannot resolve
-          // this - the branch needs rebuilding from base - so it is a real failure, not an `ok` conflict
-          // outcome. Surface it truthfully. (Forward-compat: once `@dahrk/contracts` ships a `diverged`
-          // IntegrationOutcome, forward `status: "ok", integration: "diverged"` for a native hub elicitation.)
-          if (r.integration === "diverged") {
-            return {
-              jobId,
-              status: "fail",
-              branch: job.branch,
-              headSha: r.headSha,
-              pushed: false,
-              nothingToCommit: r.nothingToCommit,
-              commitsAhead: r.commitsAhead,
-              summary: `branch history diverged from ${job.base}; cannot auto-integrate on ${job.branch} (the branch likely needs rebuilding from ${job.base})`,
-            };
-          }
           // Ambient nodes only: the hub set `openPr` so the edge best-effort opens the PR here (it holds
-          // the host's `gh` auth), symmetric with the ambient push. Skip if the push landed nothing.
-          // Failure is non-fatal - carried back as prError so the run stays green on the pushed branch.
+          // the host's `gh` auth), symmetric with the ambient push. Only the clean integration path
+          // pushes (`r.pushed`), so this is a no-op for the noop/conflict/diverged outcomes and `pr`
+          // stays undefined for them. Failure is non-fatal - carried back as prError so the run stays
+          // green on the pushed branch. The deliver/noop/conflict/diverged decision itself is the pure
+          // `resolveDeliverOutcome` (push-outcome.ts).
           const pr =
             job.openPr && r.pushed
               ? await deps.gitService.openPrAmbient(ref, {
@@ -1168,22 +1102,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
                   body: job.openPr.body,
                 })
               : undefined;
-          return {
-            jobId,
-            status: "ok",
-            branch: job.branch,
-            headSha: r.headSha,
-            pushed: r.pushed,
-            nothingToCommit: r.nothingToCommit,
-            commitsAhead: r.commitsAhead,
-            ...(r.integration ? { integration: r.integration } : {}),
-            ...(pr?.prUrl ? { prUrl: pr.prUrl } : {}),
-            ...(pr?.prNumber !== undefined ? { prNumber: pr.prNumber } : {}),
-            ...(pr?.prError ? { prError: pr.prError } : {}),
-            summary: r.nothingToCommit
-              ? `no changes to commit; ${r.pushed ? "branch pushed" : "nothing pushed"}`
-              : `committed ${r.headSha.slice(0, 7)} and pushed ${job.branch}`,
-          };
+          return resolveDeliverOutcome(r, { jobId, branch: job.branch, base: job.base }, pr);
         } catch (e) {
           return { jobId, status: "fail", summary: `push failed: ${(e as Error).message}` };
         }

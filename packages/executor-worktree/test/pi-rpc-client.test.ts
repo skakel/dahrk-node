@@ -10,6 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { PassThrough } from "node:stream";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PiEvent } from "../src/pi-mappers.js";
@@ -126,5 +127,28 @@ test("PiRpcSession satisfies the PiSessionLike contract the adapter drives", () 
   assert.equal(typeof session.prompt, "function");
   assert.equal(typeof session.abort, "function");
   assert.equal(typeof session.dispose, "function");
+  session.dispose();
+});
+
+test("PiRpcSession: malformed stdout lines are dropped at the wire boundary - never forwarded, never crash the reader", async () => {
+  const stdout = new PassThrough();
+  const stdin = new PassThrough();
+  const session = new PiRpcSession({ stdin, stdout }, {});
+  const received: PiEvent[] = [];
+  session.subscribe((ev) => received.push(ev));
+
+  // Each line is valid JSON but not a well-formed event: a null (JSON null crashed the old `msg as
+  // PiEvent` cast on `ev.type`), a primitive, an array, a typeless object, and a bodyless
+  // message_update (whose `ame.type` access would throw). None must reach the subscriber or throw
+  // inside the stdout 'data' handler.
+  for (const line of ["null", "42", '"agent_end"', '[{"type":"agent_end"}]', '{"foo":1}', '{"type":"message_update"}']) {
+    stdout.write(`${line}\n`);
+  }
+  // Command responses are still consumed (not events), and a well-formed event still flows through.
+  stdout.write('{"type":"response","command":"noop","success":true}\n');
+  stdout.write('{"type":"turn_start"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  assert.deepEqual(received.map((e) => e.type), ["turn_start"], "only the well-formed event reached the subscriber");
   session.dispose();
 });

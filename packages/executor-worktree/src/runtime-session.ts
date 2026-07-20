@@ -106,14 +106,18 @@ export interface RuntimeSession {
 /**
  * The side-channels a `RuntimeSession` needs from the loop, held once per stage: `emit` is the trace
  * sink (the per-event `makeEmit` closure) and `ask` surfaces an interactive-stage structured question
- * as a Linear elicitation through the shared router. The loop populates `ask` from the router before
- * the opening turn, so a session that raises a question mid-turn reaches it by stable reference.
+ * as a Linear elicitation through the shared router. Both are final when the session is built: the
+ * interactive loop assembles the router-backed `ask` and passes the complete hooks to the
+ * `RuntimeSessionFactory`, so `ask` is never reassigned after construction. (Batch has no elicitation
+ * and passes a `noreply` default.)
  */
 export interface RuntimeSessionHooks {
   emit: (event: EmittableEvent, rawRef?: string) => void;
   ask: (question: ElicitQuestion) => Promise<string>;
 }
 
-/** Build a `RuntimeSession` bound to the stage's context and hooks. Injected so a fake can drive the
- *  loop without a live runtime. */
-export type RuntimeSessionFactory = (ctx: RunnerContext, hooks: RuntimeSessionHooks) => Promise<RuntimeSession>;
+/** Build a `RuntimeSession` bound to a complete `hooks`. The interactive loop calls this AFTER it has
+ *  assembled the final hooks (real `emit` + router-backed `ask`), so the session receives its `ask`
+ *  immutably at construction - no post-construction reassignment. The adapter captures the stage `ctx`
+ *  and its already-open transport in the closure. */
+export type RuntimeSessionFactory = (hooks: RuntimeSessionHooks) => RuntimeSession;

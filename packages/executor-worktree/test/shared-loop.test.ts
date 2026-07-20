@@ -10,7 +10,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { HumanTurn, RunnerContext } from "@dahrk/contracts";
+import type { ElicitQuestion, HumanTurn, RunnerContext } from "@dahrk/contracts";
 import { runInteractiveLoop, runBatchLoop } from "../src/turn-loop.js";
 import { ManagedMailbox } from "../src/mailbox.js";
 import type {
@@ -90,6 +90,20 @@ const makeHooks = (events: EmittableEvent[] = []): RuntimeSessionHooks => ({
   ask: async () => "No response from the user; proceed with your best judgement.",
 });
 
+/**
+ * Drive the interactive loop against a pre-built fake session. The loop now owns session construction:
+ * it assembles the router-backed hooks and calls a factory to build the session, so the test supplies
+ * an `emit` sink and a factory that returns the fake. `ask` is assembled by the loop, not the test.
+ */
+const runInteractive = (
+  session: RuntimeSession,
+  c: RunnerContext,
+  turns: AsyncIterable<HumanTurn>,
+  value: Parameters<typeof runInteractiveLoop>[4],
+  events: EmittableEvent[] = [],
+): Promise<Awaited<ReturnType<typeof runInteractiveLoop>>> =>
+  runInteractiveLoop(c, turns, (e) => events.push(e), () => session, value);
+
 const opts = (over: Partial<Parameters<typeof runInteractiveLoop>[4]> = {}) => {
   const controller = new AbortController();
   return {
@@ -119,7 +133,7 @@ test("interactive tool-exit: the opening turn's stage-complete ends the stage wi
     results: [{ stageComplete: true, summary: "Refactored the parser.", status: "ok" }],
   });
   const { value } = opts();
-  const result = await runInteractiveLoop(session, ctx(), neverTurns(), makeHooks(), value);
+  const result = await runInteractive(session, ctx(), neverTurns(), value);
 
   assert.equal(result.status, "ok");
   assert.equal(result.summary, "Refactored the parser.");
@@ -130,7 +144,7 @@ test("interactive tool-exit: the opening turn's stage-complete ends the stage wi
 test("interactive self-seed: the opening sendTurn fires from the resolved prompt before any human turn", async () => {
   const session = new FakeRuntimeSession();
   const { value } = opts();
-  await runInteractiveLoop(session, ctx(), emptyTurns(), makeHooks(), value);
+  await runInteractive(session, ctx(), emptyTurns(), value);
 
   assert.match(session.turns[0] ?? "", /Fix the failing tests\./, "the seed folds in the ticket brief");
 });
@@ -138,7 +152,7 @@ test("interactive self-seed: the opening sendTurn fires from the resolved prompt
 test("interactive gate: turns exhausted calls summariseTurn once and returns its text", async () => {
   const session = new FakeRuntimeSession({ summary: "Explained the fix; tests pass." });
   const { value } = opts();
-  const result = await runInteractiveLoop(session, ctx(), emptyTurns(), makeHooks(), value);
+  const result = await runInteractive(session, ctx(), emptyTurns(), value);
 
   assert.equal(result.status, "ok");
   assert.equal(result.summary, "Explained the fix; tests pass.");
@@ -149,7 +163,7 @@ test("interactive timeout: no reply within the idle window settles timeout and i
   const session = new FakeRuntimeSession();
   let cancelCalls = 0;
   const { value } = opts({ cancel: async () => void cancelCalls++ });
-  const result = await runInteractiveLoop(session, fastCtx(), neverTurns(), makeHooks(), value);
+  const result = await runInteractive(session, fastCtx(), neverTurns(), value);
 
   assert.equal(result.status, "timeout");
   assert.equal(result.summary, "(stage timed out awaiting input)");
@@ -161,7 +175,7 @@ test("interactive cancel: an aborted signal settles fail with the cancelled summ
   const session = new FakeRuntimeSession();
   const { controller, value } = opts();
   controller.abort(); // pre-abort: the first race after the seed sees the cancel
-  const result = await runInteractiveLoop(session, ctx(), neverTurns(), makeHooks(), value);
+  const result = await runInteractive(session, ctx(), neverTurns(), value);
 
   assert.equal(result.status, "fail");
   assert.equal(result.summary, "(stage cancelled)");
@@ -175,7 +189,7 @@ test("interactive coalesce: a burst of rapid turns within COALESCE_MS collapses 
   turns.push({ text: "b", ts: "t" });
   turns.end();
   const { value } = opts();
-  await runInteractiveLoop(session, ctx(), turns, makeHooks(), value);
+  await runInteractive(session, ctx(), turns, value);
 
   assert.equal(session.turns[1], "a\nb", "the burst is joined into a single prompt after the seed");
   assert.equal(session.turns.length, 2, "seed + one coalesced human turn");
@@ -185,7 +199,7 @@ test("interactive coalesce: a burst of rapid turns within COALESCE_MS collapses 
 test("interactive: cost() and sessionId are surfaced onto the result", async () => {
   const session = new FakeRuntimeSession({ cost: 0.19, sessionId: "pi-sess-1" });
   const { value } = opts();
-  const result = await runInteractiveLoop(session, ctx(), emptyTurns(), makeHooks(), value);
+  const result = await runInteractive(session, ctx(), emptyTurns(), value);
 
   assert.equal(result.costUsd, 0.19);
   assert.equal(result.sessionId, "pi-sess-1");
@@ -194,10 +208,57 @@ test("interactive: cost() and sessionId are surfaced onto the result", async () 
 test("interactive: an unpriced session omits costUsd entirely (never a fabricated $0)", async () => {
   const session = new FakeRuntimeSession(); // cost undefined
   const { value } = opts();
-  const result = await runInteractiveLoop(session, ctx(), emptyTurns(), makeHooks(), value);
+  const result = await runInteractive(session, ctx(), emptyTurns(), value);
 
   assert.equal(result.costUsd, undefined);
   assert.ok(!("costUsd" in result));
+});
+
+test("interactive elicit routing: a session that calls hooks.ask mid-turn reaches the router-backed ask handed in at construction", async () => {
+  // Proves the loop assembles the router-backed `ask` and hands it to the session via the factory - the
+  // seam that used to be a mutated `hooks.ask` field read lazily by the adapters. The fake raises an
+  // elicitation on its opening turn; the queued human turn settles it through the shared router.
+  const turns = new ManagedMailbox<HumanTurn>();
+  const events: EmittableEvent[] = [];
+  let captured: RuntimeSessionHooks | undefined;
+  let askReply: string | undefined;
+  const session: RuntimeSession = {
+    async sendTurn(): Promise<TurnResult> {
+      if (askReply === undefined) {
+        const pending = captured!.ask({
+          prompt: "Pick one",
+          options: [{ label: "A" }, { label: "B" }],
+        } as ElicitQuestion);
+        // `ask` registers with the router synchronously, so a turn pushed now settles it as the reply.
+        turns.push({ text: "B", ts: "t" });
+        turns.end();
+        askReply = await pending;
+      }
+      return { stageComplete: false, status: "ok" };
+    },
+    async summariseTurn(): Promise<string> {
+      return "(fake summary)";
+    },
+    cost: () => undefined,
+    dispose: () => {},
+  };
+  const { value } = opts();
+  const result = await runInteractiveLoop(
+    ctx(),
+    turns,
+    (e) => events.push(e),
+    (hooks) => {
+      captured = hooks;
+      return session;
+    },
+    value,
+  );
+
+  assert.equal(askReply, "The user selected: B", "the reply routes through the shared elicit router");
+  assert.equal(result.status, "ok");
+  const elicit = events.find((e) => e.type === "elicitation");
+  assert.ok(elicit && elicit.type === "elicitation", "the raised question emitted an elicitation trace event");
+  assert.equal(elicit.prompt, "Pick one");
 });
 
 test("batch: one sendTurn settles ok and surfaces cost + sessionId", async () => {

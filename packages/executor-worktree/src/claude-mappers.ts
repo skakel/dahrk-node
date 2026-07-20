@@ -14,6 +14,7 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { JobStatus, TraceMeta } from "@dahrk/contracts";
 import type { EmittableEvent } from "./runtime-session.js";
+import { decideResponse } from "./response-rule.js";
 
 export interface MapResult {
   events: EmittableEvent[];
@@ -121,10 +122,11 @@ export const newBufferState = (): BufferState => ({ bufferedText: null, turnEnde
 
 /**
  * Pure: fold one SDK message into the running buffered-response state and return the
- * ordered events to emit. This is where the CYPACK-1177 rule lives - the response is the
- * last assistant text, decided at `result` time, and NEVER the body of a turn that ended on
- * a tool call (which is tool-input JSON). `suppressStageExit` drops the per-turn `stage-exit`
- * state event for interactive turns (the stage runner owns the single final stage-exit).
+ * ordered events to emit. It accumulates Claude's per-message assistant text, then at `result` time
+ * applies the CYPACK-1177 rule via the shared `decideResponse` (response-rule.ts) - the response is the
+ * last assistant text and NEVER the body of a turn that ended on a tool call (which is tool-input JSON).
+ * `suppressStageExit` drops the per-turn `stage-exit` state event for interactive turns (the stage
+ * runner owns the single final stage-exit).
  *
  * Side-effect-free over `state` aside from the documented mutation, so it is unit-testable
  * against recorded fixtures with no SDK and no I/O.
@@ -158,18 +160,16 @@ export function consumeClaudeMessage(
 
   if (msg.type === "result") {
     const status: JobStatus = r.resultStatus === "fail" ? "fail" : "ok";
-    let responseText: string | undefined;
-    if (status === "ok" && state.bufferedText && !state.turnEndedOnTool) {
-      responseText = state.bufferedText;
-      events.push({ type: "response", text: state.bufferedText });
-    }
+    // CYPACK-1177 settle decision, shared with the Pi mapper (response-rule.ts).
+    const decision = decideResponse(state.bufferedText ?? "", state.turnEndedOnTool, status);
+    if (decision.event) events.push(decision.event);
     for (const e of r.events) {
       if (suppressStageExit && e.type === "state") continue;
       events.push(e);
     }
     state.bufferedText = null;
     state.turnEndedOnTool = false;
-    return { events, isResult: true, status, responseText };
+    return { events, isResult: true, status, responseText: decision.responseText };
   }
 
   // user (observations) and recognised metadata.
