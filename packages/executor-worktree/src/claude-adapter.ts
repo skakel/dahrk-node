@@ -19,27 +19,26 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { HumanTurn, JobResult, JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
+import type { JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumeClaudeMessage, newBufferState, type BufferState } from "./claude-mappers.js";
 import {
   makeEmit,
-  raceNextTurn,
-  interactiveIdleWindows,
   resolveStagePrompt,
   hasSystemPrompt,
-  interactiveSeedText,
-  createElicitTurnRouter,
   elicitOutcomeReply,
+  runInteractiveLoop,
+  runBatchLoop,
   SUMMARISE_PROMPT,
   ManagedMailbox,
   type EmittableEvent,
   type PolicyAwareRunnerContext,
+  type RuntimeSession,
+  type RuntimeSessionHooks,
+  type TurnResult,
 } from "./runner-shared.js";
 import { createStageCompleteTool, type StageCompleteTool } from "./stage-complete-tool.js";
 import { createAskUserQuestionTool, ASK_USER_QUESTION_ALIAS } from "./ask-user-question-tool.js";
 
-/** Debounce window for coalescing a burst of rapid human turns into one user message. */
-const COALESCE_MS = Number(process.env.DAHRK_COALESCE_MS ?? process.env.SKAKEL_COALESCE_MS ?? 40);
 /** Hard turn ceiling so a runaway interactive session cannot loop indefinitely. */
 const MAX_TURNS = Number(process.env.DAHRK_MAX_TURNS ?? process.env.SKAKEL_MAX_TURNS ?? 64);
 
@@ -61,6 +60,22 @@ const userMsg = (text: string): SDKUserMessage => ({
   parent_tool_use_id: null,
   message: { role: "user", content: text },
 });
+
+/** The initial `hooks.ask` before an interactive loop installs the router-backed one. Never invoked on
+ *  the batch/summarise paths (they wire no `AskUserQuestion` shadow tool); the interactive loop replaces
+ *  it before the opening turn. Degrades to the same soft note the router's no-reply path returns.
+ *  Mirrors Pi's `defaultAsk`. */
+const defaultAsk = async (): Promise<string> => elicitOutcomeReply({ kind: "noreply" });
+
+/**
+ * How a `ClaudeRuntimeSession` drives its underlying `ClaudeSessionLike`. Interactive owns a warm
+ * streaming session (`push`/`end`) plus the stage-complete tool and the recap-only `summarising`
+ * cell the `canUseTool` closure reads; batch creates a one-shot session lazily on its single
+ * `sendTurn` (prompt-present, replays and ends), so it needs only the built `Options`.
+ */
+type ClaudeRuntimeMode =
+  | { interactive: true; session: ClaudeSessionLike; stageTool: StageCompleteTool; summarising: { value: boolean } }
+  | { interactive: false; options: Options };
 
 const sessionIdOf = (msg: SDKMessage): string | undefined =>
   "session_id" in msg && typeof msg.session_id === "string" ? msg.session_id : undefined;
@@ -304,12 +319,119 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): Runner {
     active = undefined;
   };
 
+  /**
+   * The single Claude `RuntimeSession` over the low-level `ClaudeSessionLike` transport, mirroring
+   * Pi's `makePiRuntimeSession`. The Claude-specific concerns live here, above the transport seam and
+   * below the runtime-agnostic loop: the buffered-response mapping (`handleMessage`/`consumeClaudeMessage`),
+   * stage-complete detection and its document handback (`TurnResult.artifact`), the recap-only
+   * `summarising` flag, and `sessionId`/`costUsd` capture off each message (into the runner's closure
+   * state so `summarise()`/`cancel()` see the same values). Interactive owns a warm streaming session
+   * (`push`/drain-to-`result`); batch creates its one-shot session lazily on the single `sendTurn`.
+   */
+  const makeClaudeRuntimeSession = (
+    ctx: RunnerContext,
+    hooks: RuntimeSessionHooks,
+    mode: ClaudeRuntimeMode,
+  ): RuntimeSession => {
+    const state = newBufferState();
+    const it = mode.interactive ? mode.session[Symbol.asyncIterator]() : undefined;
+
+    // Pull messages until the in-flight interactive turn settles on a `result`; return its status and
+    // last assistant text.
+    const consumeInteractiveTurn = async (): Promise<{ status?: JobStatus; responseText?: string }> => {
+      for (;;) {
+        const { value: msg, done } = (await it!.next()) as IteratorResult<SDKMessage>;
+        if (done) return {};
+        const res = handleMessage(msg, hooks.emit, ctx, state, true);
+        if (res.isResult) return { status: res.status, responseText: res.responseText };
+      }
+    };
+
+    return {
+      get sessionId(): string | undefined {
+        return sessionId;
+      },
+      async sendTurn(text: string): Promise<TurnResult> {
+        if (!mode.interactive) {
+          // Batch: a one-shot session (prompt-present) replays its script and ends the stream. Created
+          // lazily here so the FakeClaudeSession's replay-and-end behaviour is preserved.
+          const session = createSession({ prompt: text, options: mode.options });
+          active = session;
+          let status: JobStatus | undefined;
+          try {
+            for await (const msg of session) {
+              const res = handleMessage(msg, hooks.emit, ctx, state, false);
+              if (res.isResult && res.status) status = res.status;
+            }
+          } finally {
+            closeActive();
+          }
+          return { stageComplete: false, ...(status !== undefined ? { status } : {}) };
+        }
+        // Interactive: push the user turn onto the warm streaming session and drain to its settling
+        // `result`. Let a throw propagate so the loop owns the terminal runtime_error/fail decision.
+        mode.session.push(userMsg(text));
+        const { status, responseText } = await consumeInteractiveTurn();
+        const stageComplete = mode.stageTool.fired();
+        // The handed-back document rides out as the stage artifact; the loop gates it on an ok status.
+        const doc = stageComplete ? mode.stageTool.document() : null;
+        return {
+          stageComplete,
+          ...(stageComplete ? { summary: mode.stageTool.summary() ?? undefined } : {}),
+          ...(responseText !== undefined ? { responseText } : {}),
+          ...(status !== undefined ? { status } : {}),
+          ...(doc !== null
+            ? { artifact: { path: ctx.config.emitArtifact ?? HANDED_BACK_ARTIFACT_PATH, content: doc } }
+            : {}),
+        };
+      },
+      async summariseTurn(): Promise<string> {
+        // Only the interactive gate path summarises inline; batch never calls this.
+        if (!mode.interactive) return "(no summary produced)";
+        // Keep the turn recap-only: flip the flag the `canUseTool` closure reads so every tool but the
+        // stage-complete exit is denied, then restore it.
+        mode.summarising.value = true;
+        try {
+          mode.session.push(userMsg(SUMMARISE_PROMPT));
+          const { responseText } = await consumeInteractiveTurn();
+          return (responseText ?? "").trim() || "(no summary produced)";
+        } catch {
+          return "(no summary produced)";
+        } finally {
+          mode.summarising.value = false;
+        }
+      },
+      cost(): number | undefined {
+        return costUsd;
+      },
+      dispose(): void {
+        if (!mode.interactive) return;
+        // Interactive teardown (relocated from the post-loop cleanup): end the mailbox, drain any
+        // trailing messages, then close. The drain is detached because the port's `dispose` is
+        // synchronous; the mailbox `end()` happens synchronously so no turn is dropped.
+        const iter = it!;
+        mode.session.end();
+        void (async () => {
+          try {
+            for (;;) {
+              const { done } = await iter.next();
+              if (done) break;
+            }
+          } catch {
+            /* best effort */
+          } finally {
+            closeActive();
+          }
+        })();
+      },
+    };
+  };
+
   return {
     runtime: "claude-code",
 
     async runBatch(ctx, onTrace) {
-      const emit = makeEmit("claude-code", onTrace);
-      const prompt = resolveStagePrompt(ctx);
+      const hooks: RuntimeSessionHooks = { emit: makeEmit("claude-code", onTrace), ask: defaultAsk };
       const mcpServers = buildBrokeredMcpServers(ctx);
       const options: Options = {
         ...baseOptions(ctx),
@@ -320,49 +442,23 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): Runner {
         // Headless: allow tools to run without an interactive permission prompt (M6 wires policy).
         canUseTool: async (toolName, input) => policyCanUseTool(ctx, toolName, input),
       };
-      const state = newBufferState();
-      let status: JobStatus = "ok";
-      try {
-        const session = createSession({ prompt, options });
-        active = session;
-        for await (const msg of session) {
-          const res = handleMessage(msg, emit, ctx, state, false);
-          if (res.isResult && res.status) status = res.status;
-        }
-      } catch (e) {
-        if (!cancelled) emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
-        status = "fail";
-      } finally {
-        closeActive();
-      }
-      if (cancelled) status = "fail";
-      return { status, ...(sessionId ? { sessionId } : {}), ...(costUsd !== undefined ? { costUsd } : {}) };
+      const rt = makeClaudeRuntimeSession(ctx, hooks, { interactive: false, options });
+      return runBatchLoop(rt, ctx, hooks, { cancelled: () => cancelled });
     },
 
     async runInteractive(ctx, turns, onTrace) {
-      const emit = makeEmit("claude-code", onTrace);
+      const hooks: RuntimeSessionHooks = { emit: makeEmit("claude-code", onTrace), ask: defaultAsk };
       const stageTool = createStageCompleteTool();
-      const { firstReplyMs, idleMs } = interactiveIdleWindows(ctx);
-      let awaitingFirstReply = true;
+      // The recap-only flag the gate-exit summarise turn flips; the `canUseTool` closure reads it. Held
+      // on an object so the runtime session (which owns the summarise turn) and the options closure
+      // share one cell.
+      const summarising = { value: false };
 
-      // DHK-344: map the agent's structured `AskUserQuestion` onto a Linear `select` elicitation
-      // rather than letting it resolve to the headless default "the user did not answer". The router
-      // owns the relayed human-turn stream, routing each turn to a blocked in-stage elicit if one is
-      // outstanding or otherwise into the conversation mailbox the main loop reads (see
-      // createElicitTurnRouter). One elicit is in flight at a time.
-      const router = createElicitTurnRouter(turns, { signal: abortController.signal, firstReplyMs, idleMs });
-      const askTool = createAskUserQuestionTool({
-        ask: async (question) => {
-          const outcome = await router.ask(awaitingFirstReply, () => {
-            // Fires only when the elicit is actually raised (not busy). The audit trace event: the hub
-            // maps a trace `elicitation` to null (progressToActivity) and raises the Linear
-            // elicitation solely from the `elicit` wire frame, so emitting this does not double-post.
-            emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
-            (ctx as PolicyAwareRunnerContext).emitElicit?.(question);
-          });
-          return elicitOutcomeReply(outcome);
-        },
-      });
+      // DHK-344: map the agent's structured `AskUserQuestion` onto a Linear `select` elicitation rather
+      // than letting it resolve to the headless default "the user did not answer". Read `hooks.ask`
+      // LAZILY: `runInteractiveLoop` overwrites it with the router-backed version before the seed, so a
+      // question raised mid-turn reaches the shared one-at-a-time / no-reply / cancel machinery.
+      const askTool = createAskUserQuestionTool({ ask: (question) => hooks.ask(question) });
 
       // Interactive stages have full tool parity with batch stages: a prompt that writes files or
       // explores the repo works the same as in a batch stage (customers bring all kinds of prompts,
@@ -370,9 +466,8 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): Runner {
       // conversational and avoid an execute-loop that never settled a per-turn result; that risk is
       // accepted here and bounded by maxTurns (forces a result) plus the edge's job.timeout wall-clock
       // kill. Edge policy still observes every action via onTrace exactly as for batch. The one
-      // exception is the gate-exit summarisation turn below, which stays recap-only (no tools).
+      // exception is the gate-exit summarisation turn, which stays recap-only (no tools) via `summarising`.
       const brokered = buildBrokeredMcpServers(ctx);
-      let summarising = false;
       const options: Options = {
         ...baseOptions(ctx),
         // Keep the cwd-anchoring preset; fold the stage instruction in via `append` so the
@@ -391,143 +486,25 @@ export function createClaudeRunner(deps: ClaudeRunnerDeps = {}): Runner {
         // it does not restrict the other tools canUseTool allows.
         allowedTools: [stageTool.allowedToolName, askTool.allowedToolName],
         canUseTool: async (toolName, input) =>
-          interactiveCanUseTool(summarising, stageTool.allowedToolName, ctx, toolName, input),
+          interactiveCanUseTool(summarising.value, stageTool.allowedToolName, ctx, toolName, input),
         maxTurns: MAX_TURNS,
         includePartialMessages: false,
       };
-      // Default to `either`, not `gate` (DHK-363): with `gate` the stage-complete tool is disabled,
-      // so an interactive stage can only end `ok` if the human happens to type "allow"/"approve" -
-      // a keyword nothing tells them about. A stage that omits `exit` must still be completable.
-      const exit = ctx.config.exit ?? "either";
-      const wantsTool = exit === "tool" || exit === "either";
 
+      // Create the streaming session and set `active` SYNCHRONOUSLY (before the first await), so a
+      // `cancel()` racing the opening turn still interrupts it.
       const session = createSession({ options, stageTool });
       active = session;
-      const it = session[Symbol.asyncIterator]();
-      // The interactive loop reads conversational turns from the router, not the raw stream: any turn
-      // that answers an in-stage AskUserQuestion is consumed by the router and never reaches here.
-      const humanIter = router.conversation[Symbol.asyncIterator]();
-      const state = newBufferState();
-
-      // Pull messages until the in-flight turn settles on a `result`; return its response text.
-      const consumeTurn = async (): Promise<string | undefined> => {
-        for (;;) {
-          const { value: msg, done } = (await it.next()) as IteratorResult<SDKMessage>;
-          if (done) return undefined;
-          const res = handleMessage(msg, emit, ctx, state, true);
-          if (res.isResult) return res.responseText;
-        }
-      };
-
-      let exited: "tool" | "gate" | "timeout" | "cancelled" | null = null;
-      let pending = humanIter.next();
-      try {
-        // Self-seed the opening turn: an interactive stage is triggered by a Linear label
-        // or mention whose text rides in `issueContext` (the system prompt), never as a queued human
-        // turn, so open the interview ourselves. Without this the runner idled on `raceNextTurn`
-        // until the idle timeout with the model never running (status timeout, $0, no trace events).
-        session.push(userMsg(interactiveSeedText(ctx, hasSystemPrompt(ctx))));
-        await consumeTurn();
-        if (stageTool.fired() && wantsTool) exited = "tool";
-        while (exited === null) {
-          // The first wait is for the human's opening reply (longer budget); later waits are
-          // inter-turn idles once the conversation is live.
-          const race = await raceNextTurn(pending, awaitingFirstReply ? firstReplyMs : idleMs, abortController.signal);
-          awaitingFirstReply = false;
-          if (race.kind === "cancelled") {
-            exited = "cancelled";
-            break;
-          }
-          if (race.kind === "idle-timeout") {
-            exited = "timeout";
-            break;
-          }
-          if (race.kind === "turns-exhausted") {
-            exited = "gate";
-            break;
-          }
-          // race.kind === "turn": coalesce a burst of rapid turns into one user message.
-          const texts: string[] = [(race.value as HumanTurn).text];
-          pending = humanIter.next();
-          for (;;) {
-            const more = await raceNextTurn(pending, COALESCE_MS, abortController.signal);
-            if (more.kind === "turn") {
-              texts.push((more.value as HumanTurn).text);
-              pending = humanIter.next();
-              continue;
-            }
-            if (more.kind === "cancelled") exited = "cancelled";
-            // idle-timeout (debounce elapsed, `pending` still live and carried) or
-            // turns-exhausted (resolved-done, re-raced next iteration): stop coalescing.
-            break;
-          }
-          if (exited === "cancelled") break;
-          session.push(userMsg(texts.join("\n")));
-          await consumeTurn();
-          if (stageTool.fired() && wantsTool) {
-            exited = "tool";
-            break;
-          }
-        }
-      } catch (e) {
-        if (!cancelled && !exited) emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
-        exited = exited ?? (cancelled ? "cancelled" : "gate");
-      }
-
-      let status: JobStatus = "ok";
-      let summary = "";
-      if (exited === "tool") {
-        summary = stageTool.summary() ?? "(stage marked complete)";
-      } else if (exited === "gate") {
-        // Turns exhausted with no tool exit: one engine-owned summarisation turn. Keep it recap-only
-        // (deny tools for this turn) so the final handoff summary is prose, not more stage work.
-        summarising = true;
-        try {
-          session.push(userMsg(SUMMARISE_PROMPT));
-          const reply = await consumeTurn();
-          summary = (reply ?? "").trim() || "(no summary produced)";
-        } catch {
-          summary = "(no summary produced)";
-        } finally {
-          summarising = false;
-        }
-      } else if (exited === "timeout") {
-        status = "timeout";
-        summary = "(stage timed out awaiting input)";
-        await this.cancel();
-      } else {
-        status = "fail";
-        summary = "(stage cancelled)";
-      }
-
-      session.end();
-      // Drain any trailing messages, then close.
-      try {
-        for (;;) {
-          const { done } = await it.next();
-          if (done) break;
-        }
-      } catch {
-        /* best effort */
-      }
-      closeActive();
-      // A deliverable handed back through `dahrk_stage_complete`'s `document` field rides out as the
-      // stage artifact. This is the optional in-band channel; an interactive stage may equally write
-      // the file itself (tools are allowed), in which case the edge resolver prefers that written
-      // file over this handoff. Path it at the stage's declared `emitArtifact` (so `attach-document`'s
-      // `from:` matches) or a default; the edge caps and folds it onto `projection.artifacts`.
-      const handedBackDoc = status === "ok" ? stageTool.document() : null;
-      const artifact =
-        handedBackDoc !== null
-          ? { path: ctx.config.emitArtifact ?? HANDED_BACK_ARTIFACT_PATH, content: handedBackDoc }
-          : undefined;
-      return {
-        status,
-        summary,
-        ...(sessionId ? { sessionId } : {}),
-        ...(costUsd !== undefined ? { costUsd } : {}),
-        ...(artifact ? { artifact } : {}),
-      } as Omit<JobResult, "jobId">;
+      const rt = makeClaudeRuntimeSession(ctx, hooks, { interactive: true, session, stageTool, summarising });
+      const result = await runInteractiveLoop(rt, ctx, turns, hooks, {
+        signal: abortController.signal,
+        cancelled: () => cancelled,
+        cancel: () => this.cancel(),
+        // Claude carries the stage instruction in its system prompt, so the seed can be a short kickoff.
+        instructionInSystemPrompt: hasSystemPrompt(ctx),
+      });
+      rt.dispose();
+      return result;
     },
 
     async summarise(ctx) {
