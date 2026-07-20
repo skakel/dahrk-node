@@ -158,6 +158,15 @@ The edge-local bare-repo cache (`~/.dahrk/mirrors/<repoId>`) the node fetches in
 worktree, so repeated runs against a repo do not re-clone.
 _Avoid_: Cache, local clone.
 
+**RuntimeSession**:
+The loop-facing, turn-level port inside `executor-worktree` (`sendTurn` / `summariseTurn` / `cost` /
+`dispose`) that the one shared interactive/batch loop (`runInteractiveLoop` / `runBatchLoop` in
+`runner-shared.ts`) drives. Each runtime implements it and keeps its native-event mapping and
+stage-complete detection inside the session, so the loop never sees a `PiEvent` or `SDKMessage`. Both
+Pi back-ends (embedded and container) drive it. Distinct from the lower `PiSessionLike` transport seam
+(`subscribe` / `prompt` / `abort`), which stays the SDK/RPC-facing boundary beneath it.
+_Avoid_: Session (unqualified), runner (a runner is the `Runner`-shaped adapter wrapping this).
+
 ## Sources
 
 - Workspace-root `CONTEXT.md` - the shared kernel this file mirrors.

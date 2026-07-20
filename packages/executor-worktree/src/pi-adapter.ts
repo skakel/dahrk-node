@@ -18,7 +18,7 @@
  * import so the build does not hard-depend on a live Pi install.
  */
 import { join } from "node:path";
-import type { ElicitQuestion, HumanTurn, JobResult, JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
+import type { JobStatus, Runner, RunnerContext } from "@dahrk/contracts";
 import { consumePiEvent, newPiBufferState, type PiEvent } from "./pi-mappers.js";
 import {
   readAuthHint,
@@ -30,20 +30,16 @@ import {
 } from "./pi-auth.js";
 import {
   makeEmit,
-  raceNextTurn,
-  interactiveIdleWindows,
-  resolveStagePrompt,
-  interactiveSeedText,
-  createElicitTurnRouter,
   elicitOutcomeReply,
+  runInteractiveLoop,
+  runBatchLoop,
   SUMMARISE_PROMPT,
-  type EmittableEvent,
   type PolicyAwareRunnerContext,
+  type RuntimeSession,
+  type RuntimeSessionHooks,
+  type TurnResult,
 } from "./runner-shared.js";
 import { askQuestionsSequentially } from "./ask-user-question-tool.js";
-
-/** Debounce window for coalescing a burst of rapid human turns into one prompt. */
-const COALESCE_MS = Number(process.env.DAHRK_COALESCE_MS ?? process.env.SKAKEL_COALESCE_MS ?? 40);
 
 /**
  * The injected stage-complete tool's name (interactive tool-exit). Pi has no MCP-server tool
@@ -238,22 +234,109 @@ export interface PiRunnerDeps {
   createSession?: PiSessionFactory;
 }
 
+/** The initial `hooks.ask` before an interactive loop installs the router-backed one. Never invoked on
+ *  the batch/summarise paths (they wire no `ask_user_question` handler); the interactive loop replaces
+ *  it before the opening turn. Degrades to the same soft note the router's no-reply path returns. */
+const defaultAsk = async (): Promise<string> => elicitOutcomeReply({ kind: "noreply" });
+
+/**
+ * The single Pi `RuntimeSession` over the low-level `PiSessionLike` transport, used for BOTH back-ends
+ * (embedded `defaultCreatePiSession` and container `PiRpcSession`), so both drive the one shared loop
+ * with zero mapping duplication. The Pi-specific concerns live here, above the transport seam and below
+ * the runtime-agnostic loop:
+ *   - `sendTurn`: subscribe, persist raw via `ctx.writeRaw`, detect the injected stage-complete tool
+ *     (capture its handoff `summary`, keep it out of the trace), map every other event through
+ *     `consumePiEvent`, and let a thrown `prompt()` propagate so the loop owns the terminal decision.
+ *     `interactive` selects `suppressStageExit` (batch `false` emits the per-turn stage-exit; the
+ *     interactive stage runner owns the single final one, so `true`).
+ *   - `summariseTurn`: deny tools (a documented no-op on `PiRpcSession`, which has no `agent`), run
+ *     `SUMMARISE_PROMPT`, return the captured text - emitting no trace.
+ *   - `cost`: Pi's aggregate `getSessionStats().cost` (DHK-434); `undefined` when unpriced, never `0`.
+ */
+function makePiRuntimeSession(
+  s: PiSessionLike,
+  ctx: RunnerContext,
+  hooks: RuntimeSessionHooks,
+  interactive: boolean,
+): RuntimeSession {
+  return {
+    get sessionId(): string | undefined {
+      return s.sessionId;
+    },
+    async sendTurn(text: string): Promise<TurnResult> {
+      const state = newPiBufferState();
+      let stageComplete = false;
+      let summary: string | undefined;
+      let stageCompleteCallId: string | undefined;
+      let responseText: string | undefined;
+      let status: JobStatus | undefined;
+      const unsub = s.subscribe((ev) => {
+        const rawRef = ctx.writeRaw?.(ev);
+        if (ev.type === "tool_execution_start" && ev.toolName === PI_STAGE_COMPLETE_TOOL) {
+          stageComplete = true;
+          stageCompleteCallId = ev.toolCallId;
+          const args = ev.args as { summary?: string } | undefined;
+          if (args?.summary) summary = args.summary;
+          return;
+        }
+        if (ev.type === "tool_execution_end" && ev.toolCallId === stageCompleteCallId) return;
+        const r = consumePiEvent(ev, state, interactive);
+        for (const e of r.events) hooks.emit(e, rawRef);
+        if (r.responseText) responseText = r.responseText;
+        if (r.isResult && r.status) status = r.status;
+      });
+      try {
+        await s.prompt(text);
+      } finally {
+        unsub();
+      }
+      return {
+        stageComplete,
+        ...(summary !== undefined ? { summary } : {}),
+        ...(responseText !== undefined ? { responseText } : {}),
+        ...(status !== undefined ? { status } : {}),
+      };
+    },
+    async summariseTurn(): Promise<string> {
+      // Deny tools so the model recaps what it just did rather than starting fresh work. A no-op on
+      // `PiRpcSession` (no `agent` handle) - accepted; meta-loop stages are telemetry-only.
+      if (s.agent) s.agent.state.tools = [];
+      const state = newPiBufferState();
+      let out: string | undefined;
+      const unsub = s.subscribe((ev) => {
+        const r = consumePiEvent(ev, state, true);
+        if (r.responseText) out = r.responseText;
+      });
+      try {
+        await s.prompt(SUMMARISE_PROMPT);
+        return (out ?? "").trim() || "(no summary produced)";
+      } catch (e) {
+        return `(summary unavailable: ${(e as Error).message})`;
+      } finally {
+        unsub();
+      }
+    },
+    cost(): number | undefined {
+      const cost = s.getSessionStats?.()?.cost;
+      return typeof cost === "number" ? cost : undefined;
+    },
+    dispose(): void {
+      s.dispose();
+    },
+  };
+}
+
 export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
   const createSession = deps.createSession ?? defaultCreatePiSession;
   const abortController = new AbortController();
   const signal = abortController.signal;
   let cancelled = false;
   let session: PiSessionLike | undefined;
-  let sessionId: string | undefined;
 
   /** Open the session once and keep it warm so `summarise()` reuses the batch session. */
   const openSession = async (ctx: RunnerContext): Promise<PiSessionLike> => {
     if (!session) session = await createSession(ctx);
     return session;
-  };
-
-  const captureSessionId = (s: PiSessionLike): void => {
-    if (s.sessionId) sessionId = s.sessionId;
   };
 
   /**
@@ -275,225 +358,57 @@ export function createPiRunner(deps: PiRunnerDeps = {}): Runner {
     }
   };
 
-  /**
-   * The stage's dollar cost from Pi's aggregate session stats (DHK-434). `getSessionStats()` sums
-   * every entry in the session, so a single read at settle covers the whole run (batch, all
-   * interactive turns, and the engine-owned summarise turn on the warm session). Returns `undefined`
-   * when the session cannot price the run, so the caller omits `costUsd` rather than reporting a
-   * fabricated `$0` - which the hub cannot tell from "free" and which silently disables `cost_budget`.
-   */
-  const readSessionCost = (s: PiSessionLike): number | undefined => {
-    const cost = s.getSessionStats?.()?.cost;
-    return typeof cost === "number" ? cost : undefined;
-  };
-
   return {
     runtime: "pi",
 
     async runBatch(ctx, onTrace) {
-      const emit = makeEmit("pi", onTrace);
+      const hooks: RuntimeSessionHooks = { emit: makeEmit("pi", onTrace), ask: defaultAsk };
       const s = await openSession(ctx);
       registerToolCallGate(s, ctx);
-      const state = newPiBufferState();
-      let status: JobStatus = "ok";
-      const unsub = s.subscribe((ev) => {
-        const rawRef = ctx.writeRaw?.(ev);
-        const r = consumePiEvent(ev, state, false);
-        for (const e of r.events) emit(e, rawRef);
-        if (r.isResult && r.status) status = r.status;
-      });
-      try {
-        await s.prompt(resolveStagePrompt(ctx));
-      } catch (e) {
-        if (!cancelled) emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
-        status = "fail";
-      } finally {
-        unsub();
-      }
-      captureSessionId(s);
-      if (cancelled) status = "fail";
-      const costUsd = readSessionCost(s);
+      const rt = makePiRuntimeSession(s, ctx, hooks, false);
+      const result = await runBatchLoop(rt, ctx, hooks, { cancelled: () => cancelled });
       // An ok batch keeps the session warm for the engine-owned summarise turn (its true terminus, which
       // disposes then). A batch that did not settle ok gets no summarise, so runBatch IS the terminus:
       // tear the session (and its hermetic config dir) down here.
-      if (status !== "ok") disposeSession();
-      return { status, ...(sessionId ? { sessionId } : {}), ...(costUsd !== undefined ? { costUsd } : {}) };
+      if (result.status !== "ok") disposeSession();
+      return result;
     },
 
     async runInteractive(ctx, turns, onTrace) {
-      const emit = makeEmit("pi", onTrace);
+      const hooks: RuntimeSessionHooks = { emit: makeEmit("pi", onTrace), ask: defaultAsk };
       const s = await openSession(ctx);
       registerToolCallGate(s, ctx);
-      const state = newPiBufferState();
-      // Default to `either`, not `gate` (DHK-363): with `gate` the stage-complete tool is disabled,
-      // so an interactive stage can only end `ok` if the human happens to type "allow"/"approve" -
-      // a keyword nothing tells them about. A stage that omits `exit` must still be completable.
-      const exit = ctx.config.exit ?? "either";
-      const wantsTool = exit === "tool" || exit === "either";
-
-      let toolFired = false;
-      let toolSummary: string | null = null;
-      let stageCompleteCallId: string | undefined;
-      let lastResponseText: string | undefined;
-
-      // One persistent subscription across all turns. Per-turn stage-exit is suppressed (the stage
-      // runner owns the single final one); the injected stage-complete tool is detected here and kept
-      // out of the trace (it is control-plane, not stage work).
-      const unsub = s.subscribe((ev) => {
-        const rawRef = ctx.writeRaw?.(ev);
-        if (ev.type === "tool_execution_start" && ev.toolName === PI_STAGE_COMPLETE_TOOL) {
-          toolFired = true;
-          stageCompleteCallId = ev.toolCallId;
-          const args = ev.args as { summary?: string } | undefined;
-          if (args?.summary) toolSummary = args.summary;
-          return;
-        }
-        if (ev.type === "tool_execution_end" && ev.toolCallId === stageCompleteCallId) return;
-        const r = consumePiEvent(ev, state, true);
-        for (const e of r.events) emit(e, rawRef);
-        if (r.responseText) lastResponseText = r.responseText;
+      const rt = makePiRuntimeSession(s, ctx, hooks, true);
+      // DHK-505: route the live session's injected `ask_user_question` tool through the shared elicit
+      // router. `runInteractiveLoop` installs the router-backed `hooks.ask` before the opening turn, and
+      // this closure reads `hooks.ask` lazily, so a question raised mid-turn reaches it. A batch of
+      // questions is asked one at a time (the router forbids concurrent asks).
+      s.setAskUserQuestionHandler?.((questions) => askQuestionsSequentially(questions, (q) => hooks.ask(q)));
+      const result = await runInteractiveLoop(rt, ctx, turns, hooks, {
+        signal,
+        cancelled: () => cancelled,
+        cancel: () => this.cancel(),
+        instructionInSystemPrompt: false,
       });
-
-      const { firstReplyMs, idleMs } = interactiveIdleWindows(ctx);
-      // DHK-505: fan the relayed human-turn stream into (a) conversational turns the loop reads and
-      // (b) a blocking `ask` the injected `ask_user_question` tool awaits, so a mid-stage structured
-      // question surfaces as a Linear `select` elicitation and the human's pick returns into the same
-      // Pi turn. Reuses the exact router the Claude adapter uses, so Pi inherits Claude's
-      // one-at-a-time / no-reply / cancel behaviour rather than a Pi-specific variant.
-      const router = createElicitTurnRouter(turns, { signal, firstReplyMs, idleMs });
-      const humanIter = router.conversation[Symbol.asyncIterator]();
-      let awaitingFirstReply = true;
-
-      // The router-backed `ask`: raise one elicitation, block for the human's turn, and map the
-      // outcome to the SAME text the Claude adapter returns (claude-adapter.ts) so the model reads an
-      // identical result. `emitElicit` (put on the ctx by the stage runner for every runtime) carries
-      // the `elicit` wire frame; the preceding trace event is audit-only (the hub maps a trace
-      // `elicitation` to null and raises Linear solely from the wire frame, so this does not double-post).
-      const elicitCtx = ctx as PolicyAwareRunnerContext;
-      const ask = async (question: ElicitQuestion): Promise<string> => {
-        const outcome = await router.ask(awaitingFirstReply, () => {
-          emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
-          elicitCtx.emitElicit?.(question);
-        });
-        return elicitOutcomeReply(outcome);
-      };
-      // Hand the batch dispatcher to the live session so its `ask_user_question` tool's execute can
-      // reach it. A batch of questions is asked one at a time (the router forbids concurrent asks).
-      s.setAskUserQuestionHandler?.((questions) => askQuestionsSequentially(questions, ask));
-
-      let exited: "tool" | "gate" | "timeout" | "cancelled" = "gate";
-      let pending = humanIter.next();
-      try {
-        // Self-seed the opening turn: the stage's trigger text rides in `issueContext`, not
-        // as a queued human turn, so open the interview ourselves rather than idling to a timeout.
-        // Pi carries no system instruction, so seed the full resolved prompt (as the batch path does).
-        await s.prompt(interactiveSeedText(ctx, false));
-        if (toolFired && wantsTool) exited = "tool";
-        for (;;) {
-          if (exited === "tool") break; // the opening turn already completed the stage
-          // The first wait is for the human's opening reply (longer budget); later waits are
-          // inter-turn idles once the conversation is live.
-          const race = await raceNextTurn(pending, awaitingFirstReply ? firstReplyMs : idleMs, signal);
-          awaitingFirstReply = false;
-          if (race.kind === "cancelled") {
-            exited = "cancelled";
-            break;
-          }
-          if (race.kind === "idle-timeout") {
-            exited = "timeout";
-            break;
-          }
-          if (race.kind === "turns-exhausted") {
-            exited = "gate";
-            break;
-          }
-          // race.kind === "turn": coalesce a burst of rapid turns into one prompt.
-          const texts: string[] = [(race.value as HumanTurn).text];
-          pending = humanIter.next();
-          for (;;) {
-            const more = await raceNextTurn(pending, COALESCE_MS, signal);
-            if (more.kind === "turn") {
-              texts.push((more.value as HumanTurn).text);
-              pending = humanIter.next();
-              continue;
-            }
-            if (more.kind === "cancelled") exited = "cancelled";
-            break;
-          }
-          if (exited === "cancelled") break;
-          await s.prompt(texts.join("\n"));
-          if (toolFired && wantsTool) {
-            exited = "tool";
-            break;
-          }
-        }
-      } catch (e) {
-        if (!cancelled) emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
-        exited = cancelled ? "cancelled" : "gate";
-      }
-
-      let status: JobStatus = "ok";
-      let summary = "";
-      if (exited === "tool") {
-        summary = toolSummary ?? "(stage marked complete)";
-      } else if (exited === "gate") {
-        // Turns exhausted with no tool exit: one engine-owned summarisation turn on the warm session.
-        lastResponseText = undefined;
-        try {
-          await s.prompt(SUMMARISE_PROMPT);
-          summary = (lastResponseText ?? "").trim() || "(no summary produced)";
-        } catch {
-          summary = "(no summary produced)";
-        }
-      } else if (exited === "timeout") {
-        status = "timeout";
-        summary = "(stage timed out awaiting input)";
-        await this.cancel();
-      } else {
-        status = "fail";
-        summary = "(stage cancelled)";
-      }
-
-      unsub();
-      captureSessionId(s);
-      const costUsd = readSessionCost(s);
       // An interactive stage produces its own summary inline (no follow-up summarise turn), so this is
       // its terminus: dispose the session and tear down its hermetic config dir.
       disposeSession();
-      return {
-        status,
-        summary,
-        ...(sessionId ? { sessionId } : {}),
-        ...(costUsd !== undefined ? { costUsd } : {}),
-      } as Omit<JobResult, "jobId">;
+      return result;
     },
 
     async summarise(ctx) {
-      // Engine-owned handoff turn: reuse the warm in-closure session for one constrained turn. Deny
-      // tools (the model must recap what it just did, not start fresh work) and emit NO trace events
-      // (the summary is an engine artefact, not the agent's stage work).
+      // Engine-owned handoff turn: reuse the warm in-closure session for one constrained turn on the
+      // `RuntimeSession` port (deny tools, emit no trace). ctx is unused: the warm session already
+      // carries the worktree + model.
       if (!session) return "(no summary: session not established)";
-      const s = session;
-      if (s.agent) s.agent.state.tools = [];
-      const state = newPiBufferState();
-      let out: string | undefined;
-      const unsub = s.subscribe((ev) => {
-        const r = consumePiEvent(ev, state, true);
-        if (r.responseText) out = r.responseText;
-      });
+      const rt = makePiRuntimeSession(session, ctx, { emit: () => {}, ask: defaultAsk }, true);
       try {
-        await s.prompt(SUMMARISE_PROMPT);
-        captureSessionId(s);
-        return (out ?? "").trim() || "(no summary produced)";
-      } catch (e) {
-        return `(summary unavailable: ${(e as Error).message})`;
+        return await rt.summariseTurn();
       } finally {
-        unsub();
         // The summarise turn is the terminus of an ok batch stage (runBatch kept the session warm for
         // it): dispose here so the hermetic config dir is torn down on the normal batch path too.
         disposeSession();
       }
-      // ctx is unused: the warm session already carries the worktree + model.
     },
 
     async cancel() {

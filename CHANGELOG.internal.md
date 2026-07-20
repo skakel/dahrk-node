@@ -34,6 +34,22 @@ this file is left verbatim.
 
 ### Changed
 
+- **Introduce the `RuntimeSession` port + shared loop; move Pi (embedded + container) onto it
+  (DHK-593).** Defined a turn-level `RuntimeSession` port (`sendTurn` / `summariseTurn` / `cost` /
+  `dispose`) plus `TurnResult` / `RuntimeSessionHooks` in `runner-shared.ts`, and lifted the interactive
+  and batch orchestration out of `pi-adapter.ts` into `runInteractiveLoop` / `runBatchLoop` there. The
+  loops own the seed → race → coalesce → settle state machine (tool-exit / gate-summarise / timeout /
+  cancel) and reference only the port, never a `PiEvent`. A single `PiRuntimeSession` wrapper over the
+  existing `PiSessionLike` transport holds the `consumePiEvent` mapping and stage-complete detection, so
+  both Pi back-ends - embedded (`defaultCreatePiSession`) and container (`PiRpcSession` via
+  `createIsolatedPiRunner`) - drive the one shared loop; the container `summariseTurn` tool-denial stays
+  a documented no-op. The loop is now proven runtime-agnostically in a new `shared-loop.test.ts` against
+  a `FakeRuntimeSession`, and the self-seed orchestration assertion migrated out of `pi-adapter.test.ts`,
+  which keeps its Pi-specific coverage (trace envelope, cost, model resolution, MCP, DHK-504 gate,
+  DHK-505 elicit, DHK-511 teardown). Per-exit `TurnResult` output (summary / status / artifact /
+  sessionId / costUsd) is preserved; the one deliberate unification is that the interactive gate-exit
+  summarise now denies tools and emits no trace, matching the batch summarise path. Seeds the
+  `RuntimeSession` glossary entry in `CONTEXT.md`.
 - **Unify the shared runtime-adapter helpers (DHK-591).** Collapsed the pieces the Pi and Claude
   adapters copied between themselves into single shared definitions in `runner-shared.ts`, with no
   behaviour change: `PolicyAwareRunnerContext` is now defined once and imported by both adapters

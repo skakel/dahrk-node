@@ -6,7 +6,16 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ElicitQuestion, HumanTurn, PolicyOutcome, Runtime, RunnerContext, TraceEvent } from "@dahrk/contracts";
+import type {
+  ElicitQuestion,
+  HumanTurn,
+  JobResult,
+  JobStatus,
+  PolicyOutcome,
+  Runtime,
+  RunnerContext,
+  TraceEvent,
+} from "@dahrk/contracts";
 import { attachedDocBasename } from "@dahrk/contracts";
 
 /** Distributive Omit: a plain `Omit<Union, K>` collapses to the union's common keys and
@@ -436,4 +445,222 @@ export function createElicitTurnRouter(
     });
   };
   return { conversation, ask };
+}
+
+/**
+ * Debounce window (ms) for coalescing a burst of rapid human turns into one prompt. Shared by the
+ * interactive loop below so both Pi back-ends debounce identically. (Claude keeps its own copy this
+ * ticket; it migrates onto the shared loop in DHK-594.)
+ */
+export const COALESCE_MS = Number(process.env.DAHRK_COALESCE_MS ?? process.env.SKAKEL_COALESCE_MS ?? 40);
+
+/**
+ * The normalised outcome of one turn, as the shared loop reads it. A `RuntimeSession` maps its own
+ * native events (Pi `PiEvent`, later Claude `SDKMessage`) into this shape INSIDE the session, so the
+ * loop never sees a runtime-specific record. `stageComplete` is the injected stage-complete exit tool
+ * firing this turn; `summary` its handoff text; `responseText` the last assistant text (used for the
+ * gate recap by runtimes that read it off a turn); `status` the settle status; `artifact` a document
+ * handed back in-band (Claude uses it; Pi omits it).
+ */
+export type TurnResult = {
+  stageComplete: boolean;
+  summary?: string;
+  responseText?: string;
+  status?: JobStatus;
+  artifact?: { path: string; content: string };
+};
+
+/**
+ * The loop-facing runtime port: a turn-level seam the shared interactive/batch loops drive. Each
+ * runtime (embedded Pi, container Pi, later Claude) implements it over its own transport, keeping the
+ * native-event mapping and stage-complete detection INSIDE the session. Deliberately free of any
+ * `PiEvent`/`SDKMessage` reference so the one loop is runtime-agnostic.
+ */
+export interface RuntimeSession {
+  /** Stable id used as the cross-attempt resume token; absent until the runtime assigns one. */
+  readonly sessionId?: string;
+  /** Send one prompt, run it to the turn's terminus, emit its trace via the hooks, return the outcome.
+   *  Must NOT swallow an underlying throw: the loop owns the terminal `runtime_error`/`fail` decision. */
+  sendTurn(text: string): Promise<TurnResult>;
+  /** The engine-owned handoff turn: deny tools, run `SUMMARISE_PROMPT`, return the recap sentence. Emits
+   *  no trace (it is an engine artefact, not the agent's stage work). */
+  summariseTurn(): Promise<string>;
+  /** The stage's aggregate dollar cost, or `undefined` when the run cannot be priced (never a `0`). */
+  cost(): number | undefined;
+  /** Release the session's resources. */
+  dispose(): void;
+}
+
+/**
+ * The side-channels a `RuntimeSession` needs from the loop, held once per stage: `emit` is the trace
+ * sink (the per-event `makeEmit` closure) and `ask` surfaces an interactive-stage structured question
+ * as a Linear elicitation through the shared router. The loop populates `ask` from the router before
+ * the opening turn, so a session that raises a question mid-turn reaches it by stable reference.
+ */
+export interface RuntimeSessionHooks {
+  emit: (event: EmittableEvent, rawRef?: string) => void;
+  ask: (question: ElicitQuestion) => Promise<string>;
+}
+
+/** Build a `RuntimeSession` bound to the stage's context and hooks. Injected so a fake can drive the
+ *  loop without a live runtime. */
+export type RuntimeSessionFactory = (ctx: RunnerContext, hooks: RuntimeSessionHooks) => Promise<RuntimeSession>;
+
+/** The loop-owned lifecycle levers the interactive settle needs: the cancel signal, a live `cancelled`
+ *  predicate (runner state), the runner's `cancel()` (fired on timeout), and whether the stage
+ *  instruction already rides in the runtime's system prompt (so the seed can be a short kickoff). */
+export interface InteractiveLoopOptions {
+  signal: AbortSignal;
+  cancelled: () => boolean;
+  cancel: () => Promise<void>;
+  instructionInSystemPrompt: boolean;
+}
+
+/**
+ * The shared interactive loop: seed -> race the next human turn against the idle deadline and cancel
+ * -> coalesce a rapid burst -> settle. It owns the `exited: tool|gate|timeout|cancelled` state machine
+ * and, on a gate exit, the single engine-owned `summariseTurn()`. It reads ONLY the `RuntimeSession`
+ * port, so embedded Pi, container Pi and (later) Claude all drive this one body. The elicit router is
+ * built here and exposed as `hooks.ask`, so a session's structured-question tool routes through the
+ * shared one-at-a-time / no-reply / cancel machinery.
+ */
+export async function runInteractiveLoop(
+  session: RuntimeSession,
+  ctx: RunnerContext,
+  turns: AsyncIterable<HumanTurn>,
+  hooks: RuntimeSessionHooks,
+  opts: InteractiveLoopOptions,
+): Promise<Omit<JobResult, "jobId">> {
+  const { signal, cancelled, cancel, instructionInSystemPrompt } = opts;
+  // Default to `either`, not `gate` (DHK-363): with `gate` the stage-complete tool is disabled, so an
+  // interactive stage can only end `ok` if the human happens to type "allow"/"approve" - a keyword
+  // nothing tells them about. A stage that omits `exit` must still be completable.
+  const exit = ctx.config.exit ?? "either";
+  const wantsTool = exit === "tool" || exit === "either";
+  const { firstReplyMs, idleMs } = interactiveIdleWindows(ctx);
+
+  // Fan the relayed human-turn stream into (a) conversational turns this loop reads and (b) a blocking
+  // `ask` a session's injected structured-question tool awaits. Populate `hooks.ask` before the seed so
+  // a question raised on the opening turn reaches the router.
+  const router = createElicitTurnRouter(turns, { signal, firstReplyMs, idleMs });
+  const humanIter = router.conversation[Symbol.asyncIterator]();
+  let awaitingFirstReply = true;
+  const elicitCtx = ctx as PolicyAwareRunnerContext;
+  hooks.ask = async (question: ElicitQuestion): Promise<string> => {
+    const outcome = await router.ask(awaitingFirstReply, () => {
+      hooks.emit({ type: "elicitation", prompt: question.prompt, signal: "select", options: question.options });
+      elicitCtx.emitElicit?.(question);
+    });
+    return elicitOutcomeReply(outcome);
+  };
+
+  let toolSummary: string | undefined;
+  let artifact: { path: string; content: string } | undefined;
+  let exited: "tool" | "gate" | "timeout" | "cancelled" = "gate";
+  let pending = humanIter.next();
+  try {
+    // Self-seed the opening turn: an interactive stage's trigger text rides in `issueContext`, not as a
+    // queued human turn, so open the interview ourselves rather than idling to a timeout.
+    const seed = await session.sendTurn(interactiveSeedText(ctx, instructionInSystemPrompt));
+    if (seed.stageComplete && wantsTool) {
+      exited = "tool";
+      toolSummary = seed.summary;
+      artifact = seed.artifact;
+    }
+    for (;;) {
+      if (exited === "tool") break; // the opening turn already completed the stage
+      // The first wait is for the human's opening reply (longer budget); later waits are inter-turn
+      // idles once the conversation is live.
+      const race = await raceNextTurn(pending, awaitingFirstReply ? firstReplyMs : idleMs, signal);
+      awaitingFirstReply = false;
+      if (race.kind === "cancelled") {
+        exited = "cancelled";
+        break;
+      }
+      if (race.kind === "idle-timeout") {
+        exited = "timeout";
+        break;
+      }
+      if (race.kind === "turns-exhausted") {
+        exited = "gate";
+        break;
+      }
+      // race.kind === "turn": coalesce a burst of rapid turns into one prompt.
+      const texts: string[] = [(race.value as HumanTurn).text];
+      pending = humanIter.next();
+      for (;;) {
+        const more = await raceNextTurn(pending, COALESCE_MS, signal);
+        if (more.kind === "turn") {
+          texts.push((more.value as HumanTurn).text);
+          pending = humanIter.next();
+          continue;
+        }
+        if (more.kind === "cancelled") exited = "cancelled";
+        break;
+      }
+      if (exited === "cancelled") break;
+      const tr = await session.sendTurn(texts.join("\n"));
+      if (tr.stageComplete && wantsTool) {
+        exited = "tool";
+        toolSummary = tr.summary;
+        artifact = tr.artifact;
+        break;
+      }
+    }
+  } catch (e) {
+    if (!cancelled()) hooks.emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
+    exited = cancelled() ? "cancelled" : "gate";
+  }
+
+  let status: JobStatus = "ok";
+  let summary = "";
+  if (exited === "tool") {
+    summary = toolSummary ?? "(stage marked complete)";
+  } else if (exited === "gate") {
+    // Turns exhausted with no tool exit: one engine-owned summarisation turn on the warm session.
+    summary = await session.summariseTurn();
+  } else if (exited === "timeout") {
+    status = "timeout";
+    summary = "(stage timed out awaiting input)";
+    await cancel();
+  } else {
+    status = "fail";
+    summary = "(stage cancelled)";
+  }
+
+  const costUsd = session.cost();
+  const sessionId = session.sessionId;
+  const outArtifact = status === "ok" ? artifact : undefined;
+  return {
+    status,
+    summary,
+    ...(sessionId ? { sessionId } : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
+    ...(outArtifact ? { artifact: outArtifact } : {}),
+  } as Omit<JobResult, "jobId">;
+}
+
+/**
+ * The shared batch loop: one `sendTurn(resolveStagePrompt)`, settle the status, read `cost()`/
+ * `sessionId`. A thrown `sendTurn` is the terminal-failure boundary - emit `runtime_error` (guarded by
+ * the runner's `cancelled` predicate, so a cancel-driven throw is not mis-reported) and settle `fail`.
+ */
+export async function runBatchLoop(
+  session: RuntimeSession,
+  ctx: RunnerContext,
+  hooks: RuntimeSessionHooks,
+  opts: { cancelled: () => boolean },
+): Promise<Omit<JobResult, "jobId" | "summary">> {
+  let status: JobStatus = "ok";
+  try {
+    const tr = await session.sendTurn(resolveStagePrompt(ctx));
+    if (tr.status) status = tr.status;
+  } catch (e) {
+    if (!opts.cancelled()) hooks.emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
+    status = "fail";
+  }
+  if (opts.cancelled()) status = "fail";
+  const costUsd = session.cost();
+  const sessionId = session.sessionId;
+  return { status, ...(sessionId ? { sessionId } : {}), ...(costUsd !== undefined ? { costUsd } : {}) };
 }

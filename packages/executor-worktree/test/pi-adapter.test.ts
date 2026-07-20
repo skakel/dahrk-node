@@ -258,27 +258,10 @@ test("runInteractive gate exit: opening turn is self-seeded; per-turn stage-exit
   assert.ok(!events.some((e) => e.type === "state"), "no per-turn stage-exit on the interactive path");
 });
 
-test("runInteractive self-seed: opens with an agent turn even with zero human turns", async () => {
-  const events: TraceEvent[] = [];
-  const fake = new FakePiSession([
-    // The self-seeded opening turn: the interview starts itself.
-    [pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "What are we building?" } }),
-     pe({ type: "turn_end", message: { stopReason: "stop" } })],
-    // Engine-owned summarise turn (no human turns -> turns exhausted -> gate).
-    [pe({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "No answers were given." } }),
-     pe({ type: "agent_end", messages: [{ stopReason: "stop" }] })],
-  ]);
-  const runner = createPiRunner({ createSession: async () => fake });
-  // No human turns at all: this is the label-triggered case that previously idled to a timeout.
-  const result = await runner.runInteractive(ctx(), turnsFrom([]), (e) => events.push(e));
-
-  assert.match(fake.prompts[0] ?? "", /Fix the failing tests\./, "opening turn seeded from the ticket brief");
-  assert.ok(
-    events.some((e) => e.type === "response" && (e as Extract<TraceEvent, { type: "response" }>).text?.includes("What are we building?")),
-    "an opening model turn is emitted before any human input",
-  );
-  assert.equal(result.status, "ok");
-});
+// The self-seed orchestration assertion (an opening agent turn fires before any human input, even
+// with zero human turns) is proven runtime-agnostically in `shared-loop.test.ts` against the
+// `FakeRuntimeSession`. Its Pi-specific facet (the seeded turn's text streams through `consumePiEvent`
+// into a `response` event) is still covered by the gate-exit test above.
 
 test("runInteractive tool exit: the injected stage-complete tool ends the stage and yields its summary", async () => {
   const events: TraceEvent[] = [];
