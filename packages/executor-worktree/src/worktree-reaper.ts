@@ -22,6 +22,7 @@ import { join } from "node:path";
 /** Milliseconds. */
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 
 export interface ReapPolicy {
   /** Keep at most this many worktrees; the idlest are reaped first. */
@@ -34,6 +35,14 @@ export interface ReapPolicy {
    * is no IPC between them), so it must stay comfortably longer than the longest plausible stage.
    */
   activityGraceMs?: number;
+  /**
+   * Expire a parked salvage ref (`refs/dahrk/salvage/*`) this long after it was parked. These are the
+   * insurance `salvageOrphanedTip` writes before a run branch is reset away; they must live long enough
+   * for an operator to notice lost work and recover it, but be bounded so they cannot accumulate for
+   * ever. Aged by the ref's own park time, never the pointed-to commit's date (a branch can hold a
+   * commit authored days before it is parked), so a just-parked ref always survives.
+   */
+  salvageTtlMs?: number;
   /** Report what would be reaped, change nothing. */
   dryRun?: boolean;
 }
@@ -51,6 +60,12 @@ export interface ReapReport {
   reaped: ReapedWorktree[];
   /** Skipped because busy, or inside the activity grace. */
   skipped: number;
+  /**
+   * Parked salvage refs (`refs/dahrk/salvage/*`) STILL on disk after this pass. Surfaced so the count
+   * of recoverable-but-not-yet-expired run-branch tips is visible somewhere a human already looks,
+   * rather than only in the one-shot warn at park time.
+   */
+  salvagedRefs: number;
   errors: string[];
 }
 
@@ -68,6 +83,9 @@ const DEFAULTS: Required<Omit<ReapPolicy, "dryRun">> = {
   maxRuns: 20,
   maxIdleMs: 6 * HOUR,
   activityGraceMs: 30 * MINUTE,
+  // 14 days: long enough that an operator who missed the park log can still recover unpushed work, but
+  // bounded so parked tips cannot pile up for ever. Cited verbatim in docs/logging.md - keep in step.
+  salvageTtlMs: 14 * DAY,
 };
 
 const noop = { info: () => {}, warn: () => {} };
@@ -130,6 +148,64 @@ function registeredWorktrees(mirror: string): string[] {
     .filter((p) => p && p !== canonical(mirror));
 }
 
+/**
+ * When a salvage ref was parked. Its own on-disk write time (the loose-ref file mtime) is the park
+ * time - consistent with how `lastUsedMs` above ages worktrees, and correct where `committerdate` is
+ * not: a branch can hold a commit authored days before it is parked, so committer date would expire a
+ * just-parked ref immediately and destroy the very insurance it exists for. Falls back to the ref's
+ * reflog timestamp for a packed ref with no loose file, and returns undefined when it cannot be dated
+ * at all - the caller then never expires it (fail safe: do not destroy an undatable insurance ref).
+ */
+function salvageParkedMs(mirror: string, ref: string): number | undefined {
+  try {
+    return statSync(join(mirror, ref)).mtimeMs;
+  } catch {
+    /* packed or otherwise no loose file: fall back to the reflog */
+  }
+  try {
+    const ts = gitOut(mirror, ["log", "-g", "--format=%ct", "-1", ref]).trim();
+    if (ts) return Number(ts) * 1000;
+  } catch {
+    /* no reflog for this ref */
+  }
+  return undefined;
+}
+
+/**
+ * Expire parked salvage refs older than `ttlMs` and return how many are STILL parked afterwards. A ref
+ * that cannot be dated is never expired and counts as still parked. In `dryRun` nothing is deleted and
+ * every ref counts as parked, but the ones that would go are logged.
+ */
+function sweepSalvageRefs(
+  mirror: string,
+  ttlMs: number,
+  dryRun: boolean,
+  now: number,
+  log: { info: (m: string) => void; warn: (m: string) => void },
+): number {
+  let refs: string[];
+  try {
+    refs = gitOut(mirror, ["for-each-ref", "--format=%(refname)", "refs/dahrk/salvage/"])
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch {
+    return 0;
+  }
+  let parked = 0;
+  for (const ref of refs) {
+    const at = salvageParkedMs(mirror, ref);
+    const expired = at !== undefined && now - at > ttlMs;
+    if (expired && !dryRun) {
+      if (!gitOk(mirror, ["update-ref", "-d", ref])) log.warn(`reaper: could not expire salvage ref ${ref}`);
+      continue;
+    }
+    if (expired) log.info(`reaper (dry-run): would expire salvage ref ${ref}`);
+    parked++;
+  }
+  return parked;
+}
+
 export function createWorktreeReaper(opts: ReaperOptions) {
   const log = opts.logger ?? noop;
   const mirrors = (): string[] => {
@@ -153,8 +229,9 @@ export function createWorktreeReaper(opts: ReaperOptions) {
       const maxRuns = policy.maxRuns ?? DEFAULTS.maxRuns;
       const maxIdleMs = policy.maxIdleMs ?? DEFAULTS.maxIdleMs;
       const graceMs = policy.activityGraceMs ?? DEFAULTS.activityGraceMs;
+      const salvageTtlMs = policy.salvageTtlMs ?? DEFAULTS.salvageTtlMs;
       const dryRun = policy.dryRun ?? false;
-      const report: ReapReport = { scanned: 0, reaped: [], skipped: 0, errors: [] };
+      const report: ReapReport = { scanned: 0, reaped: [], skipped: 0, salvagedRefs: 0, errors: [] };
       const now = Date.now();
 
       // Prune first: drops admin entries whose directory has already vanished, so a hand-deleted
@@ -235,6 +312,18 @@ export function createWorktreeReaper(opts: ReaperOptions) {
 
       if (report.reaped.length) {
         log.info(`reaper: reaped ${report.reaped.length} worktree(s), skipped ${report.skipped}`);
+      }
+
+      // Expire and count parked run-branch tips. This is the observability half of DHK-481: the count is
+      // reported on every pass (not just the one-shot warn at park time), and a stale ref is actually
+      // collected on the TTL the docs promise. `registered` already holds every live mirror.
+      for (const m of registered.keys()) {
+        report.salvagedRefs += sweepSalvageRefs(m, salvageTtlMs, dryRun, now, log);
+      }
+      if (report.salvagedRefs) {
+        log.info(
+          `reaper: ${report.salvagedRefs} salvage ref(s) parked, expire ${Math.round(salvageTtlMs / DAY)}d after parking`,
+        );
       }
       return report;
     },

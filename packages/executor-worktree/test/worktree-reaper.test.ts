@@ -45,6 +45,31 @@ function ageBy(worktreePath: string, ms: number): void {
 }
 
 const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
+
+/** Park a tip under `refs/dahrk/salvage/*` exactly as `salvageOrphanedTip` does, and return the ref. */
+function parkSalvageRef(mirror: string, branchName: string, sha: string): string {
+  const ref = `refs/dahrk/salvage/${branchName}/${sha.slice(0, 12)}`;
+  git(mirror, ["update-ref", ref, sha]);
+  return ref;
+}
+
+/** Backdate a loose salvage ref's own write time (its park time) by `ms`. */
+function ageRef(mirror: string, ref: string, ms: number): void {
+  const t = (Date.now() - ms) / 1000;
+  utimesSync(join(mirror, ref), t, t);
+}
+
+const refExists = (mirror: string, ref: string): boolean =>
+  existsSync(join(mirror, ref)) ||
+  (() => {
+    try {
+      git(mirror, ["rev-parse", "--verify", "-q", ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
 
 test("the reaper collects a BROKEN worktree and frees the branch name it was holding hostage", async () => {
   const remote = makeBareRemote();
@@ -208,6 +233,94 @@ test("over the count cap, the idlest worktrees go first", async () => {
     assert.equal(report.reaped[0]?.reason, "over-count");
     assert.ok(!existsSync(refs[0]!.worktreePath));
     assert.ok(existsSync(refs[1]!.worktreePath) && existsSync(refs[2]!.worktreePath));
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("the reaper expires a salvage ref parked longer ago than salvageTtlMs", async () => {
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const mirror = join(mirrorsDir, "repo-s1");
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-s1",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-salv-1",
+      branch: "skakel/issue-DHK-30",
+    });
+    const sha = git(mirror, ["rev-parse", "refs/remotes/origin/main"]).trim();
+    const parked = parkSalvageRef(mirror, "skakel/issue-DHK-30", sha);
+    ageRef(mirror, parked, 30 * DAY); // parked well past a 14-day TTL
+    // Keep the worktree out of the way: it is inside the grace, so the worktree sweep leaves it alone.
+
+    const reaper = createWorktreeReaper({ worktreesDir, mirrorsDir });
+    const report = await reaper.reap({ salvageTtlMs: 14 * DAY });
+
+    assert.ok(!refExists(mirror, parked), "the stale salvage ref is collected");
+    assert.equal(report.salvagedRefs, 0, "and is not counted as still parked");
+    assert.ok(existsSync(ref.worktreePath), "the live worktree is untouched by the salvage sweep");
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("a freshly parked salvage ref survives and is counted (the insurance holds)", async () => {
+  // The committerdate trap: a branch can point at a commit authored days ago, so ageing by commit date
+  // would expire a just-parked ref at once. Ageing by PARK time must keep it.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const mirror = join(mirrorsDir, "repo-s2");
+  try {
+    await svc.createWorktree({
+      repoId: "repo-s2",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-salv-2",
+      branch: "skakel/issue-DHK-31",
+    });
+    const sha = git(mirror, ["rev-parse", "refs/remotes/origin/main"]).trim();
+    const parked = parkSalvageRef(mirror, "skakel/issue-DHK-31", sha);
+    ageRef(mirror, parked, 1 * DAY); // parked recently, well inside a 14-day TTL
+
+    const reaper = createWorktreeReaper({ worktreesDir, mirrorsDir });
+    const report = await reaper.reap({ salvageTtlMs: 14 * DAY });
+
+    assert.ok(refExists(mirror, parked), "the fresh salvage ref still resolves");
+    assert.equal(report.salvagedRefs, 1, "and is counted as still parked");
+  } finally {
+    for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("dryRun expires no salvage ref and still reports it as parked", async () => {
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const mirror = join(mirrorsDir, "repo-s3");
+  try {
+    await svc.createWorktree({
+      repoId: "repo-s3",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-salv-3",
+      branch: "skakel/issue-DHK-32",
+    });
+    const sha = git(mirror, ["rev-parse", "refs/remotes/origin/main"]).trim();
+    const parked = parkSalvageRef(mirror, "skakel/issue-DHK-32", sha);
+    ageRef(mirror, parked, 30 * DAY); // stale enough to expire, but dryRun must stay its hand
+
+    const reaper = createWorktreeReaper({ worktreesDir, mirrorsDir });
+    const report = await reaper.reap({ salvageTtlMs: 14 * DAY, dryRun: true });
+
+    assert.ok(refExists(mirror, parked), "dryRun deletes nothing");
+    assert.equal(report.salvagedRefs, 1, "and still reports the ref as parked");
   } finally {
     for (const d of [remote, worktreesDir, mirrorsDir]) rmSync(d, { recursive: true, force: true });
   }

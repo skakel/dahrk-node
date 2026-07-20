@@ -421,10 +421,10 @@ export async function startEdgeNode(opts: EdgeOptions): Promise<void> {
       // `scanned - reaped` is what is still on disk: the gauge that would have made the DHK-371 worktree
       // leak visible from the hub instead of from a full disk.
       counters.worktreeCount = Math.max(r.scanned - r.reaped.length, 0);
-      if (r.reaped.length) {
+      if (r.reaped.length || r.salvagedRefs) {
         log.info(
-          { reaped: r.reaped, scanned: r.scanned, skipped: r.skipped },
-          `EDGE_REAPED:${r.reaped.length} worktrees (scanned ${r.scanned}, skipped ${r.skipped})`,
+          { reaped: r.reaped, scanned: r.scanned, skipped: r.skipped, salvagedRefs: r.salvagedRefs },
+          `EDGE_REAPED:${r.reaped.length} worktrees (scanned ${r.scanned}, skipped ${r.skipped}, salvaged ${r.salvagedRefs})`,
         );
       }
       for (const e of r.errors) log.warn({ reapError: e }, `EDGE_REAP_ERROR:${e}`);
