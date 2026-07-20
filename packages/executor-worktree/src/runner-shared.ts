@@ -449,8 +449,8 @@ export function createElicitTurnRouter(
 
 /**
  * Debounce window (ms) for coalescing a burst of rapid human turns into one prompt. Shared by the
- * interactive loop below so both Pi back-ends debounce identically. (Claude keeps its own copy this
- * ticket; it migrates onto the shared loop in DHK-594.)
+ * interactive loop below so every runtime (both Pi back-ends and Claude) debounces identically - the
+ * single copy now that Claude drives this loop too (DHK-594).
  */
 export const COALESCE_MS = Number(process.env.DAHRK_COALESCE_MS ?? process.env.SKAKEL_COALESCE_MS ?? 40);
 

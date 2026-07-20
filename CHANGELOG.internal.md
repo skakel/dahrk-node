@@ -34,6 +34,19 @@ this file is left verbatim.
 
 ### Changed
 
+- **Move the Claude adapter onto `RuntimeSession`; both runtimes drive one loop (DHK-594).** Converted
+  `createClaudeRunner` to build a `RuntimeSession` (`makeClaudeRuntimeSession`) over the existing
+  `ClaudeSessionLike` transport and deleted its private seed → race → coalesce → settle loop: `runBatch`
+  and `runInteractive` are now thin callers of the shared `runBatchLoop` / `runInteractiveLoop` from
+  DHK-593, so that loop and the elicit `ask` map exist exactly once in the package (the adapter-local
+  `COALESCE_MS` is gone). The session keeps the Claude-specific concerns above the transport seam:
+  the buffered-response mapping (`consumeClaudeMessage`), stage-complete detection and its handed-back
+  document (`TurnResult.artifact`), the recap-only `summarising` flag the `canUseTool` closure reads,
+  and `sessionId`/`costUsd` capture; the `claude_code` preset, `sandboxOptions`, `runtimeEnvOptions`,
+  `maxTurns`, brokered MCP, and the `AskUserQuestion` shadow-tool/`toolAliases` redirect stay in
+  `runInteractive`. `summarise()` and `cancel()` remain Claude-specific `Runner` methods. Every
+  `TurnResult` (tool-exit / gate-summarise / timeout / cancel, plus the document artifact and costUsd)
+  is preserved: the DHK-592 characterisation suite passes unchanged, now driven through the shared loop.
 - **Introduce the `RuntimeSession` port + shared loop; move Pi (embedded + container) onto it
   (DHK-593).** Defined a turn-level `RuntimeSession` port (`sendTurn` / `summariseTurn` / `cost` /
   `dispose`) plus `TurnResult` / `RuntimeSessionHooks` in `runner-shared.ts`, and lifted the interactive
