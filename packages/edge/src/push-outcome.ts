@@ -9,7 +9,7 @@
  * hub's expectations exactly.
  */
 import type { PushJob, PushResult } from "@dahrk/contracts";
-import type { BackupPushResult, CommitPushResult, OpenPrResult } from "@dahrk/executor-worktree";
+import type { BackupPushResult, CommitPushResult, DiffFootprint, OpenPrResult } from "@dahrk/executor-worktree";
 
 /**
  * Forward-compat shims over `@dahrk/contracts@0.1.0`, which predates DHK-264's backup-push fields. The
@@ -22,6 +22,16 @@ import type { BackupPushResult, CommitPushResult, OpenPrResult } from "@dahrk/ex
 export type PushMode = "deliver" | "backup";
 export type PushJobWithMode = PushJob & { mode?: PushMode };
 export type PushResultWithWip = PushResult & { wipRef?: string };
+
+/**
+ * Forward-compat shim over the published `@dahrk/contracts`, which predates DHK-613/DHK-615's footprint
+ * fields. The node computes the delivered diff's blast radius in its worktree and the hub projects it
+ * onto the Card `footprint` block; `encode`/`decode` on the wire is a plain `JSON`, so these flat fields
+ * ride through even though the published `PushResult` omits them. Drop this shim (spread the fields
+ * directly onto `PushResult`) once `@dahrk/contracts` is republished with the real fields. The flat names
+ * here MUST match the names the harness publishes on `PushResult`/`PushOutcome`.
+ */
+export type PushResultWithFootprint = PushResult & Partial<DiffFootprint>;
 
 /** The job facts the deliver ladder needs to phrase its result. */
 export interface DeliverOutcomeContext {
@@ -56,7 +66,7 @@ export function resolveDeliverOutcome(
   r: CommitPushResult,
   job: DeliverOutcomeContext,
   pr: OpenPrResult | undefined,
-): PushResult {
+): PushResultWithFootprint {
   const { jobId, branch, base } = job;
 
   if (r.integration === "noop") {
@@ -82,6 +92,7 @@ export function resolveDeliverOutcome(
       commitsAhead: r.commitsAhead,
       integration: "conflict",
       ...(r.conflictFiles ? { conflictFiles: r.conflictFiles } : {}),
+      ...(r.footprint ?? {}),
       summary: `base advanced; merge conflict on ${branch} (manual merge needed)`,
     };
   }
@@ -109,6 +120,7 @@ export function resolveDeliverOutcome(
     ...(pr?.prUrl ? { prUrl: pr.prUrl } : {}),
     ...(pr?.prNumber !== undefined ? { prNumber: pr.prNumber } : {}),
     ...(pr?.prError ? { prError: pr.prError } : {}),
+    ...(r.footprint ?? {}),
     summary: r.nothingToCommit
       ? `no changes to commit; ${r.pushed ? "branch pushed" : "nothing pushed"}`
       : `committed ${r.headSha.slice(0, 7)} and pushed ${branch}`,

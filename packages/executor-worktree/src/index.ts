@@ -44,6 +44,10 @@ export type {
   OpenPrResult,
 } from "./git-service.js";
 
+/** The pure footprint core: parse `git diff --numstat` and derive the blast-radius numbers (DHK-615). */
+export { parseNumstat, deriveFootprint } from "./footprint.js";
+export type { NumstatEntry, Numstat, DiffFootprint } from "./footprint.js";
+
 /** The trace producer (M3). */
 export { createTraceWriter } from "./trace-writer.js";
 export type { TraceWriter } from "./trace-writer.js";

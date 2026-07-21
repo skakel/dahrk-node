@@ -21,6 +21,16 @@ this file is left verbatim.
 
 ### Added
 
+- **Footprint source: the node computes the diff footprint and forwards it on the push result
+  (DHK-615).** New pure `footprint.ts` (`parseNumstat` + `deriveFootprint`) in `@dahrk/executor-worktree`
+  handles numstat binary/rename rows, sums files/added/removed, derives `scope`, and caps `changedPaths`
+  at 100 with a `changedPathsTruncated` marker. `commitAndPush` computes it once from the existing
+  `FETCH_HEAD...HEAD` range (reusing the noop scratch filter) and attaches `footprint` to `CommitPushResult`
+  on the clean and conflict outcomes; `resolveDeliverOutcome` spreads the flat fields onto the wire
+  result. The wire fields ride a forward-compat shim (`PushResultWithFootprint`) because the blocking
+  DHK-613 contract republish (`numstat`/`scope`/`changedPaths`/`changedPathsTruncated` on
+  `PushResult`/`PushOutcome`) has not shipped: `@dahrk/contracts@0.4.0` still omits them. Drop the shim
+  and align the flat names once the contract is republished.
 - **Give the Claude adapter an injectable session seam + characterisation tests (DHK-592).** Wrapped
   the Claude Agent SDK `query()` (and the interactive streaming `ManagedMailbox`) behind an injectable
   factory (`ClaudeRunnerDeps.createSession` / `ClaudeSessionLike`), mirroring Pi's
