@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-07-21
+
 ### Added
 
 - **A delivered push now reports its diff footprint, so the hub can show the blast radius.** After a
@@ -14,21 +16,21 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
   `git diff --numstat` totals (files, added, removed), the changed top-level `scope`, and a capped list
   of changed paths with a truncation marker so a large diff never spills an unbounded payload over the
   wire. Engine scratch never inflates the numbers, and a zero-diff or scratch-only run reports no
-  footprint (the surface falls back to a commit count only).
-- **A salvaged run-branch tip is now discoverable, and parked tips expire on a schedule.** When a new
+  footprint (the surface falls back to a commit count only). (#105)
+- **A salvaged tip is now discoverable, and parked tips expire on a schedule.** When a new
   run resets a branch that still held unpushed commits, the node parks the old tip at
   `refs/dahrk/salvage/<branch>/<sha>` so it is never destroyed - but until now nothing told you it had
   happened, and `git branch --contains` never lists it because it lives outside `refs/heads/*`. The
   reap pass now reports how many tips are currently parked (`salvagedRefs` on the `EDGE_REAPED` log
   line), and `docs/logging.md` documents how to find and recover one. Parked tips are also now
   collected 14 days after parking (aged by park time, so a freshly parked tip always survives), so the
-  insurance cannot accumulate for ever. Parking behaviour itself is unchanged.
+  insurance cannot accumulate for ever. Parking behaviour itself is unchanged. (#104)
 - **`dahrk repo add` now warns when the hub's stored git URL differs from what this checkout would
   register.** The idempotent re-run already flagged a drifted default branch or display name; it now
   also compares `gitUrl`, so a stale record - a URL left on HTTPS, or pointing at a repo's pre-rename
   name, that an ambient (SSH-only) node cannot clone - is surfaced as a hint instead of passing
   silently. The record is still left unchanged (`repo add` never overwrites); the warning tells the
-  operator to correct it in the hub.
+  operator to correct it in the hub. (#103)
 
 ## [0.1.21] - 2026-07-19
 
@@ -819,7 +821,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/dahrkai/dahrk-node/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/dahrkai/dahrk-node/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/dahrkai/dahrk-node/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/dahrkai/dahrk-node/compare/v0.1.18...v0.1.19

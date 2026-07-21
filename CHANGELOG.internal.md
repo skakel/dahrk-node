@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-07-21
+
 ### Added
 
 - **Footprint source: the node computes the diff footprint and forwards it on the push result
