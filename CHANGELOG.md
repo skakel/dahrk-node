@@ -8,6 +8,13 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ### Added
 
+- **A delivered push now reports its diff footprint, so the hub can show the blast radius.** After a
+  clean deliver (or a base-advanced merge conflict that still produced a diff), the node computes the
+  branch's own contribution over the freshly fetched base and attaches it to the push result: the
+  `git diff --numstat` totals (files, added, removed), the changed top-level `scope`, and a capped list
+  of changed paths with a truncation marker so a large diff never spills an unbounded payload over the
+  wire. Engine scratch never inflates the numbers, and a zero-diff or scratch-only run reports no
+  footprint (the surface falls back to a commit count only).
 - **A salvaged run-branch tip is now discoverable, and parked tips expire on a schedule.** When a new
   run resets a branch that still held unpushed commits, the node parks the old tip at
   `refs/dahrk/salvage/<branch>/<sha>` so it is never destroyed - but until now nothing told you it had

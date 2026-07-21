@@ -15,6 +15,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { WorkspaceRef } from "@dahrk/contracts";
+import { parseNumstat, deriveFootprint, type DiffFootprint } from "./footprint.js";
 
 /** Minimal logger; defaults to a no-op so the library is quiet in tests. */
 export interface GitLogger {
@@ -27,6 +28,11 @@ const noopLogger: GitLogger = { info: () => {}, warn: () => {} };
  *  worktree for stages to read/write but must NEVER enter a commit or the PR. Excluded from git and
  *  untracked before every push; also the yardstick for the "nothing to deliver" no-op below. */
 const SCRATCH_DIR = ".dahrk/scratch";
+
+/** Cap on the `changedPaths` list the footprint reports (DHK-615): the headline files/added/removed and
+ *  `scope` stay exact over the full diff, but the path LIST is truncated past this many entries (with a
+ *  marker) so a large diff never spills an unbounded array over the wire or into the projection. */
+const CHANGED_PATHS_CAP = 100;
 
 /** Everything the node needs to build a worktree with no local repo config: the registry identity
  *  (`repoId`/`gitUrl`) it clones on demand, the base branch, and the run it is for. `repo` is the
@@ -122,6 +128,11 @@ export interface CommitPushResult {
   integration?: "clean" | "conflict" | "diverged" | "noop";
   /** The conflicted paths when `integration === "conflict"` (`git diff --name-only --diff-filter=U`). */
   conflictFiles?: string[];
+  /** The delivered diff's blast radius (files/added/removed, changed top-level `scope`, capped
+   *  `changedPaths`) computed from the branch's own `FETCH_HEAD...HEAD` range for the hub to project onto
+   *  the Card footprint block (DHK-615). Present only when a real non-scratch diff was delivered (the
+   *  `clean` and `conflict` outcomes); absent for `noop`/`diverged` and the no-base legacy path. */
+  footprint?: DiffFootprint;
 }
 
 /** Options for {@link GitService.backupPush}: a merge-free push of the run's HEAD to a disposable ref. */
@@ -860,6 +871,9 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       const { remote, authEnv, cleanup } = resolveRemoteAuth(ref.gitUrl, opts.credentialToken);
       let pushed = false;
       let integration: "clean" | "conflict" | undefined;
+      // The delivered diff's blast radius, computed once from the same `FETCH_HEAD...HEAD` range as the
+      // noop check (DHK-615). Undefined when there is no real non-scratch delta or no fetched base.
+      let footprint: DiffFootprint | undefined;
       try {
         // refresh the base ref at PUSH time (not just at intake) and merge it into the branch
         // BEFORE pushing, so parallel runs that all branched off the same commit integrate each other's
@@ -908,6 +922,15 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
             gitOk(worktreePath, ["check-ignore", "-q", "--no-index", "--", p]);
           if (!delta.some((p) => !isScratchPath(p))) {
             return { headSha, pushed: false, nothingToCommit: true, commitsAhead, integration: "noop" };
+          }
+          // There IS a real delta, so compute the footprint once from the same range (DHK-615): the
+          // per-file line stats via `--numstat`, scratch-filtered so engine state never inflates the
+          // blast radius, then summed/scoped/capped by the pure `deriveFootprint`.
+          const numstatEntries = parseNumstat(git(worktreePath, ["diff", "--numstat", "FETCH_HEAD...HEAD"])).filter(
+            (e) => !isScratchPath(e.path),
+          );
+          if (numstatEntries.length > 0) {
+            footprint = deriveFootprint(numstatEntries, { cap: CHANGED_PATHS_CAP });
           }
           try {
             // A non-fast-forward merge writes a commit, so pass the same committer identity as the
@@ -959,7 +982,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
                 headSha = git(worktreePath, ["rev-parse", "HEAD"]).trim();
               } else {
                 git(worktreePath, ["merge", "--abort"]);
-                return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "conflict", conflictFiles };
+                return { headSha, pushed: false, nothingToCommit: !dirty, commitsAhead, integration: "conflict", conflictFiles, ...(footprint ? { footprint } : {}) };
               }
             } else {
               // Unrelated/diverged histories: no shared ancestor, so the base can never auto-integrate.
@@ -980,7 +1003,7 @@ export function createGitService(opts: GitServiceOptions = {}): GitService {
       } finally {
         cleanup();
       }
-      return { headSha, pushed, nothingToCommit: !dirty, commitsAhead, ...(integration ? { integration } : {}) };
+      return { headSha, pushed, nothingToCommit: !dirty, commitsAhead, ...(integration ? { integration } : {}), ...(footprint ? { footprint } : {}) };
     },
 
     async backupPush(ref, opts) {

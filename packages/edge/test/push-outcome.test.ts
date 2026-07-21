@@ -101,6 +101,44 @@ test("deliver clean, nothing to commit and nothing pushed: the 'nothing pushed' 
   assert.equal(r.summary, "no changes to commit; nothing pushed");
 });
 
+const footprint = {
+  numstat: { files: 2, added: 4, removed: 1 },
+  scope: ["docs", "src"],
+  changedPaths: ["src/app.ts", "docs/guide.md"],
+  changedPathsTruncated: false,
+};
+
+test("deliver clean forwards the diff footprint fields onto the PushResult (DHK-615)", () => {
+  const r = resolveDeliverOutcome(commit({ integration: "clean", footprint }), deliverCtx, undefined) as typeof footprint & {
+    integration?: string;
+  };
+  assert.deepEqual(r.numstat, { files: 2, added: 4, removed: 1 });
+  assert.deepEqual(r.scope, ["docs", "src"]);
+  assert.deepEqual(r.changedPaths, ["src/app.ts", "docs/guide.md"]);
+  assert.equal(r.changedPathsTruncated, false);
+});
+
+test("deliver conflict forwards the footprint too (a conflicted merge still delivered a diff)", () => {
+  const r = resolveDeliverOutcome(
+    commit({ integration: "conflict", pushed: false, footprint }),
+    deliverCtx,
+    undefined,
+  ) as typeof footprint & { integration?: string };
+  assert.equal(r.integration, "conflict");
+  assert.deepEqual(r.numstat, { files: 2, added: 4, removed: 1 });
+  assert.deepEqual(r.changedPaths, ["src/app.ts", "docs/guide.md"]);
+});
+
+test("deliver forwards no footprint fields when the primitive reported none (zero-diff / older edge)", () => {
+  const r = resolveDeliverOutcome(commit({ integration: "clean" }), deliverCtx, undefined);
+  assert.ok(!("numstat" in r) && !("scope" in r) && !("changedPaths" in r) && !("changedPathsTruncated" in r));
+});
+
+test("deliver noop forwards no footprint fields (nothing was delivered)", () => {
+  const r = resolveDeliverOutcome(commit({ integration: "noop", pushed: false, nothingToCommit: true }), deliverCtx, undefined);
+  assert.ok(!("numstat" in r) && !("changedPaths" in r));
+});
+
 test("backup: the run's HEAD was preserved on a durable WIP ref, no base merge, no PR", () => {
   const r: BackupPushResult = { headSha: "0123456789abcdef", pushed: true, nothingToCommit: false, wipRef: "dahrk/wip/run-7" };
   const result = resolveBackupOutcome(r, { jobId: "job-2", branch: "dahrk/run-7" });

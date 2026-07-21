@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkspaceRef } from "@dahrk/contracts";
@@ -280,6 +280,51 @@ test("commitAndPush integrates an advanced base before pushing when the change i
   }
 });
 
+test("commitAndPush reports the diff footprint (files/added/removed/scope/changedPaths) on a clean deliver (DHK-615)", async () => {
+  // The node holds the only copy of the worktree diff, so it computes the blast radius from its own
+  // `FETCH_HEAD...HEAD` range - the branch's contribution over the freshly fetched base - and reports it
+  // for the hub to project onto the Card footprint block. Engine scratch never inflates the numbers.
+  const remote = makeBareRemote();
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dahrk-wt-"));
+  const mirrorsDir = mkdtempSync(join(tmpdir(), "dahrk-mir-"));
+  const svc = createGitService({ worktreesDir, mirrorsDir });
+  const branch = "skakel/issue-TEST-footprint";
+
+  try {
+    const ref = await svc.createWorktree({
+      repoId: "repo-footprint",
+      gitUrl: remote,
+      baseBranch: "main",
+      runId: "run-footprint-1",
+      branch,
+    });
+    // Two new files across two top-level scopes; four added lines in total.
+    mkdirSync(join(ref.worktreePath, "src"), { recursive: true });
+    mkdirSync(join(ref.worktreePath, "docs"), { recursive: true });
+    writeFileSync(join(ref.worktreePath, "src", "app.ts"), "one\ntwo\nthree\n");
+    writeFileSync(join(ref.worktreePath, "docs", "guide.md"), "hello\n");
+    // Engine scratch is present but must not enter the footprint (untracked, and scratch-filtered).
+    writeFileSync(join(ref.scratchPath, "state.json"), "{}\n");
+
+    const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
+    assert.equal(r.integration, "clean");
+    assert.equal(r.pushed, true);
+    assert.ok(r.footprint, "a clean deliver carries a footprint");
+    assert.deepEqual(r.footprint?.numstat, { files: 2, added: 4, removed: 0 });
+    assert.deepEqual(r.footprint?.scope, ["docs", "src"]);
+    assert.deepEqual([...(r.footprint?.changedPaths ?? [])].sort(), ["docs/guide.md", "src/app.ts"]);
+    assert.equal(r.footprint?.changedPathsTruncated, false);
+    assert.ok(
+      !(r.footprint?.changedPaths ?? []).some((p) => p.startsWith(".dahrk/scratch")),
+      "engine scratch never enters the footprint",
+    );
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(worktreesDir, { recursive: true, force: true });
+    rmSync(mirrorsDir, { recursive: true, force: true });
+  }
+});
+
 test("commitAndPush reports a conflict and pushes nothing when the advanced base overlaps", async () => {
   // The base advanced on the SAME file this run touched, so merging it in at push time conflicts. The
   // merge is aborted, nothing is pushed, and the conflict is reported so the hub can raise a
@@ -537,6 +582,7 @@ test("commitAndPush reports `noop` and pushes nothing when the branch adds nothi
     assert.equal(r.pushed, false, "nothing is pushed when there is nothing to deliver");
     assert.equal(r.nothingToCommit, true);
     assert.equal(r.conflictFiles, undefined, "a no-op carries no conflictFiles");
+    assert.equal(r.footprint, undefined, "a zero-diff no-op reports no footprint (falls back to commit-count only)");
     assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "no branch was pushed on a no-op");
   } finally {
     rmSync(remote, { recursive: true, force: true });
@@ -572,6 +618,7 @@ test("commitAndPush reports `noop` when the branch's only committed delta is a g
     const r = await svc.commitAndPush(ref, { message: "this run", branch, base: "main" });
     assert.equal(r.integration, "noop", "a scratch-only delta is a no-op");
     assert.equal(r.pushed, false, "the stray scratch file is not delivered");
+    assert.equal(r.footprint, undefined, "a scratch-only no-op reports no footprint");
     assert.throws(() => git(remote, ["rev-parse", "--verify", branch]), "no branch was pushed");
   } finally {
     rmSync(remote, { recursive: true, force: true });
