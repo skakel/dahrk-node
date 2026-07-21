@@ -11,7 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ElicitQuestion, HumanTurn, RunnerContext } from "@dahrk/contracts";
-import { runInteractiveLoop, runBatchLoop } from "../src/turn-loop.js";
+import { runInteractiveLoop, runBatchLoop, classifyRuntimeError } from "../src/turn-loop.js";
 import { ManagedMailbox } from "../src/mailbox.js";
 import type {
   EmittableEvent,
@@ -290,4 +290,70 @@ test("batch: a cancelled runner settles fail and suppresses the runtime_error em
 
   assert.equal(result.status, "fail");
   assert.ok(!events.some((e) => e.type === "error"), "a cancel-driven throw is not reported as a runtime error");
+});
+
+test("batch: an upstream API transient throw settles fail with failureClass external and a truthful summary (DHK-569)", async () => {
+  const events: EmittableEvent[] = [];
+  const session = new ThrowingRuntimeSession("API Error: Stream idle timeout - partial response received");
+  const result = await runBatchLoop(session, ctx(), makeHooks(events), { cancelled: () => false });
+
+  assert.equal(result.status, "fail");
+  assert.equal(result.failureClass, "external", "an upstream transient is attributed external, not agent");
+  assert.match(result.summary ?? "", /stream idle timeout/i, "the summary names the transient rather than a bare fail");
+  const err = events.find((e) => e.type === "error");
+  assert.ok(err && err.type === "error" && err.kind === "runtime_error", "the runtime_error is still emitted");
+});
+
+test("batch: a genuine agent-task failure stays unclassified so the engine still bills it agent (DHK-569)", async () => {
+  // A non-transient throw: nothing about the upstream API, so the adapter must NOT claim external.
+  const throwResult = await runBatchLoop(
+    new ThrowingRuntimeSession("assertion failed: expected 3 tests to pass"),
+    ctx(),
+    makeHooks(),
+    { cancelled: () => false },
+  );
+  assert.equal(throwResult.status, "fail");
+  assert.equal(throwResult.failureClass, undefined, "a genuine task failure carries no failureClass");
+  assert.equal(throwResult.summary, undefined, "no synthetic transient summary is attached");
+
+  // A plain `status: fail` turn (no throw at all) is likewise the agent's own verdict.
+  const session = new FakeRuntimeSession({ results: [{ stageComplete: false, status: "fail" }] });
+  const failResult = await runBatchLoop(session, ctx(), makeHooks(), { cancelled: () => false });
+  assert.equal(failResult.status, "fail");
+  assert.equal(failResult.failureClass, undefined, "a plain fail turn stays unclassified");
+});
+
+test("batch: a cancel-driven transient throw is NOT attributed external (DHK-569)", async () => {
+  // When the harness watchdog cancels the runner, sendTurn throws mid-stream. That throw is not an
+  // upstream transient we should own here - the stage-runner owns the watchdog attribution - so the
+  // loop leaves failureClass unset under `cancelled`.
+  const session = new ThrowingRuntimeSession("API Error: Stream idle timeout - partial response received");
+  const result = await runBatchLoop(session, ctx(), makeHooks(), { cancelled: () => true });
+  assert.equal(result.status, "fail");
+  assert.equal(result.failureClass, undefined, "a cancel-driven throw is never classified by the loop");
+});
+
+test("classifyRuntimeError recognises the upstream-transient vocabulary and nothing else (DHK-569)", () => {
+  for (const transient of [
+    "API Error: Stream idle timeout - partial response received",
+    "Overloaded",
+    "529 overloaded_error",
+    "429 Too Many Requests: rate limit exceeded",
+    "504 Gateway Timeout",
+    "500 Internal Server Error",
+    "502 Bad Gateway",
+    "503 Service Unavailable",
+    "read ECONNRESET",
+    "socket hang up",
+  ]) {
+    assert.equal(classifyRuntimeError(transient), "external", `\`${transient}\` should class external`);
+  }
+  for (const agentSide of [
+    "assertion failed: expected 3 tests to pass",
+    "TypeError: cannot read property 'x' of undefined",
+    "the plan did not compile",
+    "",
+  ]) {
+    assert.equal(classifyRuntimeError(agentSide), undefined, `\`${agentSide}\` should stay unclassified`);
+  }
 });

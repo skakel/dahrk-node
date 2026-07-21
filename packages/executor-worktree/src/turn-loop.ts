@@ -8,6 +8,7 @@
  */
 import type {
   ElicitQuestion,
+  FailureClass,
   HumanTurn,
   JobResult,
   JobStatus,
@@ -227,26 +228,75 @@ export async function runInteractiveLoop(
 }
 
 /**
+ * Classify a runtime error message as an upstream API transient (DHK-569). The Claude/Pi SDKs surface
+ * these as a thrown `sendTurn` (the batch loop's terminal-failure boundary) whose message names the
+ * fault: a stream idle timeout, an overloaded/529, a 5xx, a 429/rate limit, a gateway timeout, or a
+ * connection/socket reset. None of these is the agent's fault, so we attribute them `external`; the
+ * engine's `deriveFailureClass` trusts an explicit `failureClass` over its summary heuristic, which
+ * otherwise sniffs a bare `"<stage>: fail"` and mis-bills the stall to `agent`. A message we do NOT
+ * recognise returns undefined, so a genuine agent-task failure (bad output, failing tests) stays
+ * unclassified and the engine still classes it `agent` - exactly as before.
+ */
+export function classifyRuntimeError(message: string): FailureClass | undefined {
+  const m = message.toLowerCase();
+  const transient =
+    m.includes("stream idle timeout") ||
+    m.includes("partial response received") ||
+    m.includes("overloaded") ||
+    /\b529\b/.test(m) ||
+    m.includes("rate limit") ||
+    m.includes("rate_limit") ||
+    m.includes("too many requests") ||
+    /\b429\b/.test(m) ||
+    m.includes("gateway timeout") ||
+    m.includes("bad gateway") ||
+    m.includes("service unavailable") ||
+    m.includes("internal server error") ||
+    /\b50[0234]\b/.test(m) ||
+    m.includes("econnreset") ||
+    m.includes("connection reset") ||
+    m.includes("socket hang up") ||
+    m.includes("connection error");
+  return transient ? "external" : undefined;
+}
+
+/**
  * The shared batch loop: one `sendTurn(resolveStagePrompt)`, settle the status, read `cost()`/
  * `sessionId`. A thrown `sendTurn` is the terminal-failure boundary - emit `runtime_error` (guarded by
  * the runner's `cancelled` predicate, so a cancel-driven throw is not mis-reported) and settle `fail`.
+ * When the throw is an upstream API transient (see `classifyRuntimeError`), attach an explicit
+ * `failureClass: "external"` and a truthful summary naming it, so the engine does not string-sniff a
+ * bare `"<stage>: fail"` down to `agent` (DHK-569).
  */
 export async function runBatchLoop(
   session: RuntimeSession,
   ctx: RunnerContext,
   hooks: RuntimeSessionHooks,
   opts: { cancelled: () => boolean },
-): Promise<Omit<JobResult, "jobId" | "summary">> {
+): Promise<Omit<JobResult, "jobId" | "summary"> & { summary?: string }> {
   let status: JobStatus = "ok";
+  let failureClass: FailureClass | undefined;
+  let summary: string | undefined;
   try {
     const tr = await session.sendTurn(resolveStagePrompt(ctx));
     if (tr.status) status = tr.status;
   } catch (e) {
-    if (!opts.cancelled()) hooks.emit({ type: "error", kind: "runtime_error", message: (e as Error).message });
+    const message = (e as Error).message;
+    if (!opts.cancelled()) {
+      hooks.emit({ type: "error", kind: "runtime_error", message });
+      failureClass = classifyRuntimeError(message);
+      if (failureClass) summary = `upstream API transient: ${message}`;
+    }
     status = "fail";
   }
   if (opts.cancelled()) status = "fail";
   const costUsd = session.cost();
   const sessionId = session.sessionId;
-  return { status, ...(sessionId ? { sessionId } : {}), ...(costUsd !== undefined ? { costUsd } : {}) };
+  return {
+    status,
+    ...(summary !== undefined ? { summary } : {}),
+    ...(failureClass ? { failureClass } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
+  };
 }

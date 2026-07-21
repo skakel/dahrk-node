@@ -13,6 +13,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
   ElicitChoice,
   ElicitQuestion,
+  FailureClass,
   HumanTurn,
   JobProgress,
   JobRequest,
@@ -665,6 +666,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           sessionId?: string,
           costUsd?: number,
           handedBackDoc?: { path: string; content: string },
+          failureClass?: FailureClass,
         ): Promise<JobResult> => {
           active.delete(jobId);
           turnQueues.delete(jobId);
@@ -720,6 +722,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
             ...(sessionId ? { sessionId } : {}),
             ...(costUsd !== undefined ? { costUsd } : {}),
             ...(resolved ? { artifact: resolved.artifact } : {}),
+            ...(failureClass ? { failureClass } : {}),
           };
         };
 
@@ -1012,7 +1015,16 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
         // see that an action was blocked without the deny silently flipping the verdict to fail.
         if (denied) summary += "\n\n(note: one or more tool actions were blocked by a deny-only policy guard.)";
 
-        return finish(status, summary, result.sessionId ?? job.sessionId, result.costUsd, result.artifact);
+        // Explicit failure attribution (DHK-569). A harness-owned watchdog kill - the wall-clock timeout
+        // or the batch-stall cancel - is never the agent's fault, so attribute it `harness`. Otherwise
+        // honour whatever the runner attributed (the adapter labels an upstream API transient `external`);
+        // absent that, leave it unset so the engine's summary heuristic still classes a genuine agent-task
+        // failure `agent`. Without this the engine sniffed `"<stage>: stalled (no output for 300s)"`,
+        // matched nothing, and mis-billed the harness kill to the agent.
+        const failureClass: FailureClass | undefined =
+          timedOut || stalled ? "harness" : result.failureClass;
+
+        return finish(status, summary, result.sessionId ?? job.sessionId, result.costUsd, result.artifact, failureClass);
       } finally {
         inFlight.set(runId, Math.max(0, (inFlight.get(runId) ?? 1) - 1));
       }

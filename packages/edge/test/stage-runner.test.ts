@@ -334,6 +334,7 @@ test("a stage that exceeds its timeout is killed and marked `timeout` (job.timeo
   try {
     const result = await runner.runJob(job);
     assert.equal(result.status, "timeout", "the stage is killed at its timeout and reported `timeout`");
+    assert.equal(result.failureClass, "harness", "a harness-owned wall-clock kill is billed harness, not agent (DHK-569)");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -402,6 +403,7 @@ test("a batch stage that streams no output for `stallMs` is cancelled and marked
     const result = await runner.runJob(job);
     assert.equal(result.status, "timeout", "a silent batch stage is cancelled by the stall watchdog");
     assert.match(result.summary ?? "", /stalled \(no output for/, "the summary marks it a stall, not a plain timeout");
+    assert.equal(result.failureClass, "harness", "a harness-owned stall kill is billed harness, not agent (DHK-569)");
   } finally {
     if (prev === undefined) delete process.env.DAHRK_BATCH_STALL_MS;
     else process.env.DAHRK_BATCH_STALL_MS = prev;

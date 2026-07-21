@@ -6,6 +6,18 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transient upstream API failure, and a harness-owned watchdog kill, are no longer billed to the
+  agent.** When the runtime's stream stalled (a stream idle timeout, an overloaded/529, a 5xx, a 429,
+  a gateway timeout, or a connection reset), the node reported a bare `"<stage>: fail"` with no failure
+  attribution, so the hub's heuristic sniffed the summary and mis-billed the transient to the agent.
+  The batch loop now recognises the upstream transient, attributes the result `failureClass: external`,
+  and carries a truthful summary that names it. Likewise, when the node's own wall-clock timeout or
+  batch-stall watchdog cancels a stage, the result is now attributed `failureClass: harness` - a
+  watchdog kill the node owns is never the agent's fault. A genuine agent-task failure (bad output,
+  failing tests) is unaffected and still classes `agent`.
+
 ## [0.1.22] - 2026-07-21
 
 ### Added
