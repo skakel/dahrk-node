@@ -78,3 +78,49 @@ test("the same model reached through a different provider is still the same mode
     provider: "google-vertex",
   });
 });
+
+// --- The profile fallback (Codex subscription) --------------------------------------------------
+//
+// The family match above can only work when the brokered provider serves the SAME model line. A
+// ChatGPT/Codex subscription does not: `sonnet` still resolves to Bedrock Claude, and no
+// `openai-codex` model is in the `claude` family, so family matching finds nothing and the resolution
+// stays on Bedrock - the exact "No API key found for amazon-bedrock" failure again, now for a
+// different reason. The selected auth profile's `defaultModel` is the last resort that closes it.
+
+/** What `getAvailable()` returns once a Codex subscription's `auth.json` is in place. */
+const CODEX_AVAILABLE: PiModelLike[] = [
+  { id: "gpt-5.4", provider: "openai-codex" },
+  { id: "gpt-5.5", provider: "openai-codex" },
+  { id: "gpt-5.6-luna", provider: "openai-codex" },
+];
+
+test("a Codex subscription cannot serve a Claude alias: fall back to the profile's model", () => {
+  assert.deepEqual(pickAuthedModel(BEDROCK_SONNET, CODEX_AVAILABLE, "gpt-5.5"), {
+    id: "gpt-5.5",
+    provider: "openai-codex",
+  });
+});
+
+test("the fallback is a LAST resort: a family match still wins over it", () => {
+  // Holding an Anthropic key, `opus` must still land on Claude even though a profile names a fallback.
+  // Preferring the fallback here would silently downgrade every stage that could have run as authored.
+  assert.deepEqual(pickAuthedModel(BEDROCK_OPUS, ANTHROPIC_AVAILABLE, "gpt-5.5"), {
+    id: "claude-opus-4-8",
+    provider: "anthropic",
+  });
+});
+
+test("an authenticable provider is never second-guessed, fallback or not", () => {
+  const codexResolved: PiModelLike = { id: "gpt-5.4", provider: "openai-codex" };
+  assert.equal(pickAuthedModel(codexResolved, CODEX_AVAILABLE, "gpt-5.5"), codexResolved);
+});
+
+test("a fallback naming a model the auth cannot reach is ignored, so Pi raises its own error", () => {
+  // Never invent a model: an unmatched fallback leaves the resolution exactly as Pi made it, so the
+  // error the operator sees names the real problem instead of a substitution we made up.
+  assert.equal(pickAuthedModel(BEDROCK_SONNET, CODEX_AVAILABLE, "gpt-4-nonexistent"), BEDROCK_SONNET);
+});
+
+test("no fallback given: behaviour is exactly as before", () => {
+  assert.equal(pickAuthedModel(BEDROCK_SONNET, CODEX_AVAILABLE), BEDROCK_SONNET);
+});

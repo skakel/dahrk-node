@@ -6,6 +6,24 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **A Pi stage can now authenticate against a subscription login, and pick a model the subscription
+  can actually serve.** Since 0.1.21 the Pi runtime has taken provider identity solely from the auth
+  hint the hub mints, but the stage runner never carried that hint from the Job onto the stage, so a
+  brokered key arrived and was ignored: a managed node ended up with no inference auth at all and fell
+  through to whatever provider the runtime defaults to, dying on its first turn. The hint is now
+  threaded through, including the OAuth-subscription shape (e.g. a ChatGPT/Codex login), whose token
+  is refreshed hub-side and attached per stage.
+- **A stage whose model cannot be served by the connected provider now falls back to the profile's
+  model instead of failing.** Workflows name tier aliases (`sonnet`, `opus`) that resolve to Anthropic
+  models on Bedrock; a subscription for a different provider serves none of them, and no
+  same-family substitute exists, so the stage previously died asking for a credential that was never
+  brokered. The selected auth profile's default model is now the last resort, applied only after an
+  exact-provider and same-family match have both failed, so a stage that could run as authored still
+  does. An unmatched fallback is ignored rather than substituted, leaving the runtime to raise its own
+  error rather than silently running a model nobody chose.
+
 ### Fixed
 
 - **A moved or renamed repo now re-points its bare mirror instead of fetching the stale remote for

@@ -37,6 +37,7 @@ import {
   resolveMirrorsDir,
   type GitService,
   type PackCache,
+  type PiAuthHint,
   type ReapReport,
 } from "@dahrk/executor-worktree";
 import { buildRules } from "./builtins.js";
@@ -879,6 +880,16 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           // never surfaced to the agent's own tool calls. Absent on ambient nodes; inert for the Claude/
           // Codex adapters, which use ambient inference.
           ...(job.runtimeEnv ? { runtimeEnv: job.runtimeEnv } : {}),
+          // The brokered auth-profile hint (DHK-509/511): WHICH provider each piece of the inference
+          // auth above belongs to, plus the model fallback. The adapter applies nothing for a provider
+          // the hint does not name, so without this passthrough `runtimeEnv` arrives and is ignored -
+          // a managed node then has no inference auth at all and falls through to whatever provider the
+          // runtime defaults to. Read through a narrow cast because the field is not in the published
+          // `@dahrk/contracts` (^0.4.0) yet; this line and `readAuthHint` are the only two seams, and
+          // both drop the cast when contracts ships.
+          ...((job as { runtimeAuth?: PiAuthHint }).runtimeAuth
+            ? { runtimeAuth: (job as { runtimeAuth?: PiAuthHint }).runtimeAuth }
+            : {}),
           // The adapter persists each runtime-native record under the attempt's raw/ sidecar
           // and stamps the rawRef onto the emitted event.
           writeRaw: writer.writeRaw,

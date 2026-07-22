@@ -72,6 +72,17 @@ export type ProviderHint = ApiKeyProviderHint | OAuthProviderHint;
  *  source of provider identity for the Pi adapter. */
 export interface PiAuthHint {
   providers: ProviderHint[];
+  /**
+   * The selected auth profile's `defaultModel`, if it set one.
+   *
+   * This is a FALLBACK, not an override. A stage names a tier alias (`sonnet`, `opus`) which Pi
+   * resolves against its whole registry - and those aliases land on providers the brokered auth may not
+   * cover at all (`sonnet` resolves to amazon-bedrock). `pickAuthedModel` first tries to preserve the
+   * stage's intent by matching the resolved model's family against what the auth can actually reach;
+   * only when nothing matches does it fall back to this. That is what lets a pool switch from an
+   * Anthropic key to a Codex subscription without editing a single workflow.
+   */
+  defaultModel?: string;
 }
 
 /** The subset of Pi's `AuthStorage` the API-key path drives; kept local so the helper is SDK-free. */

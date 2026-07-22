@@ -514,7 +514,11 @@ test("the Job's runtimeEnv is threaded onto the runner ctx (injection boundary)"
     trace: sink,
   });
 
-  const mkJob = (jobId: string, runtimeEnv?: Record<string, string>): JobRequest => ({
+  const mkJob = (
+    jobId: string,
+    runtimeEnv?: Record<string, string>,
+    runtimeAuth?: unknown,
+  ): JobRequest => ({
     tenantId: "t_default",
     runId: "run-sr-rtenv",
     stageId: "build",
@@ -525,6 +529,7 @@ test("the Job's runtimeEnv is threaded onto the runner ctx (injection boundary)"
     workspaceRef: { repoId: "repo", gitUrl: repo, repo: "repo", baseBranch: "main", worktreePath: "", scratchPath: "" },
     timeout: 60,
     ...(runtimeEnv ? { runtimeEnv } : {}),
+    ...(runtimeAuth ? { runtimeAuth } : {}),
   });
 
   try {
@@ -533,6 +538,31 @@ test("the Job's runtimeEnv is threaded onto the runner ctx (injection boundary)"
 
     await runner.runJob(mkJob("job-rtenv-2")); // no runtimeEnv -> absent on ctx (ambient node)
     assert.equal(seen[1]?.runtimeEnv, undefined);
+
+    // DHK-509/511: the auth-profile hint must ride across the SAME seam. The adapter applies nothing
+    // for a provider the hint does not name, so if this passthrough is missing the brokered key above
+    // arrives and is silently ignored - which is precisely how a managed node ended up with no
+    // inference auth at all while looking correctly configured from the hub's side.
+    const hint = {
+      providers: [{ kind: "api_key", provider: "anthropic", envVar: "ANTHROPIC_API_KEY" }],
+      defaultModel: "claude-opus-4-8",
+    };
+    await runner.runJob(mkJob("job-rtenv-3", { ANTHROPIC_API_KEY: "sk-test" }, hint));
+    assert.deepEqual((seen[2] as { runtimeAuth?: unknown })?.runtimeAuth, hint);
+
+    // An oauth-subscription mint carries a hint and NO env at all, so the hint must attach on its own.
+    const oauthHint = {
+      providers: [
+        { kind: "oauth", provider: "openai-codex", access: "at", refresh: "rt", expires: 1, extra: { accountId: "a" } },
+      ],
+      defaultModel: "gpt-5.5",
+    };
+    await runner.runJob(mkJob("job-rtenv-4", undefined, oauthHint));
+    assert.equal(seen[3]?.runtimeEnv, undefined, "a subscription brings no env");
+    assert.deepEqual((seen[3] as { runtimeAuth?: unknown })?.runtimeAuth, oauthHint);
+
+    await runner.runJob(mkJob("job-rtenv-5")); // ambient node -> neither field
+    assert.equal((seen[4] as { runtimeAuth?: unknown })?.runtimeAuth, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

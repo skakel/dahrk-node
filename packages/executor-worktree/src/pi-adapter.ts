@@ -476,8 +476,14 @@ async function defaultCreatePiSession(ctx: RunnerContext): Promise<PiSessionLike
   if (ctx.config.model) {
     const resolved = resolveCliModel({ cliModel: ctx.config.model, modelRegistry });
     if (!resolved?.error) {
-      model = pickAuthedModel(resolved?.model, modelRegistry.getAvailable());
+      model = pickAuthedModel(resolved?.model, modelRegistry.getAvailable(), hint?.defaultModel);
     }
+  } else if (hint?.defaultModel) {
+    // No stage model at all: the profile's model is then the only expression of intent, so honour it
+    // rather than leaving Pi on its own global default (which the hermetic config dir has stripped of
+    // any operator preference anyway).
+    const resolved = resolveCliModel({ cliModel: hint.defaultModel, modelRegistry });
+    if (!resolved?.error) model = pickAuthedModel(resolved?.model, modelRegistry.getAvailable());
   }
 
   // The injected stage-complete tool (interactive tool-exit); harmless on batch stages.
@@ -652,14 +658,34 @@ function modelFamily(id: string): string {
  *
  * With no available models at all (nothing brokered, ambient/self-managed node), this is a no-op:
  * Pi resolves against whatever the operator has configured, exactly as before.
+ *
+ * `fallbackModel` is the LAST resort (the selected auth profile's `defaultModel`), for when the family
+ * match cannot succeed because the brokered provider serves a different model line entirely. A Codex
+ * subscription is the motivating case: `sonnet` resolves to `us.anthropic.claude-…` on amazon-bedrock,
+ * and no `openai-codex` model is in the `claude` family, so family matching finds nothing and - without
+ * this - the resolution stays on Bedrock and the stage dies on its first turn asking for a credential
+ * that was never brokered. Falling back keeps tier aliases meaningful in workflows while letting a pool
+ * change provider by changing a profile field.
  */
 export function pickAuthedModel(
   resolved: PiModelLike | undefined,
   available: readonly PiModelLike[] | undefined,
+  fallbackModel?: string,
 ): PiModelLike | undefined {
   if (!resolved || !available?.length) return resolved;
   const providers = new Set(available.map((m) => m.provider));
   if (providers.has(resolved.provider)) return resolved;
   const family = modelFamily(resolved.id);
-  return available.find((m) => modelFamily(m.id) === family) ?? resolved;
+  const sameFamily = available.find((m) => modelFamily(m.id) === family);
+  if (sameFamily) return sameFamily;
+  if (fallbackModel) {
+    // Match the fallback against what the auth can actually reach, by exact id then by family, so a
+    // profile naming `gpt-5.5` still lands if the provider packages it under a decorated id. Never
+    // invent one: an unmatched fallback leaves Pi's own resolution alone so IT raises the clear error.
+    const byId = available.find((m) => m.id === fallbackModel);
+    if (byId) return byId;
+    const byFamily = available.find((m) => modelFamily(m.id) === modelFamily(fallbackModel));
+    if (byFamily) return byFamily;
+  }
+  return resolved;
 }

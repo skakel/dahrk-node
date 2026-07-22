@@ -79,6 +79,10 @@ export type { PiSessionLike, PiSessionFactory, PiRunnerDeps, BrokeredPiMcpServer
 export { createContainerPiSession, createIsolatedPiRunner } from "./pi-container.js";
 export type { ContainerPiSessionOpts } from "./pi-container.js";
 
+// The brokered auth-profile hint (DHK-509/511). Exported because the edge's stage runner threads it
+// from the Job onto the RunnerContext, so both ends of that seam name the same type.
+export type { PiAuthHint, ProviderHint, ApiKeyProviderHint, OAuthProviderHint } from "./pi-auth.js";
+
 /**
  * Construct the runner for a runtime. Defaults to the real adapters; `DAHRK_RUNNER=mock`
  * selects the deterministic, credential-free mock (set by the offline hub harness so its
