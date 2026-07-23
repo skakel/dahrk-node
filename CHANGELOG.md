@@ -6,6 +6,8 @@ All notable changes to the `dahrk-node` edge client are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-07-23
+
 ### Added
 
 - **A repo can now declare a `setup` step that the node runs in the worktree before the agent starts,
@@ -884,7 +886,8 @@ First published release of the `dahrk-node` edge client.
 - Tag-driven release CI: a `vX.Y.Z` tag publishes `dahrk-node` to npm, bumps the Homebrew tap
   formula, and cuts a GitHub release.
 
-[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/dahrkai/dahrk-node/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/dahrkai/dahrk-node/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/dahrkai/dahrk-node/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/dahrkai/dahrk-node/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/dahrkai/dahrk-node/compare/v0.1.21...v0.1.22

@@ -19,6 +19,8 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-07-23
+
 ### Changed
 
 - **Take `@dahrk/contracts` `^0.7.0` and drop the last forward-compat shims for it.** 0.7.0 declares
