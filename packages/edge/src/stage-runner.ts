@@ -37,7 +37,6 @@ import {
   resolveMirrorsDir,
   type GitService,
   type PackCache,
-  type PiAuthHint,
   type ReapReport,
 } from "@dahrk/executor-worktree";
 import { buildRules } from "./builtins.js";
@@ -45,12 +44,7 @@ import { computeFsRoots } from "./fs-roots.js";
 import { createNodeLogger, type NodeLogger } from "./logger.js";
 import { evaluatePolicies, type PolicyRule } from "./policy.js";
 import { startMcpGateway, type McpGateway } from "./mcp-gateway.js";
-import {
-  resolveBackupOutcome,
-  resolveDeliverOutcome,
-  type PushJobWithMode,
-  type PushMode,
-} from "./push-outcome.js";
+import { resolveBackupOutcome, resolveDeliverOutcome, type PushMode } from "./push-outcome.js";
 
 /** Arguments for requesting a presigned upload of a heavy trace payload. */
 export interface BlobPutRequestArgs {
@@ -186,7 +180,8 @@ const putBytes = async (url: string, body: Buffer, contentType: string): Promise
  *  (e.g. `ToolSearch`). Observation output uses the larger RESULT cap so a folded result is not lost
  *  mid-content. `toolUseId` is additive on the wire: `JobProgress` in the published `@dahrk/contracts`
  *  predates the field, so it rides through the plain-JSON transport untyped until the contract is
- *  republished (same forward-compat pattern as the PushMode shim above). */
+ *  republished (the same forward-compat pattern the push-mode and footprint fields used before
+ *  `@dahrk/contracts` 0.6.0/0.7.0 declared them). */
 function previewOf(event: TraceEvent): { text?: string; tool?: string; toolUseId?: string } {
   const clip = (v: unknown, max = PREVIEW): string =>
     (typeof v === "string" ? v : JSON.stringify(v) ?? "").slice(0, max);
@@ -884,12 +879,9 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
           // auth above belongs to, plus the model fallback. The adapter applies nothing for a provider
           // the hint does not name, so without this passthrough `runtimeEnv` arrives and is ignored -
           // a managed node then has no inference auth at all and falls through to whatever provider the
-          // runtime defaults to. Read through a narrow cast because the field is not in the published
-          // `@dahrk/contracts` (^0.4.0) yet; this line and `readAuthHint` are the only two seams, and
-          // both drop the cast when contracts ships.
-          ...((job as { runtimeAuth?: PiAuthHint }).runtimeAuth
-            ? { runtimeAuth: (job as { runtimeAuth?: PiAuthHint }).runtimeAuth }
-            : {}),
+          // runtime defaults to. A plain typed read since `@dahrk/contracts` declares `runtimeAuth` on
+          // both `JobRequest` and `RunnerContext`.
+          ...(job.runtimeAuth ? { runtimeAuth: job.runtimeAuth } : {}),
           // The adapter persists each runtime-native record under the attempt's raw/ sidecar
           // and stamps the rawRef onto the emitted event.
           writeRaw: writer.writeRaw,
@@ -1055,7 +1047,7 @@ export function createStageRunner(deps: StageRunnerDeps): StageRunner {
       // backup push - which depends on the committed HEAD still being present in that worktree.
       inFlight.set(runId, (inFlight.get(runId) ?? 0) + 1);
       try {
-        const mode: PushMode = (job as PushJobWithMode).mode ?? "deliver";
+        const mode: PushMode = job.mode ?? "deliver";
 
         // Work-preservation push (DHK-264): the hub dispatches `mode:"backup"` after a `deliver` push
         // hit a base-advanced conflict, to save the run's committed HEAD on a durable `dahrk/wip/<runId>`

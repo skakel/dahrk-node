@@ -19,6 +19,22 @@ this file is left verbatim.
 
 ## [Unreleased]
 
+### Changed
+
+- **Take `@dahrk/contracts` `^0.7.0` and drop the last forward-compat shims for it.** 0.7.0 declares
+  the three fields the node was reaching through casts (`PushResult.changedPaths` /
+  `changedPathsTruncated`, and `RunnerContext.runtimeAuth`), so:
+  - `push-outcome.ts` loses `PushResultWithFootprint` (`PushResult & Partial<DiffFootprint>`) and
+    `PushResultWithWip` - both resolver signatures return a plain `PushResult`, and `PushMode` is now a
+    `NonNullable<PushJob["mode"]>` alias rather than a hand-written union.
+  - `pi-auth.ts` stops mirroring the hint types locally: `ApiKeyProviderHint` / `OAuthProviderHint` /
+    `ProviderHint` / `CustomProviderModel` are re-exported from the contract, `PiAuthHint` aliases
+    `RuntimeAuthHint`, and `readAuthHint` is a plain `ctx.runtimeAuth` read (was a structural cast).
+  - `stage-runner.ts` drops the `(job as { runtimeAuth? })` cast on the job-run passthrough and the
+    now-unused `PiAuthHint` / `PushJobWithMode` imports.
+  No behavioural change - all three fields already rode the plain-JSON wire; this is type-declaration
+  catch-up. Typecheck and the full suite pass unchanged.
+
 ## [0.1.24] - 2026-07-22
 
 ### Changed

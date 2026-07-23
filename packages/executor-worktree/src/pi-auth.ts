@@ -21,69 +21,26 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RunnerContext } from "@dahrk/contracts";
+import type {
+  ApiKeyProviderHint,
+  CustomProviderModel,
+  OAuthProviderHint,
+  ProviderHint,
+  RunnerContext,
+  RuntimeAuthHint,
+} from "@dahrk/contracts";
 
-/**
- * A brokered API-key provider from the auth-profile hint. The credential itself is NOT here: it rides
- * in `runtimeEnv` under `envVar`, so the raw secret stays a process env value the agent never sees.
- */
-export interface ApiKeyProviderHint {
-  kind: "api_key";
-  /** Pi provider id, e.g. `anthropic`, `openrouter`, `moonshot`, `groq`. */
-  provider: string;
-  /** The `runtimeEnv` key carrying the raw secret for this provider. */
-  envVar: string;
-  /** Base URL for a provider Pi ships no built-in for; drives a `models.json` custom-provider entry. */
-  baseUrl?: string;
-  /** Custom models to register under this provider (only meaningful with `baseUrl`). */
-  models?: CustomProviderModel[];
-  /** Extra request headers for the custom provider. */
-  headers?: Record<string, string>;
-}
-
-/** A minimal custom-model definition, matching Pi's `models.json` provider `models[]` shape. Only
- *  `id` is required; the rest is passed through to Pi verbatim. */
-export interface CustomProviderModel {
-  id: string;
-  [key: string]: unknown;
-}
-
-/**
- * A brokered OAuth-subscription provider from the auth-profile hint. The token material is persisted
- * into a hermetic `auth.json`; Pi refreshes it itself from `refresh`.
- */
-export interface OAuthProviderHint {
-  kind: "oauth";
-  /** Pi OAuth provider id, e.g. `openai-chatgpt`, `github-copilot`, `gemini`. */
-  provider: string;
-  /** OAuth access token. */
-  access: string;
-  /** OAuth refresh token. */
-  refresh: string;
-  /** Absolute expiry (epoch ms), as Pi's `auth.json` records it. */
-  expires: number;
-  /** Any additional provider-specific fields Pi persists alongside the tokens (e.g. an endpoint). */
-  extra?: Record<string, unknown>;
-}
-
-export type ProviderHint = ApiKeyProviderHint | OAuthProviderHint;
+// The hint types used to be mirrored here because the field they ride on did not exist in the
+// published `@dahrk/contracts`. Since 0.7.0 the contract declares `RuntimeAuthHint` (and its member
+// shapes) AND `RunnerContext.runtimeAuth`, so the mirror is gone: these are the contract's own types,
+// re-exported under the adapter's existing names to keep this package's public surface stable. The
+// harness's `runtime-auth.ts` documents each field (and its load-bearing MIRROR RULE); read it there.
+export type { ApiKeyProviderHint, CustomProviderModel, OAuthProviderHint, ProviderHint } from "@dahrk/contracts";
 
 /** The auth-profile hint the broker mints (DHK-509) and threads onto the runner ctx. It is the SOLE
- *  source of provider identity for the Pi adapter. */
-export interface PiAuthHint {
-  providers: ProviderHint[];
-  /**
-   * The selected auth profile's `defaultModel`, if it set one.
-   *
-   * This is a FALLBACK, not an override. A stage names a tier alias (`sonnet`, `opus`) which Pi
-   * resolves against its whole registry - and those aliases land on providers the brokered auth may not
-   * cover at all (`sonnet` resolves to amazon-bedrock). `pickAuthedModel` first tries to preserve the
-   * stage's intent by matching the resolved model's family against what the auth can actually reach;
-   * only when nothing matches does it fall back to this. That is what lets a pool switch from an
-   * Anthropic key to a Codex subscription without editing a single workflow.
-   */
-  defaultModel?: string;
-}
+ *  source of provider identity for the Pi adapter. The contract's `RuntimeAuthHint`, aliased so the
+ *  adapter (and its `@dahrk/executor-worktree` re-export) keep the `PiAuthHint` name. */
+export type PiAuthHint = RuntimeAuthHint;
 
 /** The subset of Pi's `AuthStorage` the API-key path drives; kept local so the helper is SDK-free. */
 export interface AuthStorageLike {
@@ -104,13 +61,13 @@ interface PiCustomProviderConfig {
 }
 
 /**
- * The runner-ctx field carrying the auth-profile hint (DHK-509). It is not yet in the published
- * `@dahrk/contracts` (`^0.4.0`), so it is read here through a narrow structural cast: the accessor is
- * the single seam the rest of the adapter goes through, so when contracts ships the field only this
- * line changes. Absent on ambient/self-managed nodes (Pi then resolves against the operator's config).
+ * The runner-ctx field carrying the auth-profile hint (DHK-509). A plain typed read since
+ * `@dahrk/contracts` 0.7.0 declared `RunnerContext.runtimeAuth` (it was a structural cast against an
+ * undeclared field before). Kept as the single accessor the rest of the adapter goes through. Absent
+ * on ambient/self-managed nodes (Pi then resolves against the operator's config).
  */
 export function readAuthHint(ctx: RunnerContext): PiAuthHint | undefined {
-  return (ctx as { runtimeAuth?: PiAuthHint }).runtimeAuth;
+  return ctx.runtimeAuth;
 }
 
 /**
